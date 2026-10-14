@@ -43,10 +43,22 @@ echo "热榜服务可用"
 
 # ── ② 风格学习（ADR-0026：必须早于写作）──
 log "② 风格学习（若你改过教学副本）"
-# 简化实现：有教学副本且与当前内容不一致时才学（版本去重由 wewrite learn-edits 自身与
-# 我们的哈希记录共同保证，见 ADR-0026）。此处先只做提示，不自动学——
-# 因为自动学习需要 diff 发布快照，涉及 git 历史读取，留待下一轮实现。
-echo "（跳过：风格学习待接入 git 快照 diff；当前不影响写作阶段）"
+python3 .agents/skills/newsagg-triage/scripts/style_learn.py > /tmp/newsagg-style.json 2>&1 || true
+python3 - <<'PYEOF'
+import json
+try:
+    d = json.load(open("/tmp/newsagg-style.json", encoding="utf-8"))
+except Exception:
+    print("（风格学习输出无法解析，跳过）"); raise SystemExit(0)
+ch = d.get("changed", 0)
+print(f"检查 {d.get('checked',0)} 篇成稿，需学习 {ch} 篇")
+for r in d.get("results", []):
+    if r.get("status") != "unchanged":
+        print(f"  [{r['status']}] {r['file']}")
+if ch:
+    print("  → learn-edits 只记录 diff；pattern 提取由 agent 完成：")
+    print("    python3 .agents/skills/newsagg-triage/scripts/style_patterns.py --prepare")
+PYEOF
 
 # ── ③ 采集 ──
 log "③ 采集"

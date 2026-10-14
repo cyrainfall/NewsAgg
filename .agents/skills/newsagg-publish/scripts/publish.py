@@ -316,7 +316,11 @@ def main() -> int:
                "--cover", str(Path(args.cover).resolve()),
                "--cover-mode", "single",
                "--declaration", args.declaration,
-               "--account", args.account]
+               "--account", args.account,
+               # ADR-0034：头条发布页默认勾选「同时发布微头条」，必须显式取消。
+               # 本项目一次运行只产出一篇文章；同发微头条会造成内容重复
+               # （平台禁止批量重复内容），且无法被每日上限与冷却期约束。
+               "--no-weitoutiao"]
         if args.mode == "dry-run":
             cmd.append("--draft")   # 存草稿而非发布（最接近"停在发布前"）
 

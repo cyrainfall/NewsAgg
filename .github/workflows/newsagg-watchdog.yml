@@ -1,0 +1,97 @@
+name: NewsAgg 看守（心跳检查）
+
+# 设计依据 ADR-0006：
+# 主系统"完全没跑"这一类故障它自己永远发现不了——而"今天没有值得写的选题"
+# 是合法结果（允许弃权），两者从外部不可区分。因此由独立看守检查
+# "今日简报是否存在"，缺失即通知。
+#
+# 关键：本看守运行在与主系统不同的机器上、由不同的调度器触发。
+# 这是它能发现"主系统整体失效"的唯一原因——如果它也跑在同一个 cron 里，
+# 就与主系统同生共死，失去意义。
+#
+# 通知通道：ADR-0006 第四条 —— 使用 GitHub Actions 的原生邮件通知能力。
+# 这是全系统唯一的"推送"通道（其余告警都写 Issue，属拉取通道，见 ADR-0005）。
+
+on:
+  schedule:
+    # 北京时间每天 11:00（UTC 03:00）检查。主系统是"采集 2-3 次 → 当晚发布 →
+    # 次日简报"，因此简报应在前一日发布后的次日上午出现；给足宽限时间。
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      contents: read
+    steps:
+      - name: 检查今日简报 issue 是否存在
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 计算"应当存在"的简报日期：
+          # 简报是"次日"发出的，所以今天 11:00 应能看到【昨天】的简报，
+          # 但也允许【今天】的已经发出。两者任一存在即视为存活。
+          YESTERDAY=$(date -u -d 'yesterday' +%Y-%m-%d)
+          TODAY=$(date -u +%Y-%m-%d)
+
+          echo "检查窗口: $YESTERDAY .. $TODAY"
+
+          # ADR-0020 的命名约定：标题固定为 "NewsAgg 简报 YYYY-MM-DD"
+          FOUND=""
+          for d in "$YESTERDAY" "$TODAY"; do
+            COUNT=$(gh issue list \
+              --repo "$REPO" \
+              --state all \
+              --search "\"NewsAgg 简报 $d\" in:title" \
+              --json number,title \
+              --jq "[.[] | select(.title | test(\"NewsAgg 简报 $d\"))] | length" \
+              2>/dev/null || echo "0")
+            if [ "${COUNT:-0}" -gt 0 ]; then
+              FOUND="$d"
+              echo "✅ 找到简报: $d"
+              break
+            fi
+          done
+
+          if [ -z "$FOUND" ]; then
+            echo "::error::未找到近两日简报（$YESTERDAY / $TODAY）——主系统可能整体失效"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "date=$FOUND" >> "$GITHUB_OUTPUT"
+
+      - name: 校验简报完整性（五段齐备）
+        if: steps.check.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          D="${{ steps.check.outputs.date }}"
+
+          BODY=$(gh issue list --repo "$REPO" --state all \
+            --search "\"NewsAgg 简报 $D\" in:title" \
+            --json title,body \
+            --jq "[.[] | select(.title | test(\"NewsAgg 简报 $D\"))][0].body")
+
+          # ADR-0019 的五段标题（用序号匹配，容忍前缀差异）
+          MISSING=""
+          for marker in "①" "②" "③" "④" "⑤"; do
+            if ! printf '%s' "$BODY" | grep -q "$marker"; then
+              MISSING="$MISSING $marker"
+            fi
+          done
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::简报 $D 存在但残缺，缺失段落:$MISSING"
+            exit 1
+          fi
+          echo "✅ 简报 $D 五段齐备"

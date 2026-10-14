@@ -13,12 +13,15 @@ node_modules/
 .toutiao-ops/
 
 # ── 参考仓库（ADR-0012：本地可读，不入库，因含 GB 级依赖目录）──
-reference/
+# 例外：toutiao-ops 源码需入仓并打补丁（ADR-0024 要求 fork 最小改动）。
+# 其依赖目录仍排除（21MB 全是 node_modules，源码仅约 160KB）。
+reference/*
+!reference/toutiao-ops/
 
 # ── 已 vendored 的外部仓库的依赖目录 ──
-Agent-Reach/.venv/
-toutiao-ops/cli/node_modules/
-DailyHotApi/node_modules/
+reference/Agent-Reach/.venv/
+reference/toutiao-ops/cli/node_modules/
+reference/DailyHotApi/node_modules/
 
 # ── macOS ──
 .DS_Store

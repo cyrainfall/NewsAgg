@@ -209,8 +209,20 @@ def main() -> int:
 
     # 校验模式：只校验，不重写输入包
     if args.validate:
-        decision = json.loads(Path(args.validate).read_text(encoding="utf-8"))
+        raw = json.loads(Path(args.validate).read_text(encoding="utf-8"))
+        # SKILL.md 记录的输出形状是 {date, decision:{...}, low_confidence_skipped,
+        # no_card_available, abstain_reason}；也接受扁平的 decision 对象，
+        # 以免调用方必须包一层。
+        decision = raw.get("decision", raw)
         result = validate_decision(decision, cards, cooldown, limits)
+        # 附带简报相关的结构检查（不计入 ok，但会在简报中用到）
+        extras = []
+        for key in ("low_confidence_skipped", "no_card_available"):
+            if key in raw and not isinstance(raw[key], list):
+                extras.append(f"{key} 应为数组")
+        if extras:
+            result["problems"].extend(extras)
+            result["ok"] = False
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
 

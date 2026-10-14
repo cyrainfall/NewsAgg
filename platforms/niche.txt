@@ -1,0 +1,127 @@
+# NewsAgg 赛道词（赛道：AI 与开发者工具 / 技术行业）
+#
+# 归属：本文件归本人所有，系统不直写（ADR-0018）。
+# 用途：采集层的赛道预筛（ADR-0016 第 1 步）。命中任一词即进入候选，
+#       否则落入 dropped 供审计。
+# 调优：跑一周后按 platforms/ 的漏筛/误筛观察增删。行首 # 为注释。
+
+# ── 模型与 AI ──
+AI
+人工智能
+大模型
+LLM
+GPT
+Claude
+Gemini
+DeepSeek
+Qwen
+通义
+文心
+豆包
+Kimi
+智谱
+GLM
+Mistral
+Llama
+多模态
+智能体
+Agent
+机器学习
+深度学习
+神经网络
+训练
+推理
+微调
+提示词
+Prompt
+RAG
+向量
+嵌入
+
+# ── 算力与芯片 ──
+芯片
+GPU
+英伟达
+NVIDIA
+AMD
+Intel
+台积电
+CUDA
+算力
+数据中心
+半导体
+光刻
+
+# ── 开发与工程 ──
+编程
+代码
+开发者
+程序员
+工程师
+开源
+GitHub
+GitLab
+前端
+后端
+全栈
+架构
+数据库
+API
+SDK
+框架
+编译器
+语言
+Python
+JavaScript
+TypeScript
+Rust
+Golang
+Java
+C++
+Kotlin
+Swift
+测试
+重构
+性能
+部署
+运维
+DevOps
+容器
+Kubernetes
+Docker
+服务器
+云
+Serverless
+微服务
+监控
+
+# ── 工具与产品 ──
+IDE
+编辑器
+VS Code
+Cursor
+Copilot
+插件
+工具链
+命令行
+终端
+自动化
+低代码
+无代码
+版本
+发布
+更新
+迭代
+
+# ── 行业与商业（技术语境）──
+融资
+创业
+独角兽
+收购
+商业化
+订阅
+定价
+市场份额
+裁员
+招聘
+岗位

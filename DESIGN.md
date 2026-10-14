@@ -33,6 +33,7 @@
 | 写作引擎 | 复用 `wewrite`（vendor 入仓、钉版本） |
 | 联网能力 | 复用 `Agent-Reach`（不 vendor，活跃依赖；阶段二取正文，写作阶段扩展检索） |
 | 头条发布 | 复用 `toutiao-ops`（fork 入仓、最小改动；包一层做反查验证与熔断） |
+| 采集源 | 本地部署 `DailyHotApi`（公开实例 `api-hot.imsyy.top` 已不可用）+ 定向 RSS |
 | 判断层 | 技能（`.agents/skills/`）：分拣规则、卡匹配、写作纪律、简报结构 |
 | 强制层 | 插件（`plugins/newsagg/`）：安全门 guard、受限发布 Tool、配置项、状态面板 |
 | 自建部分 | 采集、事件聚簇、观点卡分拣、简报、看守、发布包装层 |

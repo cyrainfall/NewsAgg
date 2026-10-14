@@ -24,9 +24,13 @@
 
 **复用 `toutiao-ops` 作为头条发布与数据读回的执行层**，NewsAgg 在其上包一层，只补它缺的三件事：
 
-**一、发布后反查验证（防静默假成功）。** 它的发布是**乐观返回**：点完「确认发布」后只 `sleep` 便 `return {success: true}`，且 `confirmPublish.click().catch(() => {})` 连失败都吞掉。因此**不信任其返回值**，发布后调用 `toutiao-ops content list` 核实该标题确实存在于作品列表；不存在则视为未发出，走 ADR-0011 的核实流程（**不重发**）。
+**一、发布后反查验证（防静默假成功）。** 其发布路径的返回是**乐观的**：点完「确认发布」后只 `sleep` 便 `return {success: true}`，且 `confirmPublish.click().catch(() => {})` 吞掉点击失败。因此**不信任其发布返回值**，发布后调用 `toutiao-ops content list` 核实该标题确实存在于作品列表；不存在则视为未发出，走 ADR-0011 的核实流程（**不重发**）。
 
-**二、内存参数与浏览器复用（2GB 约束）。** 其 `LAUNCH_ARGS` 仅含四个参数（`--disable-blink-features=AutomationControlled`、`--no-first-run`、`--no-default-browser-check`、`--disable-infobars`），**缺少服务器必需项**。补入 `--disable-dev-shm-usage`、`--no-sandbox`、`--renderer-process-limit=1`、`--disable-gpu`；并复用系统 Chromium，阻止其 `postinstall` 另行下载一份（40GB 盘装两份浏览器无意义）。因 CLI 不透传环境变量，此项需**最小改动的 fork 入仓**（与 ADR-0015 的钉版本策略一致）。
+> **受 ADR-0028 更正**：原判断"它连失败都吞掉"仅适用于**发布路径**。CLI 层其余命令的退出码是正确的（`run()` 在 catch 中 `process.exit(1)`）；先前观察到"报错但退出 0"是**管道掩码**造成的观测错误。因此本条的适用范围收窄为"发布结果的返回值不可信"，而调用其它命令时**应当检查退出码**。
+
+**二、内存参数注入（2GB 约束）。** 其 `LAUNCH_ARGS` 仅含四个参数（`--disable-blink-features=AutomationControlled`、`--no-first-run`、`--no-default-browser-check`、`--disable-infobars`），**缺少服务器必需项**。补入 `--disable-dev-shm-usage`、`--no-sandbox`、`--renderer-process-limit=1`、`--disable-gpu`；因 CLI 不透传环境变量，此项需**最小改动的 fork 入仓**（与 ADR-0015 的钉版本策略一致）。
+
+> **受 ADR-0028 更正**：此处原写"复用系统 Chromium，阻止其 `postinstall` 另行下载"，**实测证明不可行**——Playwright 需要其版本对应的特定构建（本机 1.64.1 要求 chromium revision 1248），无法指向系统 Chrome。已改为接受 Playwright 安装匹配构建（约 150MB）。同时"状态与浏览器缓存需以 `HOME` 重定向"也是实测新增的必要条件。
 
 **三、把两步发布作为读回校验点（Q118）。** 它的流程是「预览并发布」→「确认发布」两步，恰好是校验插入的位置：第一步之后、第二步之前读回表单内容与预期比对。
 

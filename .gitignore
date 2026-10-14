@@ -26,3 +26,6 @@ DailyHotApi/node_modules/
 # ── 输出产物的图片（体积大且可从源重建）──
 outputs/**/*.png
 outputs/**/*.jpg
+
+# ── 本地运行状态（ADR-0028：HOME 重定向的产物）──
+.home/

@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""发布包装层：串行锁 + 前置条件检查 + 发布 + 反查验证 + 熔断。
+
+设计依据：
+- ADR-0024 发布后反查验证（不信任 toutiao-ops 的返回值）
+- ADR-0030 浏览器命令必须串行；并发冲突不算失败
+- ADR-0011 两类重试：只读可重试，写操作（发布）绝不自动重试
+- ADR-0013 / 0020 四道门 + 发布后反查（第五道）
+- ADR-0023 2GB 内存约束：发布前内存预检、Chrome 用完即杀
+- ADR-0014 dry-run：dryRun 默认 True
+
+本脚本是**包装层**，不重新实现发布逻辑：它调用 vendored 的 toutiao-ops CLI。
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CST = timezone(timedelta(hours=8))
+
+# ADR-0030：并发冲突的识别特征（瞬时竞态，可重试，不算失败）
+CONCURRENCY_MARKERS = [
+    "Target page, context or browser has been closed",
+    "正在现有的浏览器会话中打开",
+    "ProcessSingleton",
+]
+
+# ADR-0030：登录失效的识别特征
+LOGIN_MARKERS = [
+    "未登录",
+    "not logged in",
+    "auth/page/login",
+    "请先执行: toutiao auth login",
+]
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+class Breaker:
+    """熔断状态（ADR-0025：存仓内文件，便于人工解除、guard 可同步读）。"""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def state(self) -> dict:
+        if not self.path.exists():
+            return {"tripped": False}
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {"tripped": False, "unreadable": True}
+
+    def trip(self, reason: str, detail: dict | None = None) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(
+                {
+                    "tripped": True,
+                    "reason": reason,
+                    "detail": detail or {},
+                    "tripped_at": datetime.now(CST).isoformat(),
+                    "how_to_clear": "人工修复后删除本文件即可解除（ADR-0011）",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+
+class FileLock:
+    """跨进程串行锁（ADR-0030）。
+
+    关于陈旧锁：不能只检查文件存在性——进程崩溃会留下永久锁。
+    因此记录 pid，并用 kill(pid, 0) 判断持有者是否仍存活。
+    """
+
+    def __init__(self, path: Path, timeout: float = 300.0, poll: float = 2.0):
+        self.path = path
+        self.timeout = timeout
+        self.poll = poll
+
+    def _holder_alive(self) -> bool:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            pid = int(data.get("pid", 0))
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
+            return False  # 无法解析 → 视为陈旧
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(
+                    fd,
+                    json.dumps({"pid": os.getpid(), "at": datetime.now(CST).isoformat()}).encode(),
+                )
+                os.close(fd)
+                return self
+            except FileExistsError:
+                if not self._holder_alive():
+                    try:
+                        self.path.unlink()
+                        continue  # 陈旧锁，立即重试
+                    except OSError:
+                        pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"等待浏览器锁超时（{self.timeout}s）：{self.path}")
+                time.sleep(self.poll)
+
+    def __exit__(self, *exc):
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def run_toutiao(args: list[str], env: dict, timeout: int = 300) -> tuple[int, str, str]:
+    """调用 vendored toutiao-ops CLI。返回 (退出码, stdout, stderr)。
+
+    ADR-0028：必须检查退出码，不经管道（管道会掩码退出码）。
+    ADR-0030：必须经由本函数串行调用。
+    """
+    proc = subprocess.run(
+        ["node", "index.js", *args],
+        cwd=env["TT_CLI_DIR"],
+        env=env["ENVIRON"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def classify_failure(text: str) -> str:
+    """把失败分类，用于决定"可重试"还是"熔断"（ADR-0011 + ADR-0030）。"""
+    low = text.lower()
+    if any(m.lower() in low for m in CONCURRENCY_MARKERS):
+        return "concurrency"  # 瞬时竞态 → 可重试
+    if any(m.lower() in low for m in LOGIN_MARKERS):
+        return "login_lost"  # 登录失效 → 熔断
+    return "unknown"
+
+
+def memory_check(min_free_mb: int) -> tuple[bool, str]:
+    """发布前内存预检（ADR-0023）。macOS/Linux 各自的取值方式。"""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
+            page = 4096
+            free = inactive = 0
+            for line in out.splitlines():
+                if "page size of" in line:
+                    m = re.search(r"page size of (\d+)", line)
+                    if m:
+                        page = int(m.group(1))
+                if line.startswith("Pages free"):
+                    free = int(re.search(r"(\d+)", line).group(1))
+                if line.startswith("Pages inactive"):
+                    inactive = int(re.search(r"(\d+)", line).group(1))
+            avail_mb = (free + inactive) * page / 1024 / 1024
+        else:
+            with open("/proc/meminfo") as f:
+                info = f.read()
+            avail = re.search(r"MemAvailable:\s+(\d+) kB", info)
+            avail_mb = int(avail.group(1)) / 1024 if avail else 0
+    except Exception as exc:  # noqa: BLE001
+        return True, f"内存检测失败（跳过预检）：{exc}"
+
+    if avail_mb < min_free_mb:
+        return False, f"可用内存不足：{avail_mb:.0f}MB < {min_free_mb}MB"
+    return True, f"可用内存 {avail_mb:.0f}MB ≥ {min_free_mb}MB"
+
+
+def read_publish_snapshot(out_dir: Path, slug: str) -> tuple[str, str] | None:
+    """读成稿（标题 + 正文）。成稿由写作阶段写入 outputs/。"""
+    md = out_dir / f"{slug}.md"
+    if not md.exists():
+        return None
+    text = md.read_text(encoding="utf-8")
+    title = ""
+    body = text
+    m = re.match(r"^#\s+(.+)$", text, re.M)
+    if m:
+        title = m.group(1).strip()
+        body = text[m.end():].lstrip("\n")
+    return title, body
+
+
+def append_ledger(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="NewsAgg 发布包装层")
+    ap.add_argument("--slug", required=True, help="成稿 slug（对应 outputs/<slug>.md）")
+    ap.add_argument("--cover", required=True, help="封面图路径（头条必填）")
+    ap.add_argument("--mode", choices=["dry-run", "publish"], default="dry-run",
+                    help="dry-run 只填表不发布（默认）；publish 真发")
+    ap.add_argument("--declaration", default="引用AI", help="作品声明（ADR-0013）")
+    ap.add_argument("--min-free-mb", type=int, default=800, help="发布前可用内存下限（ADR-0023）")
+    ap.add_argument("--lock-timeout", type=float, default=300.0)
+    ap.add_argument("--account", default="default")
+    args = ap.parse_args()
+
+    root = repo_root()
+    now = datetime.now(CST)
+    breaker = Breaker(root / ".newsagg" / "breaker.json")
+    ledger = root / ".newsagg" / "publish-ledger.jsonl"
+
+    # ── 门 0：熔断状态（ADR-0025：这是 guard 要同步读的部分）──
+    st = breaker.state()
+    if st.get("tripped"):
+        print(json.dumps({
+            "ok": False, "stage": "breaker",
+            "message": "熔断中，拒绝发布。修复后删除 .newsagg/breaker.json 解除。",
+            "reason": st.get("reason"), "tripped_at": st.get("tripped_at"),
+        }, ensure_ascii=False, indent=2))
+        return 1
+
+    # ── 成稿存在性 ──
+    snap = read_publish_snapshot(root / "outputs", args.slug)
+    if snap is None:
+        print(json.dumps({"ok": False, "stage": "input",
+                          "message": f"找不到成稿：outputs/{args.slug}.md"},
+                         ensure_ascii=False, indent=2))
+        return 1
+    title, body = snap
+    if not title:
+        print(json.dumps({"ok": False, "stage": "input",
+                          "message": "成稿缺少一级标题（# 标题）"}, ensure_ascii=False, indent=2))
+        return 1
+    # 头条标题硬限制 2~30 字（ADR-0024）
+    if not (2 <= len(title) <= 30):
+        print(json.dumps({"ok": False, "stage": "input",
+                          "message": f"标题长度 {len(title)} 不在 2~30 字内：{title}"},
+                         ensure_ascii=False, indent=2))
+        return 1
+    if not Path(args.cover).exists():
+        print(json.dumps({"ok": False, "stage": "input",
+                          "message": f"封面不存在：{args.cover}（头条必填，ADR-0013）"},
+                         ensure_ascii=False, indent=2))
+        return 1
+
+    # ── 门 3：内存预检（ADR-0023）──
+    mem_ok, mem_msg = memory_check(args.min_free_mb)
+    if not mem_ok:
+        breaker.trip("memory_insufficient", {"detail": mem_msg, "slug": args.slug})
+        print(json.dumps({"ok": False, "stage": "memory", "message": mem_msg},
+                         ensure_ascii=False, indent=2))
+        return 1
+
+    # ── 环境：ADR-0028 的 HOME 重定向（状态与浏览器缓存一起）──
+    ws_home = root / ".home"
+    ws_home.mkdir(parents=True, exist_ok=True)
+    env = {
+        "TT_CLI_DIR": str(root / "reference" / "toutiao-ops" / "cli"),
+        "ENVIRON": {
+            **os.environ,
+            "HOME": str(ws_home),                 # 重定向状态 + Playwright 缓存
+            "PATH": f"{root / '.uv-bin'}:{os.environ.get('PATH', '')}",
+        },
+    }
+
+    steps: list[dict] = []
+
+    with FileLock(root / ".newsagg" / "browser.lock", timeout=args.lock_timeout):
+        # ── 门 2：登录预检（只读，可重试；ADR-0011 + ADR-0030）──
+        login_ok = False
+        for attempt in range(1, 4):
+            code, out, err = run_toutiao(["auth", "check", "--account", args.account],
+                                         env, timeout=180)
+            kind = classify_failure(out + err)
+            if code == 0 and '"logged_in": true' in out:
+                login_ok = True
+                steps.append({"step": "auth_check", "attempt": attempt, "ok": True})
+                break
+            steps.append({"step": "auth_check", "attempt": attempt, "ok": False,
+                          "kind": kind, "code": code})
+            if kind == "login_lost":
+                break
+            time.sleep(5)
+        if not login_ok:
+            breaker.trip("login_lost", {"slug": args.slug, "steps": steps})
+            print(json.dumps({
+                "ok": False, "stage": "auth", "message": "登录预检失败，已熔断",
+                "steps": steps, "how_to_fix": "重新扫码：node index.js auth login（HOME=<repo>/.home）",
+            }, ensure_ascii=False, indent=2))
+            return 1
+
+        # ── 发布或 dry-run ──
+        cmd = ["publish", "article",
+               "--title", title,
+               "--content-file", str(root / "outputs" / f"{args.slug}.md"),
+               "--cover", str(Path(args.cover).resolve()),
+               "--cover-mode", "single",
+               "--declaration", args.declaration,
+               "--account", args.account]
+        if args.mode == "dry-run":
+            cmd.append("--draft")   # 存草稿而非发布（最接近"停在发布前"）
+
+        code, out, err = run_toutiao(cmd, env, timeout=420)
+        kind = classify_failure(out + err)
+        steps.append({"step": "publish" if args.mode == "publish" else "draft",
+                      "mode": args.mode, "code": code, "kind": kind})
+
+        record = {
+            "at": now.isoformat(), "slug": args.slug, "title": title,
+            "mode": args.mode, "steps": steps, "stdout_tail": out[-800:],
+        }
+
+        # ── 门 5：反查验证（ADR-0024，仅真发时）──
+        if args.mode == "publish":
+            if code != 0:
+                if kind == "concurrency":
+                    # 并发冲突是瞬时竞态，但发布是写操作 → 不自动重试（ADR-0011）
+                    record["verdict"] = "unknown_needs_review"
+                    record["note"] = "发布遇并发冲突，结果未知；按 ADR-0011 不重发，需回后台核实"
+                elif kind == "login_lost":
+                    breaker.trip("login_lost", {"slug": args.slug})
+                    record["verdict"] = "login_lost"
+                else:
+                    record["verdict"] = "publish_failed"
+                append_ledger(ledger, record)
+                print(json.dumps({"ok": False, "stage": "publish", **record},
+                                 ensure_ascii=False, indent=2)[:4000])
+                return 1
+
+            # 反查：按标题在作品列表中查找
+            time.sleep(8)  # 给平台一点时间
+            rc, cout, cerr = run_toutiao(["content", "list", "--limit", "20",
+                                          "--account", args.account], env, timeout=240)
+            record["verify_code"] = rc
+            found = None
+            if rc == 0:
+                try:
+                    payload = json.loads(cout)
+                    blob = json.dumps(payload, ensure_ascii=False)
+                    if title in blob:
+                        found = "title_found"
+                        # 尽力判断状态（reviewing / rejected / published）
+                        for status in ("rejected", "reviewing", "published"):
+                            if status in blob:
+                                found = f"title_found:{status}"
+                                break
+                except json.JSONDecodeError:
+                    record["verify_parse_error"] = cout[:200]
+            record["verify_result"] = found or "title_not_found"
+
+            if found is None:
+                # 查不到 → 视为未发出，但不重发（ADR-0011）
+                record["verdict"] = "not_published_needs_review"
+                append_ledger(ledger, record)
+                print(json.dumps({"ok": False, "stage": "verify", **record},
+                                 ensure_ascii=False, indent=2)[:4000])
+                return 1
+            if found.endswith(":rejected"):
+                breaker.trip("content_rejected", {"slug": args.slug, "title": title})
+                record["verdict"] = "rejected"
+                append_ledger(ledger, record)
+                print(json.dumps({"ok": False, "stage": "verify", **record},
+                                 ensure_ascii=False, indent=2)[:4000])
+                return 1
+            record["verdict"] = found  # title_found / title_found:reviewing / :published
+        else:
+            record["verdict"] = "draft_saved" if code == 0 else "draft_failed"
+
+        append_ledger(ledger, record)
+        print(json.dumps({"ok": code == 0, **record}, ensure_ascii=False, indent=2)[:4000])
+        return 0 if code == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

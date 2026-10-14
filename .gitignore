@@ -1,0 +1,28 @@
+# ── 运行时状态与工具缓存（不入库）──
+.uv-cache/
+.uv-tools/
+.uv-bin/
+.npm-cache/
+.venv/
+node_modules/
+
+# ── 凭证（ADR-0015 / 0018 / 0022：绝不入库）──
+.env
+.wewrite/config.yaml
+.wewrite/browser-profile/
+.toutiao-ops/
+
+# ── 参考仓库（ADR-0012：本地可读，不入库，因含 GB 级依赖目录）──
+reference/
+
+# ── 已 vendored 的外部仓库的依赖目录 ──
+Agent-Reach/.venv/
+toutiao-ops/cli/node_modules/
+DailyHotApi/node_modules/
+
+# ── macOS ──
+.DS_Store
+
+# ── 输出产物的图片（体积大且可从源重建）──
+outputs/**/*.png
+outputs/**/*.jpg

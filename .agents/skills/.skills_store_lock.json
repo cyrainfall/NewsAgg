@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "@indiv-ebandao/dev-expert": {
+      "name": "编程专家.Skill",
+      "zip_url": "https://api.skillhub.cn/api/v1/download?slug=dev-expert&namespace=indiv-ebandao",
+      "source": "community",
+      "version": "1.21.9",
+      "namespace": {
+        "canonicalName": "@indiv-ebandao/dev-expert",
+        "displayName": "user_741dc82b",
+        "handle": "indiv-ebandao",
+        "publicSlug": "dev-expert"
+      },
+      "internalSlug": "dev-expert",
+      "publicSlug": "dev-expert",
+      "installDir": "/Users/cyx/repo/ybrain/.agents/skills/@indiv-ebandao/dev-expert"
+    }
+  }
+}

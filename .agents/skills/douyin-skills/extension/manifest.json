@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Douyin Bridge",
+  "version": "1.0.0",
+  "description": "抖音创作服务平台自动化 Bridge - 连接本地 Python CLI",
+  "permissions": ["tabs", "cookies", "scripting", "alarms", "debugger", "storage"],
+  "host_permissions": ["https://*.douyin.com/*", "https://douyin.com/*", "ws://localhost/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Douyin Bridge"
+  }
+}

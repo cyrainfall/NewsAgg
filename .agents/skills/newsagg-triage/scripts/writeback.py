@@ -75,7 +75,11 @@ def append_covered_event(raw_fm: str, event_desc: str, date: str) -> str:
 
 
 def append_revision(body: str, revision: str) -> str:
-    """把一条修订追加到「## 修订史」段末尾。段落缺失则创建。"""
+    """把一条修订追加到「## 修订史」段末尾。段落缺失则创建。
+
+    注意：必须在插入内容与后续 `##` 标题之间保留空行，否则 markdown 渲染时
+    下一节标题会被吸进列表项里（本函数早期版本就产生过这种残缺结构）。
+    """
     m = re.search(r"^##\s+修订史\s*$", body, re.M)
     if not m:
         return body.rstrip() + "\n\n## 修订史\n\n" + revision + "\n"
@@ -84,7 +88,10 @@ def append_revision(body: str, revision: str) -> str:
     tail_start = m.end() + (nxt.start() if nxt else len(rest))
     head = body[:tail_start].rstrip()
     tail = body[tail_start:]
-    return head + "\n" + revision + "\n" + tail
+    if tail:
+        # 有后续小节：修订块之后补空行，再接下一节
+        return head + "\n" + revision + "\n\n" + tail
+    return head + "\n" + revision + "\n"
 
 
 def main() -> int:
@@ -108,6 +115,28 @@ def main() -> int:
     date = args.date or f"{now:%Y-%m-%d}"
     text = path.read_text(encoding="utf-8")
     fm, body, raw_fm = parse_frontmatter(text)
+
+    # ── 幂等保护（ADR-0026 的同构要求）──
+    # 与"风格学习需按版本去重"同理：同一次事件被写回两次，会让 covered_events
+    # 出现重复条目，从而污染「跳过 vs 续写」的判定——分拣会以为写过两次。
+    # 判据：同日 + 同事件（前缀匹配）已存在于 covered_events。
+    event_key = args.event[:24]
+    for e in (fm.get("covered_events") or []):
+        if str(e).startswith(date) and event_key in str(e):
+            print(json.dumps({
+                "ok": True, "skipped": True, "reason": "该事件已在 covered_events 中（幂等保护）",
+                "card": args.card, "date": date, "matched": str(e),
+            }, ensure_ascii=False, indent=2))
+            return 0
+
+    # 若同一来源文章已写过修订，也跳过（防止同日重跑产生重复修订条目）
+    if args.article and f"来源 {args.article}" in body:
+        print(json.dumps({
+            "ok": True, "skipped": True,
+            "reason": f"来源文章 {args.article} 已在修订史中（幂等保护）",
+            "card": args.card,
+        }, ensure_ascii=False, indent=2))
+        return 0
 
     # ── 构造修订记录 ──
     lines = [f"- {date} 修订（**未复核**，来源 "

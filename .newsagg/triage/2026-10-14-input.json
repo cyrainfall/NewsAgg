@@ -1,5 +1,5 @@
 {
-  "prepared_at": "2026-10-14T22:19:16.074200+08:00",
+  "prepared_at": "2026-10-14T22:36:04.826741+08:00",
   "instruction": "对每条候选条目：先聚成事件，再判断接得住哪张卡，给出三态决策（skip / continue / new）。判据见 SKILL.md 的硬规则。",
   "limits": {
     "max_articles_per_day": 1,

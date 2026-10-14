@@ -6,17 +6,26 @@ import { mkdirSync } from 'fs';
 
 chromium.use(StealthPlugin());
 
-const BASE_DIR = join(homedir(), '.toutiao-ops');
 const DEFAULT_ACCOUNT = 'default';
 
 const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
 
+// NewsAgg patch (ADR-0024 / ADR-0023)：服务器 2GB 内存必需。
+// 上游原本没有这些参数，在容器/小内存环境下会因为 /dev/shm 不足而崩溃。
 const LAUNCH_ARGS = [
   '--disable-blink-features=AutomationControlled',
   '--no-first-run',
   '--no-default-browser-check',
   '--disable-infobars',
+  '--disable-dev-shm-usage',
+  '--no-sandbox',
+  '--renderer-process-limit=1',
+  '--disable-gpu',
 ];
+
+// NewsAgg note (ADR-0028)：状态目录与 Playwright 浏览器缓存都由 HOME 决定，
+// 因此调用方通过设置 HOME 把两者一起重定向到仓内位置，源码无需改动。
+const BASE_DIR = join(homedir(), '.toutiao-ops');
 
 /**
  * 获取指定账号的数据目录路径。

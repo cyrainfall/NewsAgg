@@ -12,9 +12,13 @@
 | `auth check` 登录态检测 | Q66 发布前预检登录态 | ✅ 已实现 |
 | 文章发布（Markdown 富文本、封面、声明） | Q65 发布技能职责 | ✅ 已实现 |
 | `--declaration` 支持 `引用AI` | Q71 AI 标识 | ✅ 原生支持 |
-| `analytics works` / `content-detail` | Q41 数据读回 | ✅ 已实现（浏览器内 API） |
-| `content list`（含 title/status） | Q134 发布反查验证 | ✅ 可用 |
+| `analytics works` / `content-detail` | Q41 数据读回 | ⚠️ **接口存在但数据不可用**（ADR-0037 实测修正） |
+| `content list`（含 title/status） | Q134 发布反查验证 | ✅ 可用，**且每篇自带 `itemCounter`**——循环 C 的唯一数据源（ADR-0037） |
 | `inspiration`（创作活动 + 热点推荐） | 采集侧 | ⚠️ 未纳入（见下） |
+
+> **能力表的两处修正（ADR-0037 实测）**：`analytics works` 只返回**账号级聚合**且 `source: dom_scrape`（`metrics` 里混着省份名与频道来源百分比）；`analytics content-detail` 的上游 API `/mp/agw/statistic/v2/item/info` 返回 `{code: 1003, item_data: {}, message: "数据开小差啦~请稍后再试"}`，**空数据**。而 `content list` 的每篇作品自带 `itemCounter`（展现/阅读/点赞/评论/转发），循环 C 因此**不需要** `content-detail`。
+>
+> 教训：**本表是"接口存在"的证据，不是"数据可用"的证据**。✅ 只表示命令能跑通并返回 200，不表示返回的内容是所声称的东西。
 
 其技术方案比本 ADR 原设想更成熟：`playwright-extra` + `puppeteer-extra-plugin-stealth` 隐藏自动化特征、`launchPersistentContext` 保留真实指纹、逐字输入带随机延迟、主动关闭弹窗与拒绝地理位置权限。数据类操作走**浏览器内 `fetch`/API 拦截**（复用登录 session），而非直接 POST ——这正是规避风控的正确做法。
 

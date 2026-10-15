@@ -61,10 +61,79 @@ def unwrap(raw):
     return raw.get("decision", raw) if isinstance(raw, dict) else {}
 
 
-def section_conclusion(decision, publish_recs, date: str) -> list[str]:
+def read_performance(root: Path) -> dict:
+    """读表现数据回路的状态（ADR-0010 循环 C）。
+
+    它有两半：入库的历史（`reports/performance.jsonl`）与运行时的本次结果
+    （`.newsagg/performance-status.json`）。后者决定"读到了没有"——表现数据
+    是经浏览器会话读的（Q41），浏览器失效时它和发布链路一起失明，
+    这正是简报必须显式呈现、而不是静默显示"无数据"的原因（ADR-0010）。
+    """
+    out: dict = {"available": False, "status": None, "records": [],
+                 "frequency": {}, "articles": {}}
+
+    store = root / "reports" / "performance.jsonl"
+    if store.exists():
+        for line in store.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out["records"].append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # 容忍坏行
+
+    st = read_json(root / ".newsagg" / "performance-status.json")
+    if st:
+        out["status"] = st
+        out["available"] = bool(st.get("ok"))
+
+    freq = read_json(root / ".newsagg" / "frequency.json")
+    if freq:
+        out["frequency"] = freq
+
+    # 每篇取最新观测（用于 ③ 段呈现本篇表现）
+    for r in out["records"]:
+        if not r.get("ours"):
+            continue
+        key = r.get("gid") or r.get("slug")
+        if key:
+            out["articles"][key] = r
+    return out
+
+
+def fmt_rate(rate) -> str:
+    if rate is None:
+        return "无"
+    try:
+        return f"{float(rate):.2%}"
+    except (TypeError, ValueError):
+        return "无"
+
+
+def fmt_metrics(metrics: dict | None) -> str:
+    m = metrics or {}
+    label = {"showCount": "展现", "readCount": "阅读", "diggCount": "点赞",
+             "commentCount": "评论", "repinCount": "转发"}
+    parts = [f"{label[k]} {m[k]}" for k in label if k in m]
+    return " / ".join(parts) if parts else "无"
+
+
+def section_conclusion(decision, publish_recs, date: str, perf: dict | None = None) -> list[str]:
     out = ["## ① 今日结论", ""]
     d = unwrap(decision)
     if not d:
+        # 降频跳过日会刻意不产出决策文件。若不特判，① 段会写成"无决策记录"，
+        # 那正是 ADR-0019 要求区分开的两种情形之一（"系统没跑"）——会误报。
+        freq = (perf or {}).get("frequency") or {}
+        if freq.get("downshifted"):
+            out += [f"**降频跳过日**（系统处于自动降频状态，自 {freq.get('since')} 起隔日发文）。",
+                    "今日只出简报，不采集、不写作、不发布。",
+                    "",
+                    "> 这是 ADR-0010 的设计行为，不是故障；也不是「今日无选题」。",
+                    f"> 恢复需人工确认：{freq.get('how_to_clear') or '删除 .newsagg/frequency.json'}",
+                    ""]
+            return out
         out += ["**无决策记录**（分拣层今日未运行或未产出）。", ""]
         return out
 
@@ -144,11 +213,26 @@ def section_overview(candidates, decision) -> list[str]:
     return out
 
 
-def section_article(decision, publish_recs, body_dir: Path) -> list[str]:
+def section_article(decision, publish_recs, body_dir: Path, perf: dict | None = None) -> list[str]:
     out = ["## ③ 本篇文章与发布结果", ""]
     d = unwrap(decision)
+
+    # 表现数据（ADR-0010 循环 C）：呈现的是**已发表文章**的最新一次读回，
+    # 不是今天这篇——今天这篇当天还没有数据（这句必须说清，否则会误导）。
+    # 放在弃权早返回之前：弃权日恰恰是本人最想看已发文章表现的时候。
+    perf_block: list[str] = []
+    if perf and perf.get("articles"):
+        perf_block = ["", "**已发表文章的表现**（截至本次读回，累计值）："]
+        rows = sorted(perf["articles"].values(),
+                      key=lambda r: str(r.get("published_at") or ""))
+        for r in rows:
+            perf_block += [f"- {r.get('title','')}：阅读率 {fmt_rate(r.get('read_rate'))}"
+                           f"（{fmt_metrics(r.get('metrics'))}）"]
+
     if not d or d.get("action") == "abstain":
-        out += ["本日无文章。", ""]
+        out += ["本日无文章。"]
+        out += perf_block
+        out += [""]
         return out
 
     ev = d.get("event") or {}
@@ -169,6 +253,8 @@ def section_article(decision, publish_recs, body_dir: Path) -> list[str]:
     drafts = [r for r in publish_recs if r.get("verdict") == "draft_saved"]
     if drafts:
         out += ["", "**本次为 dry-run**：已创建草稿，需人工清理。"]
+
+    out += perf_block
     out += [""]
     return out
 
@@ -193,7 +279,7 @@ def section_assets(decision, cards_dir: Path) -> list[str]:
     return out
 
 
-def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None) -> list[str]:
+def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None) -> list[str]:
     out = ["## ⑤ 需你介入的事项", ""]
     any_item = False
 
@@ -226,6 +312,28 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
     if failed:
         any_item = True
         out += [f"**信源失效**：{', '.join(map(str, failed))}", ""]
+
+    if perf:
+        freq = perf.get("frequency") or {}
+        if freq.get("downshifted"):
+            any_item = True
+            out += [f"**系统已自动降频（隔日发文）**，自 {freq.get('since')} 起。",
+                    f"  原因：{freq.get('reason') or '（未记录）'}",
+                    "  这是 ADR-0010 的设计行为，不是故障——但它会让系统**变得更不活跃**，",
+                    "  产出下降本身会掩盖问题的严重性，所以必须在这里告警。",
+                    f"  恢复需人工确认：{freq.get('how_to_clear') or '删除 .newsagg/frequency.json'}",
+                    ""]
+
+        status = perf.get("status")
+        if status and not status.get("ok"):
+            any_item = True
+            out += [f"**表现数据读回失败**：{status.get('reason')}（阶段 {status.get('stage')}）",
+                    "  它和发布链路共用浏览器会话（ADR-0010），因此失败往往与登录态相关；",
+                    "  本次运行不受影响，但排序参考与降频判据暂时是旧的。",
+                    ""]
+            st = status.get("detail") or {}
+            if st.get("lock_timeout"):
+                out += ["  等待浏览器锁超时——检查是否有残留的锁文件或并发进程（ADR-0030）。", ""]
 
     if not any_item:
         out += ["无。", ""]
@@ -262,11 +370,12 @@ def main() -> int:
             cover = c if c.exists() else None
 
     lines = [f"# NewsAgg 简报 {date}", ""]
-    lines += section_conclusion(decision, publish_recs, date)
+    perf = read_performance(root)
+    lines += section_conclusion(decision, publish_recs, date, perf)
     lines += section_overview(cand, decision)
-    lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies")
+    lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies", perf)
     lines += section_assets(decision, root / "knowledge" / "cards")
-    lines += section_actions(publish_recs, cand, decision, cover, slug)
+    lines += section_actions(publish_recs, cand, decision, cover, slug, perf)
 
     lines += ["---", f"*生成于 {now.isoformat()} ｜ 时区 Asia/Shanghai*"]
     md = "\n".join(lines)
@@ -284,6 +393,7 @@ def main() -> int:
         "has_decision": decision is not None,
         "has_candidates": cand is not None,
         "publish_records": len(publish_recs),
+        "performance_available": bool(perf.get("available")),
         "sections": 5,
     }, ensure_ascii=False, indent=2))
     return 0

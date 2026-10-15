@@ -105,8 +105,80 @@ def load_candidates(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def build_triage_input(candidates: dict, cards: list[dict], cooldown: dict) -> dict:
-    """组装模型的输入包：候选条目 + 全部卡 + 冷却状态 + 限额。"""
+def performance_reference(perf_path: Path, runs_path: Path) -> dict:
+    """汇总历史表现，供分拣做**排序参考**（ADR-0010）。
+
+    ⚠️ 这是软信号，不是硬规则：ADR-0010 明确不据此自动降权或退役卡片。
+    因此这里只把「每张卡接过的文章跑出了什么数据」摆出来，让模型在
+    「卡匹配度 × 事件热度」相当时多一个参考维度——**不参与打分，也不设阈值**。
+    读不到就返回 available: false，分拣照常进行。
+    """
+    ref: dict = {"available": False, "note": "无表现数据历史"}
+    if not perf_path.exists():
+        return ref
+
+    try:
+        records = []
+        for line in perf_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    except (json.JSONDecodeError, OSError) as exc:
+        return {"available": False, "note": f"表现数据不可解析：{exc}"}
+
+    # 每篇取最新一次观测
+    latest: dict[str, dict] = {}
+    for r in records:
+        if not r.get("ours"):
+            continue
+        key = r.get("gid") or r.get("slug")
+        if key:
+            latest[key] = r
+    if not latest:
+        return {"available": False, "note": "表现数据里没有本账号的文章"}
+
+    # slug → card_file（分拣决策文件里记着接的是哪张卡）
+    slug_to_card: dict[str, str] = {}
+    if runs_path.exists():
+        for d in sorted(runs_path.glob("*-decision.json")):
+            try:
+                raw = json.loads(d.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            dec = raw.get("decision", raw)
+            card = dec.get("card_file")
+            if not card:
+                continue
+            date = raw.get("date") or d.name[:10]
+            for md in sorted((runs_path.parent.parent / "outputs").glob(f"{date}-*.md")):
+                slug_to_card[md.stem] = card
+
+    by_card: dict[str, list[dict]] = {}
+    unlinked = 0
+    for r in latest.values():
+        card = slug_to_card.get(str(r.get("slug") or ""))
+        item = {
+            "slug": r.get("slug"), "date": r.get("date"),
+            "read_rate": r.get("read_rate"), "metrics": r.get("metrics"),
+        }
+        if card:
+            by_card.setdefault(card, []).append(item)
+        else:
+            unlinked += 1
+
+    return {
+        "available": True,
+        "note": ("软信号（ADR-0010）：仅作「卡匹配度 × 事件热度」相当时的排序参考，"
+                 "不参与打分、不触发降权或退役。卡片历史表现差不等于该卡该退役。"),
+        "articles_observed": len(latest),
+        "by_card": by_card,
+        "unlinked_articles": unlinked,
+    }
+
+
+def build_triage_input(candidates: dict, cards: list[dict], cooldown: dict,
+                       performance: dict | None = None) -> dict:
+    """组装模型的输入包：候选条目 + 全部卡 + 冷却状态 + 限额 + 历史表现参考。"""
     return {
         "prepared_at": datetime.now(CST).isoformat(),
         "instruction": (
@@ -124,6 +196,7 @@ def build_triage_input(candidates: dict, cards: list[dict], cooldown: dict) -> d
         "collection_counts": candidates.get("counts", {}),
         "stale_sources": candidates.get("stale_sources", []),
         "failed_sources": [f.get("source") for f in candidates.get("failures", [])],
+        "performance_reference": performance or {"available": False, "note": "未读取"},
     }
 
 
@@ -226,7 +299,13 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
 
-    pkg = build_triage_input(candidates, cards, cooldown)
+    pkg = build_triage_input(
+        candidates, cards, cooldown,
+        performance=performance_reference(
+            root / "reports" / "performance.jsonl",
+            root / ".newsagg" / "triage",
+        ),
+    )
     pkg["limits"] = limits
 
     out_path = Path(args.out) if args.out else root / ".newsagg" / "triage" / f"{now:%Y-%m-%d}-input.json"

@@ -60,6 +60,48 @@ if ch:
     print("    python3 .agents/skills/newsagg-triage/scripts/style_patterns.py --prepare")
 PYEOF
 
+# ── ②b 表现数据（ADR-0010 循环 C）──
+# 必须在分拣之前：分拣把它当排序参考。**必须永不致命**——表现数据读不回来
+# 不能拖垮整轮运行，否则看守无法区分「系统没跑」与「数据读不到」（ADR-0006）。
+log "②b 表现数据（循环 C：读回 + 自身基准 + 降频判定）"
+python3 .agents/skills/newsagg-performance/scripts/performance.py > /tmp/newsagg-perf.json 2>&1 || true
+python3 - <<'PYEOF'
+import json
+try:
+    d = json.load(open("/tmp/newsagg-perf.json", encoding="utf-8"))
+except Exception:
+    print("（表现数据输出无法解析——本次读回失败，不影响本轮运行）")
+    raise SystemExit(0)
+if not d.get("ok"):
+    print(f"  读回失败（阶段 {d.get('stage')}）：{d.get('reason')}")
+    print("  → 排序参考与降频判据沿用旧值；简报 ⑤ 段会呈现本项")
+    raise SystemExit(0)
+v = d.get("verdict", {})
+print(f"  平台作品 {d.get('articles_on_platform')} 篇，"
+      f"其中本账号 {d.get('articles_matched')} 篇，新增记录 {d.get('new_records')} 条")
+if v.get("status") == "cold_start":
+    print(f"  基准：{v.get('note')}")
+else:
+    print(f"  基准阅读率 {v.get('baseline_read_rate')}，阈值 {v.get('threshold')}，"
+          f"连续低迷 {v.get('low_streak')} 篇 → {v.get('status')}")
+f = d.get("frequency", {})
+if f.get("downshifted"):
+    print(f"  ⚠ 系统已降频：{f.get('why')}")
+PYEOF
+
+# ── ②c 降频跳过日（ADR-0010：自动降频，恢复需人工确认）──
+SKIP_DAY="$(python3 .agents/skills/newsagg-performance/scripts/performance.py --check-skip 2>/dev/null \
+  | python3 -c 'import json,sys
+try: print("1" if json.load(sys.stdin).get("skip") else "0")
+except Exception: print("0")' 2>/dev/null || echo 0)"
+if [[ "$SKIP_DAY" == "1" ]]; then
+  log "②c 降频跳过日：今日不发文"
+  echo "系统处于自动降频状态（ADR-0010），今日为跳过日——只出简报，不采集不写作不发布。"
+  echo "解除：人工确认表现已恢复后删除 .newsagg/frequency.json。"
+  python3 .agents/skills/newsagg-brief/scripts/brief.py || true
+  exit 0
+fi
+
 # ── ③ 采集 ──
 log "③ 采集"
 python3 .agents/skills/newsagg-collect/scripts/collect.py --base "$HOT_BASE"

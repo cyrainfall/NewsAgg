@@ -39,14 +39,55 @@ def sha256_text(t: str) -> str:
     return hashlib.sha256(t.encode("utf-8")).hexdigest()
 
 
-def find_publish_snapshot(root: Path, rel_path: str) -> tuple[str, str] | None:
-    """找该文件在 git 历史中**最后一次被提交**的版本，即发布快照。
+def read_ledger(ledger: Path) -> list[dict]:
+    """读发布账本（每行一条记录）。"""
+    if not ledger.exists():
+        return []
+    out = []
+    for line in ledger.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
 
-    发布时系统会 commit 成稿（ADR-0026），因此"最后一次提交"就是发布内容。
-    取 HEAD 提交而非工作区内容——工作区可能已被本人修改。
+
+def find_publish_snapshot(root: Path, rel_path: str, slug: str) -> tuple[str, str] | None:
+    """取发布快照（发布那一刻的成稿内容），作为风格 diff 的基线。
+
+    ⚠️ ADR-0036：**不能**用「该文件最后一次提交」推断快照。
+    本人改稿并 push 后，最后一次提交就变成改稿本身，基线随之错位 ——
+    diff 恒为空、风格学习静默失效（本项目实测踩到，见 ADR-0036）。
+
+    优先级：
+    1. 发布账本里记录的 `snapshot.git_blob`（发布时写入，权威）
+    2. 回退：账本记录的发布时间之前的最后一次提交（兼容 ADR-0036 之前的旧记录）
     """
+    recs = [r for r in read_ledger(root / ".newsagg" / "publish-ledger.jsonl")
+            if r.get("slug") == slug and r.get("mode") == "publish"]
+    if not recs:
+        return None
+    rec = recs[-1]
+    published_at = rec.get("at")
+
+    # ── 路径 1：账本记录了 git blob（ADR-0036 之后）──
+    blob = (rec.get("snapshot") or {}).get("git_blob")
+    if blob:
+        try:
+            content = git("cat-file", "-p", blob, cwd=root)
+            return f"blob:{blob[:8]}", content
+        except RuntimeError:
+            pass  # blob 可能已被 GC，落到路径 2
+
+    # ── 路径 2：回退，取发布时间之前的最后一次提交 ──
+    if not published_at:
+        return None
     try:
-        log = git("log", "--format=%H", "-1", "--", rel_path, cwd=root).strip()
+        log = git("log", "--format=%H", "-1", f"--before={published_at}",
+                  "--", rel_path, cwd=root).strip()
     except RuntimeError:
         return None
     if not log:
@@ -96,7 +137,7 @@ def main() -> int:
     results = []
     for path in outs:
         rel = str(path.relative_to(root))
-        snap = find_publish_snapshot(root, rel)
+        snap = find_publish_snapshot(root, rel, path.stem)
         if snap is None:
             results.append({"file": rel, "status": "no_snapshot",
                             "why": "该文件尚未被提交，无发布快照可比对"})
@@ -143,11 +184,38 @@ def main() -> int:
             "WEWRITE_HOME": str(root / ".wewrite"),
             "PATH": f"{root / '.uv-bin'}:{__import__('os').environ.get('PATH','')}",
         }
+        # ── 抑制 learn-edits 的范文库自动增长（ADR-0036）──
+        # learn_edits.py:468-481 会把本次的「终稿」自动收进范文库，凡
+        # quality_score>=50 即入库并标 ownership=user / authenticity=user_edited。
+        # 两个实测缺陷：
+        #   ① 它无法分辨「本人真实定稿」与「测试夹具」——一次模拟修改的
+        #      临时终稿曾被永久登记为"用户亲笔范文"，污染写作风格；
+        #   ② detect_category 的 STORY_MARKERS 含「我」，中文技术观点文
+        #      必然命中，实测把技术文判成 story-emotional。
+        # 范文属风格资产，其档次与类别需人工把关，故自动增长一律丢弃，
+        # 由显式步骤（见 ADR-0036）按正确类别添加。
+        ex_dir = root / ".wewrite" / "exemplars"
+        ex_index = ex_dir / "index.yaml"
+        ex_before = {p.name for p in ex_dir.glob("*.md")} if ex_dir.exists() else set()
+        ex_index_before = ex_index.read_text(encoding="utf-8") if ex_index.exists() else None
+
         proc = subprocess.run(
             ["wewrite", "learn-edits", "--draft", str(draft_p), "--final", str(path)],
             capture_output=True, text=True, env=env, cwd=root,
         )
         ok = proc.returncode == 0
+
+        # 还原范文库：删除新增文件，恢复 index.yaml
+        ex_after = {p.name for p in ex_dir.glob("*.md")} if ex_dir.exists() else set()
+        auto_added = sorted(ex_after - ex_before)
+        for name in auto_added:
+            (ex_dir / name).unlink(missing_ok=True)
+        if ex_index_before is not None:
+            ex_index.write_text(ex_index_before, encoding="utf-8")
+        elif ex_index.exists():
+            ex_index.unlink()
+
+        exemplars_purged = auto_added
         if ok:
             learned[rel] = {
                 "last_learned_hash": cur_hash,
@@ -158,6 +226,7 @@ def main() -> int:
             "file": rel, "status": "learned" if ok else "failed",
             "commit": commit[:8],
             "exit_code": proc.returncode,
+            "exemplars_purged": exemplars_purged,
             "stdout_tail": proc.stdout[-300:],
             "stderr_tail": proc.stderr[-300:],
         })
@@ -171,7 +240,7 @@ def main() -> int:
         "checked": len(outs),
         "changed": len(changed),
         "results": results,
-        "note": "基线取发布快照（git 那次提交），不取 draft.md —— 见 ADR-0026",
+        "note": "基线取发布账本记录的快照（ADR-0036）；不取工作区、也不取最后一次提交",
     }, ensure_ascii=False, indent=2))
     return 0 if all(r["status"] != "failed" for r in results) else 1
 

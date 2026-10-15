@@ -1,5 +1,9 @@
 # 风格回路的两个实现发现：基线来源与 pattern 提取缺口
 
+> **部分作废**：下方「发现一」被 [ADR-0036](0036-publish-snapshot-must-be-recorded-and-exemplars-not-auto-grown.md) 推翻。
+> 发布快照**不能**由"最后一次提交"推断（本人改稿 push 后基线即错位），必须由发布时记录。
+> 「发现二」（pattern 提取缺口）继续有效。
+
 ## Context
 
 按 ADR-0026 实现风格回路（`learn-edits` 的 diff 学习）时，实测暴露两个此前设计未覆盖的事实。两者都会导致**回路静默失效**——看起来在跑，实际不产生任何学习效果。

@@ -1,0 +1,55 @@
+date: '2026-10-15'
+diff_summary:
+  char_diff: -38
+  draft_title: 模型打五折，未必是好事
+  final_title: Gemini 4 打五折：做应用的人在省钱，做模型的人在挨打
+  lines_added: 27
+  lines_deleted: 20
+  structure_changed: true
+  title_changed: true
+draft_file: /Users/cyx/repo/NewsAgg/.newsagg/style-diff/2026-10-14-gemini4-price-war.baseline.md
+final_file: /Users/cyx/repo/NewsAgg/outputs/2026-10-14-gemini4-price-war.md
+patterns:
+  - type: title
+    key: title_actor_and_benefit
+    description: "标题必须点名主体（公司/模型/产品名），并写出至少一类读者的利益点；禁用悬念式（'未必是好事'）。"
+    rule: "标题 = <主体名> + <读者利益点>。主体名不可省为泛指（'模型'/'大厂'）。利益点要能被目标读者一眼判定'这跟我有关'。信息流冷启动靠关键词匹配，标题必须命中赛道词。"
+    scope: global
+    scope_value: ""
+    confirmed: false
+  - type: structure
+    key: opening_benefit_first
+    description: "开头前两段先给读者利益点，作者的方法论/元叙事后移。"
+    rule: "首段之后立刻回答'这跟读者有什么关系'（省钱/挨打/划线在哪），再进入'我怎么读这件事'。禁止用'按惯例，这类…有两种读法'这类作者视角的方法论起手。信息流无关注关系，前两段决定跳出率。"
+    scope: global
+    scope_value: ""
+    confirmed: false
+  - type: structure
+    key: h2_reader_benefit
+    description: "小标题写成读者利益句，不是作者思路推进的节点。"
+    rule: "每个 H2 要么是一个对读者的承诺，要么是一个可带走的结论（'降的到底是售价，还是成本'／'哪些账现在算得过来了'）。禁止用纯内部视角的过程标题（'先看这次到底降了什么'／'我怎么看这一轮的定性'）——头条读者靠扫小标题决定是否继续。"
+    scope: global
+    scope_value: ""
+    confirmed: false
+  - type: expression
+    key: no_self_referential_trail
+    description: "删掉自我指涉的判断演化叙事，除非它本身就是新信息。"
+    rule: "不写'我原来的判断是…''我之前写过一句判断''那张判断里预留过一个反方'。判断可以直接给出，不必交代自己如何走到这个判断。对新读者这是自言自语，且挤占篇幅。"
+    scope: global
+    scope_value: ""
+    confirmed: false
+  - type: expression
+    key: thesis_early_not_diluted
+    description: "金句/核心判断前置到前 20%，且只保留一次自我限定。"
+    rule: "全文最可被转述的那句话放在前两段，不要留到结尾。同一结论不重复加限定（'保留警惕'/'不打算把话说满'/'没到可以下结论的程度'三连会把结论削没）。全文只保留一条最主要的警惕，其余合并。"
+    scope: global
+    scope_value: ""
+    confirmed: false
+  - type: expression
+    key: abstract_number_to_bill
+    description: "抽象百分比/指数必须配一个可执行换算或具体场景，并紧邻边界声明。"
+    rule: "'成本降到 60%'这类抽象比例要紧跟一个读者能对上号的换算（'过去每月推理花 1000 元，现在约 600 元'）或一个具体场景（'过去只敢在用户点开时调一次模型'）。数字越抽象，越需要锚点。换算是推算时必须紧跟边界声明（'这是按 60% 做的换算，不是实测'）——但不因此收回结论。"
+    scope: global
+    scope_value: ""
+    confirmed: false
+timestamp: '2026-10-15T22:39:24.142062'

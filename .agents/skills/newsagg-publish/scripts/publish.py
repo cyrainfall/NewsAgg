@@ -206,6 +206,34 @@ def read_publish_snapshot(out_dir: Path, slug: str) -> tuple[str, str] | None:
     return title, body
 
 
+def snapshot_fingerprint(md_path: Path) -> dict:
+    """记录发布那一刻成稿的指纹（ADR-0036）。
+
+    风格回路需要「发布快照」做 diff 基线。不能用「该文件最后一次提交」推断——
+    本人改稿并 push 之后，最后一次提交就变成了**改稿**，基线随之错位，
+    diff 恒为空、风格学习静默失效（实测踩到）。
+    因此发布时把指纹写进账本，让快照成为**记录下来的事实**而非事后推断。
+    """
+    text = md_path.read_text(encoding="utf-8")
+    fp = {
+        "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "published_at": datetime.now(CST).isoformat(),
+    }
+    try:
+        # 必须带 -w：只算哈希而不写对象时，该 blob 在 ODB 中并不存在。
+        # 那样只有在「事后有人把同样内容提交进 git」时才碰巧可解析——
+        # 而发布与提交是两个独立步骤（发布后由编排 agent commit），
+        # 提交失败或内容再改一次，快照就永久取不到，静默退回路径 2。
+        # -w 让快照在发布那一刻就独立于后续任何操作而存在。
+        proc = subprocess.run(["git", "hash-object", "-w", str(md_path)],
+                              capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            fp["git_blob"] = proc.stdout.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return fp
+
+
 def append_ledger(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -332,6 +360,8 @@ def main() -> int:
         record = {
             "at": now.isoformat(), "slug": args.slug, "title": title,
             "mode": args.mode, "steps": steps, "stdout_tail": out[-800:],
+            # ADR-0036：发布快照指纹，供风格回路做 diff 基线
+            "snapshot": snapshot_fingerprint(root / "outputs" / f"{args.slug}.md"),
         }
 
         # ── 门 5：反查验证（ADR-0024，仅真发时）──

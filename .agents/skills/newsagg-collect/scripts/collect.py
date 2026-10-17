@@ -189,6 +189,91 @@ def source_age_minutes(meta: dict, now: datetime) -> float | None:
     return (now - parsed).total_seconds() / 60.0
 
 
+def item_key(it: dict) -> str:
+    return f"{it.get('source')}:{it.get('id')}"
+
+
+def merge_candidates(existing: dict, fresh: dict) -> dict:
+    """把本次采集并入同日已有候选池（ADR-0006：采集 2–3 次以捕捉事件发酵过程）。
+
+    合并规则：
+    - 条目按 (source, id) 归并；**保留 first_seen**（第一次被看到的时间），
+      热度轨迹记进 hot_history —— 「发酵过程」正是这些中间值，而不是最后一个数字。
+    - 已有条目只更新热度/排名/封面等易变字段，不动 first_seen。
+    - 已恢复的源从 failures 中移除；sources 取并集。
+    - 每次采集追加一条 collection_runs，供简报呈现「今天采了几次、每次多少条」。
+    """
+    merged = dict(fresh)
+    prev_items = {item_key(i): i for i in existing.get("items", []) if item_key(i) != "None:None"}
+    prev_dropped = {item_key(i): i for i in existing.get("dropped", []) if item_key(i) != "None:None"}
+
+    items: list[dict] = []
+    for it in fresh.get("items", []):
+        old = prev_items.pop(item_key(it), None)
+        if old is None:
+            it = {**it, "first_seen": fresh["collected_at"],
+                  "hot_history": [{"at": fresh["collected_at"], "hot": it.get("hot")}]}
+        else:
+            it = {**it,
+                  "first_seen": old.get("first_seen", existing.get("collected_at")),
+                  "hot_history": (old.get("hot_history") or []) + [
+                      {"at": fresh["collected_at"], "hot": it.get("hot")}]}
+        items.append({**it, "seen_in_last_run": True})
+    # 上一轮见过、这一轮没再出现的条目：保留并标记，不静默丢弃
+    for old in prev_items.values():
+        items.append({**old, "seen_in_last_run": False})
+
+    dropped: list[dict] = []
+    for it in fresh.get("dropped", []):
+        old = prev_dropped.pop(item_key(it), None)
+        dropped.append(it if old is None else {**it, "first_seen": old.get("first_seen")})
+    dropped.extend(prev_dropped.values())
+
+    meta_by_source: dict[str, dict] = {}
+    for m in existing.get("source_meta", []):
+        meta_by_source[m["source"]] = {**m, "observations": m.get("observations", 1)}
+    for m in fresh.get("source_meta", []):
+        old = meta_by_source.get(m["source"])
+        meta_by_source[m["source"]] = {**m, "observations": (old or {}).get("observations", 0) + 1}
+
+    failed_sources = {f["source"] for f in fresh.get("failures", [])}
+    failures = [f for f in fresh.get("failures", [])]
+    failures += [f for f in existing.get("failures", []) if f["source"] not in failed_sources]
+
+    runs = list(existing.get("collection_runs", []))
+    runs.append({"at": fresh["collected_at"], **fresh.get("counts", {})})
+
+    # 本轮新进来的条目：以 first_seen 是否等于本次采集时刻判定。用 first_seen
+    # 而不是 fresh.counts.kept_new，是因为后者在"本次采集的条目全部是旧的"时
+    # 仍会报出本次的 kept 数——那会把"没新东西"显示成"采到 100 条新的"。
+    new_count = sum(1 for i in items if i.get("first_seen") == fresh["collected_at"])
+    runs[-1]["kept_new"] = new_count
+
+    merged.update({
+        "collected_at": fresh["collected_at"],
+        "first_collected_at": existing.get("first_collected_at")
+                              or existing.get("collected_at")
+                              or fresh["collected_at"],
+        "collection_runs": runs,
+        "sources": sorted({*existing.get("sources", []), *fresh.get("sources", [])}),
+        "source_meta": list(meta_by_source.values()),
+        "stale_sources": fresh.get("stale_sources", []),
+        "failures": failures,
+        "items": items,
+        "dropped": dropped,
+        "counts": {
+            "fetched": fresh.get("counts", {}).get("fetched", 0),
+            "kept": len(items),
+            "dropped": len(dropped),
+            "sources_ok": fresh.get("counts", {}).get("sources_ok", 0),
+            "sources_failed": fresh.get("counts", {}).get("sources_failed", 0),
+            "kept_new": len([i for i in items if i.get("first_seen") == fresh["collected_at"]]),
+            "runs_today": len(runs),
+        },
+    })
+    return merged
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="NewsAgg 采集层：热榜 → 归一化 → 赛道预筛")
     ap.add_argument("--base", default=os.environ.get("NEWSAGG_HOT_BASE", DEFAULT_BASE))
@@ -196,6 +281,8 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=20)
     ap.add_argument("--out", default=None, help="输出路径；默认 .newsagg/candidates/<日期>.json")
     ap.add_argument("--no-prescreen", action="store_true", help="跳过赛道预筛（保留全部条目）")
+    ap.add_argument("--no-merge", action="store_true",
+                    help="不并入同日已有候选池，直接覆盖（默认是累积合并，见 ADR-0006）")
     ap.add_argument("--stale-minutes", type=float, default=180.0,
                     help="数据超过该分钟数未更新则计为陈旧（默认 180）")
     args = ap.parse_args()
@@ -232,6 +319,9 @@ def main() -> int:
             "dropped": len(dropped),
             "sources_ok": sum(1 for m in meta if m.get("ok")),
             "sources_failed": len(failures),
+            # 本次采集新进来的条目数。merge_candidates 会把它写进 collection_runs，
+            # 简报 ② 段据此显示"每次采到多少新东西"——否则那一行只有时间没有内容。
+            "kept_new": len(kept),
         },
         "source_meta": meta,
         "stale_sources": stale_sources,
@@ -240,6 +330,24 @@ def main() -> int:
         "items": kept,
         "dropped": dropped,
     }
+
+    # ADR-0006：采集每日 2–3 次以捕捉事件发酵过程。默认累积合并而非覆盖——
+    # 覆盖会丢掉「同一事件热度如何爬升」这一正是多次采集想要的信息。
+    #
+    # 注意：即使没有旧文件也走 merge_candidates（以空池为底）。否则**当日第一次
+    # 采集**产出的条目不会有 first_seen / hot_history，第二次合并时无轨迹可续，
+    # runs_today 也永远停在 1。
+    existing: dict = {}
+    if not args.no_merge and out_path.exists():
+        try:
+            loaded = json.loads(out_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and loaded.get("items"):
+                existing = loaded
+        except (json.JSONDecodeError, OSError):
+            pass  # 旧文件坏了就当没有：本次结果本身是完整的
+
+    merged = bool(existing)
+    result = merge_candidates(existing, result)
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 简报友好的摘要
@@ -247,6 +355,8 @@ def main() -> int:
         "ok": True,
         "out": str(out_path),
         "collected_at": result["collected_at"],
+        "merged_with_existing": merged,
+        "runs_today": result.get("counts", {}).get("runs_today", 1),
         "counts": result["counts"],
         "failed_sources": [f["source"] for f in failures],
         "stale_sources": stale_sources,

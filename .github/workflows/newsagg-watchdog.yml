@@ -11,11 +11,24 @@ name: NewsAgg 看守（心跳检查）
 #
 # 通知通道：ADR-0006 第四条 —— 使用 GitHub Actions 的原生邮件通知能力。
 # 这是全系统唯一的"推送"通道（其余告警都写 Issue，属拉取通道，见 ADR-0005）。
+#
+# ── ADR-0038：看守改读仓库里的 reports/<日期>.md，不再读 GitHub Issue ──
+# 原因：主系统的简报**从未开过 Issue**（brief.py 只写 reports/），而本看守原先
+# 按"issue 是否存在"判定存活，于是它每天都会发一封"主系统可能整体失效"的假警报，
+# 把唯一的推送通道占满——比没有告警更糟。
+# 改读仓库后：看守本就跑在独立机器上、用 GITHUB_TOKEN 直接读仓库，不再依赖
+# 主系统所在机器上是否装了 `gh`；而且同样能判"存在性"与"五段齐备"。
+# 这是对 ADR-0020 issue 命名约定的一处有意偏离，已在 ADR-0038 记录。
+#
+# 另一处加强（ADR-0038）：`.newsagg/` 是运行时状态、不入库，看守读不到，故
+# 主系统每轮运行都会把成败写进简报 ① 与 ⑤ 段（run-status）。看守不解析这个
+# 字段——它只判"简报存在且五段齐备"；运行失败的细节由人在简报里读。把失败
+# 也当成"存在"是有意的：一份写明"本轮运行未完成"的简报，比没有简报更有信息量。
 
 on:
   schedule:
-    # 北京时间每天 11:00（UTC 03:00）检查。主系统是"采集 2-3 次 → 当晚发布 →
-    # 次日简报"，因此简报应在前一日发布后的次日上午出现；给足宽限时间。
+    # 北京时间每天 11:00（UTC 03:00）检查。主系统是"白天采集 3 次 → 21:00 主流程
+    # → 次日简报"，因此前一天的简报应在此刻之前已经 push 上来；给足宽限时间。
     - cron: '0 3 * * *'
   workflow_dispatch: {}
 
@@ -23,44 +36,41 @@ jobs:
   heartbeat:
     runs-on: ubuntu-latest
     permissions:
-      issues: read
       contents: read
     steps:
-      - name: 检查今日简报 issue 是否存在
+      - name: 取仓库内容
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 检查近两日简报是否存在
         id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          # 计算"应当存在"的简报日期：
-          # 简报是"次日"发出的，所以今天 11:00 应能看到【昨天】的简报，
-          # 但也允许【今天】的已经发出。两者任一存在即视为存活。
-          YESTERDAY=$(date -u -d 'yesterday' +%Y-%m-%d)
-          TODAY=$(date -u +%Y-%m-%d)
+          # 计算"应当存在"的简报日期：简报是"次日"发出的，所以今天 11:00 应能看到
+          # 【昨天】的简报，但也允许【今天】的已经发出。两者任一存在即视为存活。
+          #
+          # 用 TZ=Asia/Shanghai 而不是 UTC（ADR-0018：时区在仓内显式声明，不依赖
+          # 运行环境的本地时区）。今天 03:00 UTC 恰好等于北京 11:00，两者算出的
+          # 日期此时相同——但那是巧合，不是保证：一旦 cron 时间调整（例如改成
+          # 检查前一天的更晚时刻），UTC 日期就会与简报的实际日期错开一天。
+          YESTERDAY=$(TZ=Asia/Shanghai date -d 'yesterday' +%Y-%m-%d)
+          TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)
 
           echo "检查窗口: $YESTERDAY .. $TODAY"
 
-          # ADR-0020 的命名约定：标题固定为 "NewsAgg 简报 YYYY-MM-DD"
           FOUND=""
           for d in "$YESTERDAY" "$TODAY"; do
-            COUNT=$(gh issue list \
-              --repo "$REPO" \
-              --state all \
-              --search "\"NewsAgg 简报 $d\" in:title" \
-              --json number,title \
-              --jq "[.[] | select(.title | test(\"NewsAgg 简报 $d\"))] | length" \
-              2>/dev/null || echo "0")
-            if [ "${COUNT:-0}" -gt 0 ]; then
+            if [ -f "reports/$d.md" ]; then
               FOUND="$d"
-              echo "✅ 找到简报: $d"
+              echo "✅ 找到简报: reports/$d.md"
               break
             fi
           done
 
           if [ -z "$FOUND" ]; then
-            echo "::error::未找到近两日简报（$YESTERDAY / $TODAY）——主系统可能整体失效"
+            echo "::error::未找到近两日简报（reports/$YESTERDAY.md / reports/$TODAY.md）——主系统可能整体失效"
             echo "found=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
@@ -71,16 +81,10 @@ jobs:
       - name: 校验简报完整性（五段齐备）
         if: steps.check.outputs.found == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          D: ${{ steps.check.outputs.date }}
         run: |
           set -euo pipefail
-          D="${{ steps.check.outputs.date }}"
-
-          BODY=$(gh issue list --repo "$REPO" --state all \
-            --search "\"NewsAgg 简报 $D\" in:title" \
-            --json title,body \
-            --jq "[.[] | select(.title | test(\"NewsAgg 简报 $D\"))][0].body")
+          BODY=$(cat "reports/$D.md")
 
           # ADR-0019 的五段标题（用序号匹配，容忍前缀差异）
           MISSING=""
@@ -95,3 +99,8 @@ jobs:
             exit 1
           fi
           echo "✅ 简报 $D 五段齐备"
+
+      - name: 汇总
+        if: steps.check.outputs.found == 'true'
+        run: |
+          echo "✅ 主系统心跳正常（reports/${{ steps.check.outputs.date }}.md）"

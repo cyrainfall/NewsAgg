@@ -2,9 +2,10 @@
 name: newsagg-brief
 description: |
   NewsAgg 简报层：把当日运行结果汇成五段式简报（今日结论 / 采集分拣概览 /
-  本篇与发布结果 / 资产变动 / 需你介入的事项），写入 reports/ 并可开为 GitHub Issue。
+  本篇与发布结果 / 资产变动 / 需你介入的事项），写入 reports/。
   当需要出简报、汇总今日运行、或查看系统状态时使用。
   简报必须**无条件每日存在**——它是心跳，不是可选报告。
+  看守（GitHub Action）直接读 reports/<日期>.md 判存活（ADR-0038）。
 ---
 
 # newsagg-brief — 简报层
@@ -49,15 +50,20 @@ python3 .agents/skills/newsagg-brief/scripts/brief.py --stdout
 
 7. **dry-run 必须提示清理草稿。** 它会在真实账号留痕（ADR-0032）。
 
-## 输出与双写
+## 输出
 
-- `reports/<日期>.md`（入库，随 git 可追溯）
-- GitHub Issue（可选，供评论与通知）——**issue 是人机交互界面，markdown 是历史档案**（ADR-0012）
+- `reports/<日期>.md`（入库，随 git 可追溯）——**这是简报的唯一产物**。
+- stdout：结构化摘要（`--stdout` 可只打印不落盘）。
 
-Issue 命名约定（ADR-0020）：标题固定为 `NewsAgg 简报 YYYY-MM-DD`，带固定 label。看守按**标题 + 日期 + label** 判定存在性，并校验五段齐备（因而能发现"存在但残缺"）。已处理的简报由本人**手动关闭**，关闭即"已读"信号。
+**关于 GitHub Issue**：ADR-0020 曾定「简报 issue 命名约定」，但**该双写从未实现**
+（全仓 `gh issue create` 零命中）。ADR-0038 据此把看守改为直接读仓库里的
+`reports/<日期>.md`——看守的职责是发现「主系统整体失效」，它不该依赖一个从未被
+实现的机制（见 ADR-0038 决定 6）。issue 双写若要恢复，应作为独立工作另开，
+**不能与看守的正确性绑在一起**。
 
 ## 与其他阶段的接口
 
-- **上游**：采集（`newsagg-collect`）、分拣（`newsagg-triage`）、发布（`newsagg-publish`）的产物。
-- **下游**：看守（GitHub Action）读它判存活；本人读它做否决与教学。
+- **上游**：采集（`newsagg-collect`）、分拣（`newsagg-triage`）、发布（`newsagg-publish`）
+  的产物，以及编排器写入的 `.newsagg/run-status.json`（本轮成败，ADR-0038）。
+- **下游**：看守（GitHub Action）读 `reports/<日期>.md` 判存活；本人读它做否决与教学。
 - 简报是**所有需要人否决的机制的提交处**：退役/合并建议、风格提议、熔断、待处理成稿都在这里。

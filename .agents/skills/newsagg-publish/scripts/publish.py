@@ -250,6 +250,8 @@ def main() -> int:
     ap.add_argument("--min-free-mb", type=int, default=800, help="发布前可用内存下限（ADR-0023）")
     ap.add_argument("--lock-timeout", type=float, default=300.0)
     ap.add_argument("--account", default="default")
+    ap.add_argument("--card-file", default="",
+                    help="本篇承接的观点卡文件名（ADR-0037：循环 C 靠它把表现数据归因回卡）")
     args = ap.parse_args()
 
     root = repo_root()
@@ -360,6 +362,11 @@ def main() -> int:
         record = {
             "at": now.isoformat(), "slug": args.slug, "title": title,
             "mode": args.mode, "steps": steps, "stdout_tail": out[-800:],
+            # ADR-0037：把「这篇属于哪张卡」记下来。没有它，循环 C 读回来的
+            # 表现数据只能停在文章粒度，无法回答"哪些卡跑出了数据"——
+            # 而那正是 ADR-0010 要的排序参考。空值写 null 而不是省略：
+            # 省略与"决策未给卡"在消费端不可区分。
+            "card_file": args.card_file or None,
             # ADR-0036：发布快照指纹，供风格回路做 diff 基线
             "snapshot": snapshot_fingerprint(root / "outputs" / f"{args.slug}.md"),
         }

@@ -119,9 +119,39 @@ def fmt_metrics(metrics: dict | None) -> str:
     return " / ".join(parts) if parts else "无"
 
 
-def section_conclusion(decision, publish_recs, date: str, perf: dict | None = None) -> list[str]:
+def read_run_status(root: Path, date: str) -> dict:
+    """读本轮运行的成败（ADR-0038）。
+
+    `.newsagg/` 是运行时状态、不入库，看守读不到；但简报可以。因此编排器每轮
+    无论成败都写一份 run-status，由简报把它呈现给人——这是把"主系统自己失败了"
+    这件事从 `.newsagg/` 带到 `reports/` 的唯一通路。
+
+    只有当这份状态属于本简报的日期时才采用，避免把昨天失败写在今天简报里。
+    """
+    st = read_json(root / ".newsagg" / "run-status.json")
+    if not st or str(st.get("date")) != date:
+        return {}
+    return st
+
+
+def section_conclusion(decision, publish_recs, date: str, perf: dict | None = None,
+                       run_status: dict | None = None) -> list[str]:
     out = ["## ① 今日结论", ""]
     d = unwrap(decision)
+
+    # 运行失败优先于一切：此时"没发布"不是判断，是故障。
+    rs = run_status or {}
+    if rs and not rs.get("ok"):
+        out += [f"**本轮运行未完成**（阶段 `{rs.get('stage')}`）：{rs.get('reason')}",
+                "",
+                "> 这不是「今日无选题」，也不是弃权——系统在运行途中失败了。",
+                "> 它已经把自己的成败写进本简报，因此看守不会把这天当成正常日。",
+                ""]
+        detail = (rs.get("detail") or "").strip()
+        if detail:
+            out += ["```", detail[:1200], "```", ""]
+        return out
+
     if not d:
         # 降频跳过日会刻意不产出决策文件。若不特判，① 段会写成"无决策记录"，
         # 那正是 ADR-0019 要求区分开的两种情形之一（"系统没跑"）——会误报。
@@ -178,14 +208,21 @@ def section_overview(candidates, decision) -> list[str]:
     out = ["## ② 采集与分拣概览", ""]
     if candidates:
         c = candidates.get("counts", {})
+        runs = candidates.get("collection_runs") or []
         out += [f"- 采集 {c.get('fetched',0)} 条 → 赛道预筛后 {c.get('kept',0)} 条"
                 f"（丢弃 {c.get('dropped',0)}）"]
+        # ADR-0006：白天采 2–3 次以捕捉事件发酵过程。采了几次、每次进来多少条
+        # 新条目，正是"发酵"的可观测形式——不呈现就等于白采。
+        if runs:
+            out += [f"- 今日采集 {len(runs)} 次：" + "、".join(
+                f"{str(r.get('at',''))[11:16]}（新 {r.get('kept_new', '?')}）" for r in runs)]
         out += [f"- 源：{c.get('sources_ok',0)} 成功 / {c.get('sources_failed',0)} 失败"]
         stale = candidates.get("stale_sources") or []
         if stale:
             out += [f"- **陈旧源**（updateTime 超过阈值）："
                     + "、".join(f"{s['source']}({s['age_minutes']}分)" for s in stale)]
-        failed = candidates.get("failed_sources") or []
+        # 字段名是 failures（list[dict]），早期版本误读 failed_sources 导致这段永远空白
+        failed = [f.get("source") for f in (candidates.get("failures") or [])]
         if failed:
             out += [f"- **失效源**：{', '.join(map(str, failed))}"]
     else:
@@ -279,7 +316,7 @@ def section_assets(decision, cards_dir: Path) -> list[str]:
     return out
 
 
-def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None) -> list[str]:
+def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None) -> list[str]:
     out = ["## ⑤ 需你介入的事项", ""]
     any_item = False
 
@@ -308,10 +345,19 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
         out += [f"**教学副本已就绪**：`outputs/{article_slug}.md`",
                 "  你若修改并 push，系统下次运行会 diff 学习（ADR-0026 循环 B）。", ""]
 
-    failed = (candidates or {}).get("failed_sources") or []
+    failed = [f.get("source") for f in ((candidates or {}).get("failures") or [])]
     if failed:
         any_item = True
         out += [f"**信源失效**：{', '.join(map(str, failed))}", ""]
+
+    # 运行失败（ADR-0038）：`.newsagg/run-status.json` 不入库、看守读不到，
+    # 所以它必须在这里出现——否则"系统今天跑挂了"就没有任何出口。
+    rs = run_status or {}
+    if rs and not rs.get("ok"):
+        any_item = True
+        out += [f"**本轮运行未完成**：阶段 `{rs.get('stage')}` — {rs.get('reason')}",
+                "  产出可能不完整。修复后重跑：`bash .agents/skills/newsagg-collect/scripts/run_all.sh`",
+                ""]
 
     if perf:
         freq = perf.get("frequency") or {}
@@ -371,11 +417,12 @@ def main() -> int:
 
     lines = [f"# NewsAgg 简报 {date}", ""]
     perf = read_performance(root)
-    lines += section_conclusion(decision, publish_recs, date, perf)
+    run_status = read_run_status(root, date)
+    lines += section_conclusion(decision, publish_recs, date, perf, run_status)
     lines += section_overview(cand, decision)
     lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies", perf)
     lines += section_assets(decision, root / "knowledge" / "cards")
-    lines += section_actions(publish_recs, cand, decision, cover, slug, perf)
+    lines += section_actions(publish_recs, cand, decision, cover, slug, perf, run_status)
 
     lines += ["---", f"*生成于 {now.isoformat()} ｜ 时区 Asia/Shanghai*"]
     md = "\n".join(lines)
@@ -394,6 +441,7 @@ def main() -> int:
         "has_candidates": cand is not None,
         "publish_records": len(publish_recs),
         "performance_available": bool(perf.get("available")),
+        "run_ok": run_status.get("ok") if run_status else None,
         "sections": 5,
     }, ensure_ascii=False, indent=2))
     return 0

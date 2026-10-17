@@ -31,9 +31,27 @@ python3 .agents/skills/newsagg-collect/scripts/collect.py
 | `--base <url>` | 热榜服务地址，默认 `http://127.0.0.1:6688`（或 `NEWSAGG_HOT_BASE`） |
 | `--sources a,b,c` | 指定源，默认 `toutiao,36kr,juejin,csdn,ithome,sspai,github` |
 | `--no-prescreen` | 跳过赛道预筛，保留全部条目（用于审计预筛质量） |
+| `--no-merge` | 不做同日累积，直接覆盖写（逃生开关，默认关闭） |
 | `--stale-minutes N` | 数据陈旧阈值，默认 180 分钟 |
 
 输出：`.newsagg/candidates/<日期>.json`，并在 stdout 打印简报友好摘要。
+
+## 同日多次采集（ADR-0006 / ADR-0038）
+
+白天按 `08:00 / 13:00 / 18:00` 采三次，**同日结果累积合并**，不是覆盖写。
+合并规则（`merge_candidates`）：
+
+- 条目按 `(source, id)` 归并；**保留 `first_seen`**（第一次被看到的时间）。
+- 热度轨迹记进 `hot_history`——「发酵过程」正是这些中间值，而不是最后一个数字。
+- 上一轮见过、这一轮没再出现的条目**保留并标 `seen_in_last_run: false`**，
+  不静默丢弃：「掉出榜」本身就是信息。
+- 每次采集追加一条 `collection_runs`，供简报 ② 段显示「今天采了几次、每次新进来多少条」。
+  其中 `kept_new` 按 `first_seen == 本次采集时刻` 计数，**不等于本次的 `kept`**——
+  第二次采集时预筛仍会"保留 100 条"，但可能全是旧的，取 `kept` 会把"没有新东西"
+  显示成"采到 100 条新的"（ADR-0039）。
+
+> ⚠️ `hot_history` 目前**只被记录、还没有消费者**：分拣仍按"当前热度"排序。
+> 让分拣用上热度**轨迹**（"正在爬升"比"已经很高"更值得写）是后续优化（ADR-0038）。
 
 ## 输出形状
 
@@ -63,3 +81,7 @@ python3 .agents/skills/newsagg-collect/scripts/collect.py
 
 - 下游是**分拣层**（`newsagg-triage`）：它读 `items`，做事件聚簇与观点卡匹配，产出三态决策。
 - 采集层**不做**聚簇、不做判断、不认识观点卡。它只负责"把值得看的东西捞上来"。
+- **编排入口是 `run_all.sh`，不是 `collect.py`。** 无人值守下白天三次只跑
+  `bash .agents/skills/newsagg-collect/scripts/run_all.sh --collect-only`（纯脚本、不碰 git）；
+  21:00 的主流程才跑 `--no-collect` / `--after-triage` / `--after-write` 三段（ADR-0038）。
+  单独跑 `collect.py` 仅用于调试。

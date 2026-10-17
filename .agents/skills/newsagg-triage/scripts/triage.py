@@ -137,7 +137,10 @@ def performance_reference(perf_path: Path, runs_path: Path) -> dict:
     if not latest:
         return {"available": False, "note": "表现数据里没有本账号的文章"}
 
-    # slug → card_file（分拣决策文件里记着接的是哪张卡）
+    # slug → card_file。两个来源，**账本优先**（ADR-0037）：
+    #   ① 发布账本：发布那一刻记下的 card_file，是权威关联，不随日期漂移；
+    #   ② 决策文件兜底：账本修复前的旧记录没有该字段，且决策文件按日期散落。
+    # 只用 ② 会静默丢归因——决策文件属运行时状态，可能被清理或跨环境不同步。
     slug_to_card: dict[str, str] = {}
     if runs_path.exists():
         for d in sorted(runs_path.glob("*-decision.json")):
@@ -152,6 +155,20 @@ def performance_reference(perf_path: Path, runs_path: Path) -> dict:
             date = raw.get("date") or d.name[:10]
             for md in sorted((runs_path.parent.parent / "outputs").glob(f"{date}-*.md")):
                 slug_to_card[md.stem] = card
+
+    ledger = runs_path.parent / "publish-ledger.jsonl"
+    if ledger.exists():
+        try:
+            for line in ledger.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                slug, card = rec.get("slug"), rec.get("card_file")
+                if slug and card:
+                    slug_to_card[str(slug)] = str(card)
+        except (json.JSONDecodeError, OSError):
+            pass
 
     by_card: dict[str, list[dict]] = {}
     unlinked = 0

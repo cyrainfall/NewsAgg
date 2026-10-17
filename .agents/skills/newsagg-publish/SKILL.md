@@ -37,6 +37,12 @@ python3 .agents/skills/newsagg-publish/scripts/publish.py \
 | `--min-free-mb` | 发布前可用内存下限，默认 800（ADR-0023） |
 | `--lock-timeout` | 等待浏览器锁的秒数，默认 300 |
 | `--account` | 头条账号名，默认 `default` |
+| `--card-file` | 本篇承接的观点卡文件名（ADR-0037）。由 `run_all.sh` 从决策文件传入 |
+
+> **`--card-file` 为什么要记进账本**：循环 C 读回表现数据后要回答"**哪些卡**跑出了数据"，
+> 而账本是唯一的关联点。文章标题会被本人改、决策文件属运行时状态（`.newsagg/` 不入库，
+> ADR-0027 可能被清理或跨环境不同步），只有发布那一刻记下的 `card_file` 是可靠归因。
+> 归因读取顺序是**账本优先、决策文件兜底**。
 
 ## 安全门（按执行顺序）
 

@@ -89,6 +89,10 @@ grep -rn 'credit\|信用\|score' reference/toutiao-ops/cli/src/*.js      # → �
 
 **十二、信用分门本轮不实现，记入残余风险。** 循环 C 不因此阻塞——信用分是独立的安全门，与表现数据无数据依赖，另开一轮处理。ADR-0013 的该条**当前无实现路径**，必须显式记录而非留作默认成立。
 
+**十三、发布账本必须记下 `card_file`。** 接无人值守编排时实测发现：账本记录只有 `at/slug/title/mode/steps/stdout_tail/snapshot/verdict`，**没有"这篇属于哪张卡"**。而 ADR-0010 要的排序参考是"**哪些卡**跑出了数据"——缺这一字段，读回来的数据只能停在文章粒度，归因无从落地。故 `publish.py` 新增 `--card-file`，由 `run_all.sh` 从决策文件取 `card_file` 一并写入账本（dry-run 也记，便于验证）。
+
+归因读取顺序**账本优先、决策文件兜底**：账本记的是发布那一刻的事实、不随日期漂移；决策文件属运行时状态（`.newsagg/`，ADR-0027 不入库），可能被清理或跨环境不同步，只用它会静默丢归因。实测账本写入后 `performance_reference` 正确报出 `by_card: {llm-price-war-signals-commoditization.md: [...]}`、`unlinked_articles: 0`。
+
 ## Consequences
 
 **降频的告警责任被加重。** ADR-0010 已指出自动降频使系统在变差时**变得更不活跃**，产出下降本身会掩盖问题的严重性。现在这条路径真实存在了，因此简报 ⑤ 段必须无条件呈现降频状态与解除方法——否则系统会静默滑向长期停摆，而这恰恰是 ADR-0010 警告的失效模式。

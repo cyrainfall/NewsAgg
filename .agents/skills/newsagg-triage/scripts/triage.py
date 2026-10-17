@@ -252,6 +252,21 @@ def validate_decision(decision: dict, cards: list[dict], cooldown: dict, limits:
         # ADR-0007：可复用性判据
         if not decision.get("reusable_because"):
             problems.append("new 必须说明 reusable_because（为何能接住未来的新闻）")
+        # 2026-10-17 实测发现：new 原先不校验 card_file，而第 3 段的写回靠它取卡
+        # （run_all.sh 的 `[[ -n "$CARD" ]]`），缺失时写回被**静默跳过**——
+        # 新卡永远不会拿到 covered_events 与 last_written，认知资产停止生长且不报错。
+        # 建卡是分拣层的动作，card_file 必须在决策里点名。
+        cf = decision.get("card_file")
+        if not cf:
+            problems.append(
+                "new 必须给出 card_file（你新建的卡的文件名）；"
+                "缺失会让第 3 段的写回被静默跳过，新卡永远拿不到 covered_events"
+            )
+        elif cf not in card_files:
+            problems.append(
+                f"new 的 card_file 不存在：{cf}——建卡与决策是同一个动作，"
+                f"必须先写 knowledge/cards/{cf} 再产出决策"
+            )
 
     if decision.get("confidence") is None:
         problems.append("必须给出 confidence")

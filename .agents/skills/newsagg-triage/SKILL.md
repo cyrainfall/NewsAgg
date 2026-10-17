@@ -44,7 +44,7 @@ python3 .agents/skills/newsagg-triage/scripts/triage.py --validate <决策文件
 | --- | --- | --- |
 | `skip` | 卡已含此事件且**无新进展**；或纯重复报道（同一事实换家媒体） | 给出 `card_file` |
 | `continue` | 卡已存在，且这是**新进展** | 给出 `card_file` + `whats_new` |
-| `new` | 需要一张新卡 | 给出 `new_issue` + `reusable_because` |
+| `new` | 需要一张新卡 | 给出 `new_issue` + `reusable_because` + `card_file`（**你必须先写 `knowledge/cards/<file>.md`，再产出决策**） |
 | `abstain` | 无任何聚簇接得住卡，也没达到新建门槛 | 说明原因 |
 
 ## 硬规则（不可违背）
@@ -54,6 +54,8 @@ python3 .agents/skills/newsagg-triage/scripts/triage.py --validate <决策文件
 2. **冷却期优先于排序。** 卡在 `cooldown_state` 中 `in_cooldown: true` 时，该卡本轮**不参与竞争**，直接看下一名。若所有候选卡都在冷却，则 `abstain`。冷却期的目的是防重复，不是惩罚其他选题。
 
 3. **新建门槛是可复用性。** 一条判断要成为新卡，必须能**接住未来的新闻**，而不只是支撑当前这一个事件。永远只有单一事件支撑的判断不是观点卡，只是一篇一次性文章。给出 `reusable_because` 说明理由。
+
+   **建卡与决策是同一个动作。** `action: new` 时必须同时给出 `card_file`，且该文件必须已经存在——先写 `knowledge/cards/<file>.md`（五节结构），再产出决策。校验器会拒绝没有 `card_file` 或指向不存在文件的 `new`。理由：第 3 段的写回靠 `card_file` 取卡，缺失时写回被**静默跳过**，新卡永远拿不到 `covered_events` 与 `last_written`——认知资产停止生长且不报错（2026-10-17 实测发现）。
 
 4. **限额。** 每日最多成文 1 篇（`max_articles_per_day`）、最多新建 1 张卡（`max_new_cards_per_day`）。多个事件通过分拣时，按「卡匹配度 × 事件热度」排序取第一名，其余记入简报备选。
 

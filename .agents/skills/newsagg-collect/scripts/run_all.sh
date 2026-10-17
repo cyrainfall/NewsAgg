@@ -321,9 +321,15 @@ if [[ -n "$COLLECT_ONLY" ]]; then
 fi
 
 # ══ 主流程第 1 段 ═══════════════════════════════════════════════
-git_pull
-
+# ① pull 只在整轮运行的**开头**执行一次。
+# 续跑段（--after-triage / --after-write）**不得**再 pull：整轮运行中途工作区
+# 必然是脏的——reports/performance.jsonl 是入库文件（ADR-0018/0037），第 1 段的
+# 表现数据读回就会改写它。在脏工作区上 `pull --rebase` 必然报
+# 「您有未暂存的变更」而失败，但那不是合并冲突、是**预期状态**；把它当熔断
+# 会让每一轮无人值守运行都死在第 2 段，且第 1 段的产出永不落地。
+# 实测：2026-10-17 首次无人值守运行即因此失败（接线后第一次真实触发）。
 if [[ -z "$AFTER_TRIAGE" && -z "$AFTER_WRITE" ]]; then
+  git_pull
   style_learn
   performance
   skip_day_gate

@@ -13,15 +13,20 @@
 #     bash .agents/skills/newsagg-collect/scripts/run_all.sh --collect-only
 #
 #   21:00 主流程第 1 段：
-#     bash .agents/skills/newsagg-collect/scripts/run_all.sh --no-collect
+#     bash .agents/skills/newsagg-collect/scripts/run_all.sh --no-collect --publish
 #       ← agent 读 .newsagg/triage/<date>-input.json，产出 decision.json，跑 --validate
 #
 #   主流程第 2 段：
-#     bash .agents/skills/newsagg-collect/scripts/run_all.sh --after-triage
+#     bash .agents/skills/newsagg-collect/scripts/run_all.sh --after-triage --publish
 #       ← 若写作模型未配置（退出码 3），agent 写 outputs/<slug>.md
 #
 #   主流程第 3 段：
 #     bash .agents/skills/newsagg-collect/scripts/run_all.sh --after-write --publish
+#
+# ⚠️ **三段都必须带 `--publish`**，否则全程 dry-run。MODE 默认 dry-run，且会被
+#    写进每段结尾打印的 handoff 命令里（`$([[ "$MODE" == "publish" ]] && echo --publish)`），
+#    所以漏了第一段就会一路漏到底——三段全部只存草稿，而每段都报"成功"。
+#    这也意味着 dry-run 与真发的差别**只由调用者决定**，脚本自身不记得上一段用了什么。
 #
 # 测试用开关：--no-git（跳过 pull 与 commit/push）、--no-collect、--date <YYYY-MM-DD>
 

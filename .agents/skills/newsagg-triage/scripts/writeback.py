@@ -26,27 +26,23 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+def _load_cardfm():
+    """加载同目录的 `cardfm`（观点卡 frontmatter 的唯一解析实现，ADR-0042）。
+
+    用 sys.path 注入而不是直接 `import cardfm`：本脚本既可能被 `python3 <路径>`
+    直接执行（脚本目录自动在 sys.path 上），也可能被 importlib 按路径加载
+    （那时脚本目录不在 sys.path 上）。两种方式都要能工作。
+    """
+    here = Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import cardfm
+    return cardfm
+
+
 def parse_frontmatter(text: str) -> tuple[dict, str, str]:
-    """返回 (fm, body, 原始 frontmatter 文本)。"""
-    m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
-    if not m:
-        return {}, text, ""
-    raw = m.group(1)
-    fm: dict = {}
-    key = None
-    for line in raw.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if re.match(r"^\s*-\s+", line) and key:
-            fm.setdefault(key, [])
-            if isinstance(fm[key], list):
-                fm[key].append(line.strip()[2:].strip().strip('"'))
-            continue
-        if ":" in line:
-            k, v = line.split(":", 1)
-            key, v = k.strip(), v.strip()
-            fm[key] = [] if v in ("", "[]") else (None if v.lower() in ("null", "~") else v.strip('"'))
-    return fm, m.group(2), raw
+    """返回 (fm, body, 原始 frontmatter 文本)。委托给同目录 `cardfm`（ADR-0042）。"""
+    return _load_cardfm().parse_frontmatter(text)
 
 
 def set_frontmatter_scalar(raw_fm: str, key: str, value: str) -> str:

@@ -30,32 +30,28 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+def _load_cardfm():
+    """加载同目录的 `cardfm`（观点卡 frontmatter 的唯一解析实现，ADR-0042）。
+
+    用 sys.path 注入而不是直接 `import cardfm`：本脚本既可能被 `python3 <路径>`
+    直接执行（脚本目录自动在 sys.path 上），也可能被 importlib 按路径加载
+    （那时脚本目录不在 sys.path 上）。两种方式都要能工作。
+    """
+    here = Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import cardfm
+    return cardfm
+
+
 def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """极简 frontmatter 解析（只用得到标量与简单列表，不引入 yaml 依赖）。"""
-    m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
-    if not m:
-        return {}, text
-    raw, body = m.group(1), m.group(2)
-    fm: dict = {}
-    key = None
-    for line in raw.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if re.match(r"^\s*-\s+", line) and key:
-            fm.setdefault(key, [])
-            if isinstance(fm[key], list):
-                fm[key].append(line.strip()[2:].strip().strip('"'))
-            continue
-        if ":" in line:
-            k, v = line.split(":", 1)
-            key = k.strip()
-            v = v.strip()
-            if v in ("", "[]"):
-                fm[key] = [] if v == "[]" else ""
-            elif v.lower() in ("null", "~"):
-                fm[key] = None
-            else:
-                fm[key] = v.strip('"')
+    """委托给同目录 `cardfm`（ADR-0042：三份拷贝漂移过一次，只留一份实现）。
+
+    本函数曾把「空值」记成 `""`，而 `writeback.py` 写回的 `covered_events`
+    是「空值 + 列表项」形态——列表项因此被静默丢弃，**分拣层永远看不到
+    「已覆盖事件」**，而 `build_brief.py` 看得到。详见 `cardfm.py` 的模块说明。
+    """
+    fm, body, _ = _load_cardfm().parse_frontmatter(text)
     return fm, body
 
 

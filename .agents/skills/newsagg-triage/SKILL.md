@@ -67,6 +67,8 @@ python3 .agents/skills/newsagg-triage/scripts/triage.py --validate <决策文件
 
 7. **突发事件（重要但一次性）不为它开例外**，不建一次性卡；但列入简报的「**无卡可接**」列表供人工指定。理由：为一次性事件写出的文章本质是新闻综述，而本系统的价值在观点；但不该让你看不见系统的这个判断。
 
+8. **`covered_events` 是防重复发文的唯一依据，读不到就等于没有。** 输入包里每张卡的 `covered_events` 来自 `cardfm.py`——观点卡 frontmatter 的**唯一**解析实现（ADR-0042）。此前三份拷贝漂移，`triage.py` 的那份把 `writeback.py` 写回的「空值 + 列表项」形态静默读成空，于是**分拣层看不到「这张卡写过什么」**，而写作阶段看得到（同一轮里分拣不知道、写作知道）。判 `skip` 还是 `continue` 全靠这个字段：若某张卡的 `covered_events` 与你的预期不符（例如 `last_written` 有日期却是空列表），先按 `cardfm.py` 重新解析核对，**不要**凭 `last_written` 推断「写过什么」。
+
 ## 输出形状
 
 ```json

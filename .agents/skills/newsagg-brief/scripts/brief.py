@@ -119,6 +119,28 @@ def fmt_metrics(metrics: dict | None) -> str:
     return " / ".join(parts) if parts else "无"
 
 
+def clip(text: str, limit: int) -> str:
+    """按句截断，而不是按字符硬切。
+
+    理由（实测 2026-10-17）：硬切会把理由砍在半句上，读者拿到的是
+    「…现有 6 张卡无一接得住「AI 资本定价」这一议题。它够格建新卡——可复用性明确：
+    能接住融资、估值、资本开支、算力投资回报等未来新闻，且与现有卡形成互补（现有卡
+    都在谈「技术」，没有一张谈「钱」）。但本轮每日成文上限为 1，已在与 Meta 开源簇的排序中让」
+    ——最后半句没了，而 ADR-0019 说简报是**人机接口**、⑤ 段承载所有需要人否决的事项。
+    砍在句末至少让每一段可读；若单句本身就超长，才退回硬切。
+    """
+    s = str(text or "")
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    # 优先在句末断开（中文句号/问号/叹号/分号，或英文句点后跟空格）
+    for mark in ("。", "？", "！", "；", ". "):
+        cut = head.rfind(mark)
+        if cut > limit * 0.5:
+            return head[:cut + len(mark)].rstrip()
+    return head.rstrip() + "…"
+
+
 def read_run_status(root: Path, date: str) -> dict:
     """读本轮运行的成败（ADR-0038）。
 
@@ -195,7 +217,7 @@ def section_conclusion(decision, publish_recs, date: str, perf: dict | None = No
                 state = v.split(":")[-1] if ":" in v else v
                 out += [f"**已发布**：《{r.get('title','')}》（状态：{state}）", ""]
         else:
-            summary = (d.get("event") or {}).get("summary", "")[:60]
+            summary = clip((d.get("event") or {}).get("summary", ""), 120)
             out += [f"**已成稿，尚未发布**。选题：{summary}", ""]
     elif action == "skip":
         out += [f"**跳过**。卡 {d.get('card_file')} 已含该事件且无新进展。", ""]
@@ -214,8 +236,13 @@ def section_overview(candidates, decision) -> list[str]:
         # ADR-0006：白天采 2–3 次以捕捉事件发酵过程。采了几次、每次进来多少条
         # 新条目，正是"发酵"的可观测形式——不呈现就等于白采。
         if runs:
+            # kept_new 在早期版本里是 None（字段尚未写入），`.get(k, '?')` 的默认值
+            # 不会生效（键存在、值是 None），会印出「新 ?」这种读不懂的东西。
+            def _kn(r):
+                v = r.get("kept_new")
+                return "未记录" if v is None else v
             out += [f"- 今日采集 {len(runs)} 次：" + "、".join(
-                f"{str(r.get('at',''))[11:16]}（新 {r.get('kept_new', '?')}）" for r in runs)]
+                f"{str(r.get('at',''))[11:16]}（新 {_kn(r)}）" for r in runs)]
         out += [f"- 源：{c.get('sources_ok',0)} 成功 / {c.get('sources_failed',0)} 失败"]
         stale = candidates.get("stale_sources") or []
         if stale:
@@ -233,19 +260,19 @@ def section_overview(candidates, decision) -> list[str]:
         if low:
             out += ["", "**低置信度（已跳过）**："]
             for it in low:
-                out += [f"- {it.get('event','')[:60]}（{it.get('confidence')}）"]
+                out += [f"- {clip(it.get('event',''), 120)}（{it.get('confidence')}）"]
                 if it.get("why"):
-                    out += [f"  - {it['why'][:160]}"]
+                    out += [f"  - {clip(it['why'], 400)}"]
         nca = decision.get("no_card_available") or []
         if nca:
             out += ["", "**值得关注但无卡可接**（供你人工指定）："]
             for it in nca:
-                out += [f"- {it.get('event','')[:60]}"]
+                out += [f"- {clip(it.get('event',''), 120)}"]
                 if it.get("why"):
-                    out += [f"  - {it['why'][:160]}"]
+                    out += [f"  - {clip(it['why'], 400)}"]
         note = (decision.get("decision") or decision).get("ranking_note")
         if note:
-            out += ["", f"**排序说明**：{note[:300]}"]
+            out += ["", f"**排序说明**：{clip(note, 800)}"]
     out += [""]
     return out
 
@@ -274,7 +301,7 @@ def section_article(decision, publish_recs, body_dir: Path, perf: dict | None = 
 
     ev = d.get("event") or {}
     if ev:
-        out += [f"- 事件：{ev.get('summary','')[:120]}"]
+        out += [f"- 事件：{clip(ev.get('summary',''), 200)}"]
     if d.get("card_file"):
         out += [f"- 接卡：{d['card_file']}（匹配度 {d.get('confidence')}）"]
     if d.get("whats_new"):
@@ -302,7 +329,7 @@ def section_assets(decision, cards_dir: Path) -> list[str]:
     out += [f"- 观点卡总数：{before}"]
     d = unwrap(decision)
     if d.get("action") == "new":
-        out += [f"- **新建卡**：{d.get('new_issue')}（可复用性：{d.get('reusable_because','')[:80]}）"]
+        out += [f"- **新建卡**：{d.get('new_issue')}（可复用性：{clip(d.get('reusable_because',''), 300)}）"]
     elif d.get("action") == "continue":
         out += [f"- **修订**：{d.get('card_file')}（待发布成功后写回，带未复核标记）"]
     # 治理建议（退役/合并）由分拣层在需要时提供

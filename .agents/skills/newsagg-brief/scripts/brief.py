@@ -141,6 +141,24 @@ def clip(text: str, limit: int) -> str:
     return head.rstrip() + "…"
 
 
+def _fmt_age(minutes) -> str:
+    """把分钟数写成「分钟」或「小时」，避免出现「1230.9分」这种读不出量级的写法。
+
+    陈旧阈值现在是**按源**算的（ADR-0043），github 的阈值是 2160 分钟。以分钟为单位
+    呈现长周期源，会让「阈值 2160.0 分」看起来像一个荒谬的数字——读者得自己在脑子里
+    除 60 才能判断这是 36 小时。简报是人机接口（ADR-0019），它不该要求人做换算。
+    """
+    if minutes is None:
+        return "未知"
+    try:
+        m = float(minutes)
+    except (TypeError, ValueError):
+        return str(minutes)
+    if m >= 120:
+        return f"{m / 60:.1f}小时"
+    return f"{m:.0f}分钟"
+
+
 def read_run_status(root: Path, date: str) -> dict:
     """读本轮运行的成败（ADR-0038）。
 
@@ -246,8 +264,9 @@ def section_overview(candidates, decision) -> list[str]:
         out += [f"- 源：{c.get('sources_ok',0)} 成功 / {c.get('sources_failed',0)} 失败"]
         stale = candidates.get("stale_sources") or []
         if stale:
-            out += [f"- **陈旧源**（updateTime 超过阈值）："
-                    + "、".join(f"{s['source']}({s['age_minutes']}分)" for s in stale)]
+            out += [f"- **陈旧源**（updateTime 超过该源自身的刷新周期）："
+                    + "、".join(f"{s['source']}({_fmt_age(s.get('age_minutes'))}"
+                               f" / 阈值 {_fmt_age(s.get('threshold_minutes'))})" for s in stale)]
         # 字段名是 failures（list[dict]），早期版本误读 failed_sources 导致这段永远空白
         failed = [f.get("source") for f in (candidates.get("failures") or [])]
         if failed:

@@ -32,6 +32,40 @@ RAW_ENDPOINTS = {
     "toutiao": "https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc",
 }
 
+# 各源在 DailyHotApi 里的缓存 TTL（分钟）。默认 60 分钟来自 `src/config.ts:48`
+# 的 `CACHE_TTL: getNumericEnvVariable("CACHE_TTL", 3600)`（秒）；github 是唯一
+# 显式覆盖 TTL 的源，见 `src/routes/github.ts:93` 的 `ttl: 60 * 60 * 24`。
+#
+# 为什么需要这张表：陈旧阈值若对全部源用同一个数字，就等于拿一个**统一的时长**
+# 去量**刷新周期本来就不同的源**。github 每 24 小时才刷新一次，用 3 小时判它陈旧
+# 会让它每个自然日有约 21 小时处于"被判陈旧"状态——每日必然误报，而每日必然
+# 触发的告警会被忽略，这正是 ADR-0006/0021/0031 反复要避免的"狼来了"。
+# 实测：2026-10-17 与 2026-10-18 两次采集都把 github 列为陈旧源，而它的
+# update_time 两次都是 2026-10-17T05:21:31Z（同一次刷新，只是年龄更大了）。
+SOURCE_TTL_MINUTES = {
+    "github": 60.0 * 24,  # 1440 分钟
+}
+DEFAULT_SOURCE_TTL_MINUTES = 60.0  # DailyHotApi 默认 CACHE_TTL=3600s
+
+# 陈旧阈值 = max(配置阈值, 源自身 TTL × STALE_TTL_FACTOR)。
+#
+# 为什么是乘一个系数而不是加「最大采集间隔」：在一次**采集时刻**能观察到的
+# 合法最大年龄就是 TTL 本身，不需要加采集间隔——
+#   - 请求落在缓存有效期内 → 返回缓存，age ≤ TTL；
+#   - 请求落在缓存过期之后 → 触发重新填充 → age ≈ 0。
+# 也就是说**过期后的那次请求会把数据刷新掉，年龄不会累积到 TTL 之上**。
+# （曾经想过 `TTL + 最大采集间隔`，那是把"缓存过期"与"没被重取"混为一谈，
+#  会把短周期源一起放宽：toutiao 会从 3h 变 15h，那是回归。）
+#
+# 实测印证（github，TTL 24h）：2026-10-17 13:21 CST 填充 → 18:00 时 age=4.7h
+# → 2026-10-18 08:11 时 age=18.8h（仍在有效期内）→ 次日 13:00 过期并刷新 → age≈0。
+# 观测最大值 18.8h < TTL 24h ✓。
+#
+# 系数 > 1 只留边界余量：年龄正好等于 TTL 时是**边界**，定时抖动会让它反复在
+# 陈旧/不陈旧之间翻转，于是告警变成噪音。1.5 意味着"超出刷新周期一半才算陈旧"。
+# 这是经验值，非推导值（与 ADR-0016/0031/0037 的阈值同策略：先记下、后实测）。
+STALE_TTL_FACTOR = 1.5
+
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
@@ -49,6 +83,45 @@ def http_json(url: str, timeout: int = 20):
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
+def normalize_hot(value) -> int | None:
+    """把上游各源形态不一的 `hot` 统一成 int 或 None。
+
+    实测各源的原始形态（2026-10-18，逐一打 DailyHotApi 得到）：
+
+    | 源 | 形态 |
+    | --- | --- |
+    | toutiao / 36kr / juejin / csdn / ithome / sspai | `int` |
+    | github | `str`，且带千分位：`'40,798'` |
+    | 36kr（个别条目） | `None`（字段缺失） |
+
+    统一成数字的理由不是"整洁"，而是**类型不一致会让排序静默出错**：
+    `sorted(items, key=lambda x: x["hot"])` 在 str 与 int 混排时抛
+    `TypeError: '<' not supported between instances of 'str' and 'int'`；
+    更隐蔽的是，若全部当字符串比较，字典序会把 `'9,000' > '51,667'` 判反
+    （'9' > '5'）。
+
+    当前没有任何脚本按 `hot` 排序（「卡匹配度 × 事件热度」由模型判断），
+    所以这个坑还没绊到人——但残余风险 16 记的「热度轨迹无消费者」一旦接上，
+    它就是第一个会踩的雷。在**入口处**归一，比在每个消费者里各写一遍容错便宜。
+
+    返回 None 而不是 0 的理由：`None` 表示"这个源不提供热度"，`0` 会被读成
+    "热度为零"。两者在下游的排序语义完全不同，不能混为一谈。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip().replace(",", "").replace("，", "")
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
 def normalize_dailyhot(source: str, payload: dict) -> tuple[list[dict], dict]:
     """归一化 DailyHotApi 形状：{id,title,cover,hot,url}。"""
     items = []
@@ -61,7 +134,7 @@ def normalize_dailyhot(source: str, payload: dict) -> tuple[list[dict], dict]:
                 "source": source,
                 "id": str(raw.get("id") or ""),
                 "title": title,
-                "hot": raw.get("hot") or raw.get("hotValue"),
+                "hot": normalize_hot(raw.get("hot") if raw.get("hot") is not None else raw.get("hotValue")),
                 "url": raw.get("url") or raw.get("mobileUrl") or "",
                 "cover": raw.get("cover") or "",
                 "rank": rank,
@@ -90,7 +163,7 @@ def normalize_raw_toutiao(source: str, payload: dict) -> tuple[list[dict], dict]
                 "source": source,
                 "id": str(raw.get("ClusterIdStr") or raw.get("ClusterId") or ""),
                 "title": title,
-                "hot": raw.get("HotValue"),
+                "hot": normalize_hot(raw.get("HotValue")),
                 "url": raw.get("Url") or "",
                 "cover": (raw.get("Image") or {}).get("url") if isinstance(raw.get("Image"), dict) else "",
                 "rank": rank,
@@ -189,6 +262,57 @@ def source_age_minutes(meta: dict, now: datetime) -> float | None:
     return (now - parsed).total_seconds() / 60.0
 
 
+def source_stale_threshold(source: str, configured: float) -> float:
+    """该源的陈旧阈值 = max(配置阈值, 源自身 TTL × STALE_TTL_FACTOR)。
+
+    ADR-0031 定下「宁可漏报陈旧，也不误报」，但当时的阈值是**全局**的：
+    所有源共用 `--stale-minutes`。这对刷新周期短于该阈值的源是对的，对
+    github 这种 TTL 为 24 小时的源则**每天必然误报**（见 SOURCE_TTL_MINUTES
+    与 STALE_TTL_FACTOR 的注释）。
+
+    用 `max` 而非直接取 TTL 的倍数，是为了让 `--stale-minutes` 仍能**放宽**判定
+    （例如某源已知在维护，想让告警晚点响）；但它**不能收紧到低于该源的刷新周期**
+    ——那正是本 ADR 要消除的误报。实测语义：github（下限 2160 分钟）传 60/180/600/
+    1440 阈值一律 2160，传 3000 才变 3000；toutiao（下限 90）传 60 被托到 90，
+    传 180/600 则生效。也就是说**传得比下限小没有效果，传得比下限大才生效**。
+
+    调用方传 `configured` 而非在函数内读全局，是为了让单元测试能直接构造
+    场景，不必改环境或参数解析。
+    """
+    ttl = SOURCE_TTL_MINUTES.get(source, DEFAULT_SOURCE_TTL_MINUTES)
+    return max(configured, ttl * STALE_TTL_FACTOR)
+
+
+def normalize_hot_history(history) -> list[dict]:
+    """把历史观测里的 `hot` 也归一化。
+
+    为什么需要这一遍：`normalize_hot` 只在**写入新观测**时生效，而
+    `hot_history` 里可能存着归一化之前落盘的旧值——实测 2026-10-18 的池子里
+    github 条目带着 `['40,798', 40798]` 这种"新旧混杂"的轨迹。只修入口不修
+    存量，等于让同一个字段在一个文件里同时有两种类型。
+
+    这是 ADR-0042 的同一形状：**修复只做在生产者一侧时，消费者仍会读到旧
+    格式的数据**。那次是 `kept_new` 的 `None` 在简报里印成 `?`；这次是旧
+    `hot` 字符串留在轨迹里。两者都指向同一条纪律——修数据格式时，必须同时
+    处理"已经在盘上的数据"，否则缺陷以"历史条目"的形态存活下来。
+
+    保留原始值到 `hot_raw` 的理由：归一化可能**改变**数值（`'40,798'` 去掉
+    逗号是同一个数，但若上游哪天给出 `'1.2万'` 这类形式，归一化就是一次有
+    损转换）。留下原文，将来出现归一化争议时能回溯。
+    """
+    out = []
+    for h in history or []:
+        if not isinstance(h, dict):
+            continue
+        raw = h.get("hot")
+        norm = normalize_hot(raw)
+        entry = {"at": h.get("at"), "hot": norm}
+        if norm != raw and raw is not None:
+            entry["hot_raw"] = raw
+        out.append(entry)
+    return out
+
+
 def item_key(it: dict) -> str:
     return f"{it.get('source')}:{it.get('id')}"
 
@@ -216,12 +340,17 @@ def merge_candidates(existing: dict, fresh: dict) -> dict:
         else:
             it = {**it,
                   "first_seen": old.get("first_seen", existing.get("collected_at")),
-                  "hot_history": (old.get("hot_history") or []) + [
+                  "hot_history": normalize_hot_history(old.get("hot_history")) + [
                       {"at": fresh["collected_at"], "hot": it.get("hot")}]}
         items.append({**it, "seen_in_last_run": True})
-    # 上一轮见过、这一轮没再出现的条目：保留并标记，不静默丢弃
+    # 上一轮见过、这一轮没再出现的条目：保留并标记，不静默丢弃。
+    # hot 与其轨迹同样过一遍归一化——这些条目本轮没有新观测，但它们的**存量**
+    # 旧格式仍会被下游读到（见 normalize_hot_history 的说明）。
     for old in prev_items.values():
-        items.append({**old, "seen_in_last_run": False})
+        items.append({**old,
+                      "hot": normalize_hot(old.get("hot")),
+                      "hot_history": normalize_hot_history(old.get("hot_history")),
+                      "seen_in_last_run": False})
 
     dropped: list[dict] = []
     for it in fresh.get("dropped", []):
@@ -292,12 +421,22 @@ def main() -> int:
     all_items, meta, failures = collect(sources, args.base, args.timeout)
 
     # 为每个源计算新鲜度（ADR-0029 第四条：updateTime 是真正的陈旧信号）
+    #
+    # 阈值按源计算而不是全局统一（ADR-0043）：各源在 DailyHotApi 里的缓存 TTL
+    # 不同（github 24h，其余 1h），统一阈值等于拿一个时长量不同周期的源。
+    # `stale_sources` 的每条同时带上判定所用的阈值，便于简报解释"为什么它算陈旧"。
     stale_sources = []
     for m in meta:
         age = source_age_minutes(m, now)
         m["age_minutes"] = round(age, 1) if age is not None else None
-        if age is not None and age > args.stale_minutes:
-            stale_sources.append({"source": m["source"], "age_minutes": round(age, 1)})
+        threshold = source_stale_threshold(m["source"], args.stale_minutes)
+        m["stale_threshold_minutes"] = round(threshold, 1)
+        if age is not None and age > threshold:
+            stale_sources.append({
+                "source": m["source"],
+                "age_minutes": round(age, 1),
+                "threshold_minutes": round(threshold, 1),
+            })
 
     keywords = load_niche_keywords()
     if args.no_prescreen:

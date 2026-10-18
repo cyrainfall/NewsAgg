@@ -32,7 +32,7 @@ python3 .agents/skills/newsagg-collect/scripts/collect.py
 | `--sources a,b,c` | 指定源，默认 `toutiao,36kr,juejin,csdn,ithome,sspai,github` |
 | `--no-prescreen` | 跳过赛道预筛，保留全部条目（用于审计预筛质量） |
 | `--no-merge` | 不做同日累积，直接覆盖写（逃生开关，默认关闭） |
-| `--stale-minutes N` | 数据陈旧阈值，默认 180 分钟 |
+| `--stale-minutes N` | 数据陈旧阈值的**下限**，默认 180 分钟。实际阈值按源自身刷新周期取 `max(该值, TTL × 1.5)`（ADR-0043）——传得比下限小**没有效果**，传得比下限大才生效（放宽） |
 
 输出：`.newsagg/candidates/<日期>.json`，并在 stdout 打印简报友好摘要。
 
@@ -61,8 +61,9 @@ python3 .agents/skills/newsagg-collect/scripts/collect.py
   "counts": {"fetched": 280, "kept": 107, "dropped": 173,
              "sources_ok": 7, "sources_failed": 0},
   "source_meta": [{"source":"toutiao","shape":"dailyhot","total":50,
-                   "from_cache":true,"update_time":"...","age_minutes":11.4,"ok":true}],
-  "stale_sources": [],
+                   "from_cache":true,"update_time":"...","age_minutes":11.4,
+                   "stale_threshold_minutes":180.0,"ok":true}],
+  "stale_sources": [{"source":"github","age_minutes":2300.0,"threshold_minutes":2160.0}],
   "failures": [],
   "items":    [{"source","id","title","hot","url","cover","rank","niche_hits"}],
   "dropped":  [ ... 同上，供审计漏筛 ... ]
@@ -72,6 +73,8 @@ python3 .agents/skills/newsagg-collect/scripts/collect.py
 ## 硬规则
 
 - **`fromCache: true` 不是陈旧信号。** 它表示"由缓存提供"，是正常且对风控有利的行为。真正的陈旧判据是 `updateTime` 的**年龄**（`age_minutes`）。把 fromCache 当陈旧会产生每日误报。
+- **陈旧阈值按源自身的刷新周期算，不是全局统一值。** `max(--stale-minutes, TTL × 1.5)`：github 的 TTL 是 24h（其余 1h），用全局 3 小时判它会让它每个自然日约 21 小时都"陈旧"——**每日必然触发的告警会被忽略**（ADR-0043）。`source_meta` 与 `stale_sources` 都带上实际判定阈值，便于解释"为什么它算陈旧"。
+- **`hot` 一律是 `int` 或 `None`，不可是字符串。** github 上游给的是带千分位的 `'40,798'`，其余六源是 `int`；不归一化会让下游 `sorted(key=hot)` 抛 `TypeError`。归一化在入口做，存量轨迹由 `normalize_hot_history` 补齐（旧值留在 `hot_raw`）。
 - **单源失败不中断整轮。** 失败记入 `failures`，并对头条尝试原始接口兜底（形状不同，已归一化）。只有**全部源都失败**才返回退出码 1。
 - **两种返回形状必须走各自的归一化函数**（`normalize_dailyhot` / `normalize_raw_toutiao`），不可混用——`id/title` 与 `ClusterId/Title` 直接换用会静默失败。
 - **保留 `dropped`。** 赛道预筛存在漏筛与误筛（ADR-0016），`dropped` 是审计窗口，不要丢弃。

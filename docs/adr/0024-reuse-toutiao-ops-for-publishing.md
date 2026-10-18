@@ -11,7 +11,7 @@
 | 多账号登录、QR 扫码、会话持久化 | Q84 首次人工扫码 | ✅ 已实现 |
 | `auth check` 登录态检测 | Q66 发布前预检登录态 | ✅ 已实现 |
 | 文章发布（Markdown 富文本、封面、声明） | Q65 发布技能职责 | ✅ 已实现 |
-| `--declaration` 支持 `引用AI` | Q71 AI 标识 | ✅ 原生支持 |
+| `--declaration` 支持多值（`个人观点` / `引用AI` / `取材网络` …） | Q71 AI 标识 | ✅ 原生支持（当前默认值见 ADR-0046） |
 | `analytics works` / `content-detail` | Q41 数据读回 | ⚠️ **接口存在但数据不可用**（ADR-0037 实测修正） |
 | `content list`（含 title/status） | Q134 发布反查验证 | ✅ 可用，**且每篇自带 `itemCounter`**——循环 C 的唯一数据源（ADR-0037） |
 | `inspiration`（创作活动 + 热点推荐） | 采集侧 | ⚠️ 未纳入（见下） |

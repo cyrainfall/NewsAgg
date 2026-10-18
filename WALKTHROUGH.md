@@ -314,7 +314,7 @@ strongest_counter: 第三方复现本身也可能有偏差
   ↓
 ```
 
-> **实际由 `toutiao-ops` 执行**（ADR-0024）：`toutiao-ops publish article --title ... --content-file ... --cover ... --cover-mode single --declaration "引用AI"`
+> **实际由 `toutiao-ops` 执行**（ADR-0024）：`toutiao-ops publish article --title ... --content-file ... --cover ... --cover-mode single --declaration "个人观点"`
 >
 > 两步流程：先「预览并发布」，NewsAgg 在此时做**提交前读回校验**（第四道门）；再「确认发布」。
 >

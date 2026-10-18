@@ -263,7 +263,13 @@ def main() -> int:
     ap.add_argument("--cover", required=True, help="封面图路径（头条必填）")
     ap.add_argument("--mode", choices=["dry-run", "publish"], default="dry-run",
                     help="dry-run 只填表不发布（默认）；publish 真发")
-    ap.add_argument("--declaration", default="引用AI", help="作品声明（ADR-0013）")
+    # 作品声明（ADR-0013 / ADR-0046）。默认「个人观点，仅供参考」。
+    # ⚠️ 已知合规风险：正文由 AI 生成，而《人工智能生成合成内容标识办法》
+    # （2025-09-01 施行）第十条禁止"隐匿"标识，用户侧义务是发布时主动声明。
+    # 用户于 2026-10-18 明确选择不用「引用AI」，改标「个人观点」，并已知悉
+    # 该风险。见 docs/adr/0046-declaration-is-personal-opinion-not-ai.md。
+    ap.add_argument("--declaration", default="个人观点",
+                    help="作品声明（ADR-0013 / ADR-0046）：取材网络,引用站内,个人观点,引用AI,虚构演绎")
     ap.add_argument("--min-free-mb", type=int, default=800, help="发布前可用内存下限（ADR-0023）")
     ap.add_argument("--lock-timeout", type=float, default=300.0)
     ap.add_argument("--account", default="default")

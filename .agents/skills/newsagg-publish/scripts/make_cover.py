@@ -24,6 +24,12 @@
 
 所有文字都经 `fit_font()` / `fit_block()` 由**测量**决定字号，绝不写死尺寸再赌
 它放得下。写死尺寸的后果是溢出画布——那比难看更糟，因为无人值守时没人看得见。
+
+## 封面不印「AI 辅助创作」
+
+AI 标识由平台的**作品声明**承担（`publish.py --declaration 引用AI`），那是平台
+自己展示的、可被检索的字段。在图上再印一行脚注是重复的，且要占掉 7.5% 的画布
+高度——而封面上每一寸都该留给论据。故 `--note` 默认为空。
 """
 from __future__ import annotations
 
@@ -523,7 +529,11 @@ def main() -> int:
     ap.add_argument("--slug", required=True, help="成稿 slug（取 outputs/<slug>.md 的标题）")
     ap.add_argument("--out", default=None, help="封面输出路径")
     ap.add_argument("--title", default=None, help="直接给标题（默认从成稿读一级标题）")
-    ap.add_argument("--note", default="AI 辅助创作", help="封面脚注")
+    ap.add_argument(
+        "--note",
+        default="",
+        help="可选脚注（默认**不画**）。AI 标识走平台的作品声明，不印在图上",
+    )
     ap.add_argument("--layout", default="auto", choices=["auto", "number", "contrast", "statement"])
     ap.add_argument("--kicker", default="", help="顶部小字（默认从标题推导）")
     ap.add_argument("--hero", default="", help="主数字，如 8160（number 布局）")

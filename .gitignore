@@ -5,6 +5,8 @@
 .npm-cache/
 .venv/
 node_modules/
+__pycache__/
+*.pyc
 
 # ── 凭证（ADR-0015 / 0018 / 0022：绝不入库）──
 .env

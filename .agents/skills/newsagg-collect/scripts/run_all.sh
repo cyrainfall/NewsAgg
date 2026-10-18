@@ -76,6 +76,9 @@ if [[ -f "$REPO/.env" ]]; then
   set +a
 fi
 
+# 运行时目录先建好：第 2 段末尾 agent 要写 .newsagg/covers/<date>.json（封面论据，
+# ADR-0044），第 3 段才读它。目录不存在会让 agent 的写入静默失败或被迫自己建。
+mkdir -p .newsagg/covers .newsagg/briefs
 export WEWRITE_HOME="$REPO/.wewrite"
 export PATH="$REPO/.uv-bin:$PATH"
 
@@ -415,7 +418,13 @@ if [[ -n "$AFTER_TRIAGE" && -z "$AFTER_WRITE" ]]; then
 请让模型读 .newsagg/briefs/${DATE}.md，把成稿写成
   outputs/<slug>.md        （slug 形如 ${DATE}-<短标题>，首行一级标题 2~30 字）
 
-封面不必手写，下一步会自动生成。写完后执行：
+封面：信息流里标题就印在封面旁边，复述标题的封面不增加信息，缩到 320px 宽
+时还会读不出来（ADR-0044）。所以封面要承载**一个视觉论据**，写到
+  .newsagg/covers/${DATE}.json
+形如 {"layout":"number","kicker":"Meta 开源","hero":"8160","hero_unit":"亿参数",
+"payoff":"模型免费，运维不免费"}；无强数字时用
+{"layout":"contrast","kicker":"…","line1":"…","line2":"…"}。
+留空则由标题自动推导（不一定最优，但不会出错）。写完后执行：
   bash ${SELF} --after-write $([[ "$MODE" == "publish" ]] && echo --publish)
 ────────────────────────────────────────────────────────
 EOF
@@ -426,8 +435,15 @@ fi
 log "④b 封面"
 SLUG="$(find_slug)" || fail_soft "cover" "找不到今日成稿" "outputs/${DATE}-*.md" 1
 echo "成稿：outputs/${SLUG}.md"
+COVER_SPEC=".newsagg/covers/${DATE}.json"
+COVER_SPEC_ARG=()
+[[ -f "$COVER_SPEC" ]] && COVER_SPEC_ARG=(--spec "$COVER_SPEC")
+# ⚠️ 必须写 ${A[@]+"${A[@]}"}：bash 3.2（macOS 自带）在 set -u 下展开**空数组**
+# 会报 "A[@]: unbound variable" 并终止脚本。没有 spec 时（最常见的情形）
+# 这一步会直接失败——一个只在"没写封面 spec"时才触发的静默故障。
 "$COVER_PY" .agents/skills/newsagg-publish/scripts/make_cover.py --slug "$SLUG" \
-  || fail_soft "cover" "封面生成失败（解释器：${COVER_PY}）" "$SLUG" 1
+  ${COVER_SPEC_ARG[@]+"${COVER_SPEC_ARG[@]}"} \
+  || fail_soft "cover" "封面生成失败（解释器：${COVER_PY}；spec：${COVER_SPEC}）" "$SLUG" 1
 
 log "⑤ 发布（${MODE}）"
 if [[ "$MODE" == "publish" ]]; then PUB_FLAG="--mode publish"; else PUB_FLAG=""; fi

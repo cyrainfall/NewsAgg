@@ -16,7 +16,38 @@ description: |
 
 1. 位于 `outputs/<slug>.md`，且**第一行是一级标题**（`# 标题`）
 2. 标题长度 **2~30 字**（头条硬限制）
-3. 封面图存在（头条必填；由 `wewrite-visual` 生成或模板拼图，ADR-0013）
+3. 封面图存在（头条必填；由 `make_cover.py` 模板拼图生成，ADR-0013）
+
+## 封面：承载一个视觉论据，不复述标题（ADR-0044）
+
+信息流里标题就印在封面旁边，**复述标题的封面不增加信息**，还会在 320px 缩略图下
+把字号压到读不出来。旧版实测：1200x675 上亮像素仅 4.7%，缩到 320px 宽时正文约 8px 高。
+
+封面只放**一个**元素，且必须能在 320px 宽下读出：
+
+```bash
+# 自动推导（从标题里找数字/对比，不一定最优但不会出错）
+.uv-tools/wewrite/bin/python .agents/skills/newsagg-publish/scripts/make_cover.py --slug <slug>
+
+# 显式指定视觉论据（推荐：由写作阶段判断"这篇文章的视觉论据是什么"）
+.uv-tools/wewrite/bin/python .agents/skills/newsagg-publish/scripts/make_cover.py \
+  --slug <slug> --spec .newsagg/covers/<日期>.json
+```
+
+三种布局：
+
+| `layout` | 用途 | 字段 |
+| --- | --- | --- |
+| `number` | 有强数字（金额/比例/参数） | `kicker` `hero` `hero_unit` `payoff` |
+| `contrast` | 两个短句相撞（A 成立 / B 不成立） | `kicker` `line1` `line2` |
+| `statement` | 无数字、无论点对撞，只有一句判断 | `kicker` `statement` |
+
+**数字要拆成 `hero` + `hero_unit`**：`hero` 放大到占满画面（`8160`），`hero_unit` 缩到
+三分之一（`亿参数`）。把两者塞进同一个字符串会让主字号被压小。
+
+**溢出会被挡住**：`make_cover.py` 用像素检查内容是否侵入左右边距带，溢出时
+`problems` 非空且退出码 1，编排器据此不发布。一张溢出画布的封面比没有封面更糟——
+它会被发出去，而没人看见。
 
 ## 执行
 

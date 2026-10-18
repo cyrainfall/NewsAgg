@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -139,16 +140,32 @@ def run_toutiao(args: list[str], env: dict, timeout: int = 300) -> tuple[int, st
 
     ADR-0028：必须检查退出码，不经管道（管道会掩码退出码）。
     ADR-0030：必须经由本函数串行调用。
+    ADR-0045：**必须把 stdout/stderr 重定向到文件，不能用管道捕获**。
+        toutiao-ops 的 `run()` 在 `console.log(...)` 之后**立刻** `process.exit(0)`；
+        Node 对管道写入是异步的，进程退出时尚未 flush 的部分会被丢掉。
+        `content list --limit 20` 的输出约 103KB，走管道只回收到约 64KB，
+        而且是在一个 JSON 字符串**中间**截断 —— 调用方 json.loads 失败，
+        反查被判成「查不到」。实测对照：同一命令 `> file` 得 103296 字节且合法，
+        `capture_output=True` 得 64788 字节且非法。
+        文件描述符是同步写，不受进程提前退出影响。
     """
-    proc = subprocess.run(
-        ["node", "index.js", *args],
-        cwd=env["TT_CLI_DIR"],
-        env=env["ENVIRON"],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+    with tempfile.TemporaryDirectory(prefix="newsagg-tt-") as td:
+        out_path = Path(td) / "stdout"
+        err_path = Path(td) / "stderr"
+        with out_path.open("wb") as fo, err_path.open("wb") as fe:
+            proc = subprocess.run(
+                ["node", "index.js", *args],
+                cwd=env["TT_CLI_DIR"],
+                env=env["ENVIRON"],
+                stdout=fo,
+                stderr=fe,
+                timeout=timeout,
+            )
+        return (
+            proc.returncode,
+            out_path.read_text(encoding="utf-8", errors="replace"),
+            err_path.read_text(encoding="utf-8", errors="replace"),
+        )
 
 
 def classify_failure(text: str) -> str:
@@ -394,6 +411,7 @@ def main() -> int:
                                           "--account", args.account], env, timeout=240)
             record["verify_code"] = rc
             found = None
+            parse_failed = False
             if rc == 0:
                 try:
                     payload = json.loads(cout)
@@ -405,10 +423,24 @@ def main() -> int:
                             if status in blob:
                                 found = f"title_found:{status}"
                                 break
-                except json.JSONDecodeError:
-                    record["verify_parse_error"] = cout[:200]
-            record["verify_result"] = found or "title_not_found"
+                except json.JSONDecodeError as exc:
+                    # SKILL.md：解析失败**不可判为"未找到"**——两者会导向完全不同的
+                    # 人工动作（前者去后台核实，后者可能诱使重发）。
+                    # 2026-10-18 实测：CLI 的 stdout 被 process.exit 截断，
+                    # 这里曾静默落入 title_not_found，把一次**成功发布**报成失败。
+                    parse_failed = True
+                    record["verify_parse_error"] = f"{exc}；原始输出前 200 字：{cout[:200]}"
+            record["verify_result"] = found or (
+                "verify_parse_failed" if parse_failed else "title_not_found"
+            )
 
+            if parse_failed:
+                # 结果未知 → 不重发、不判成功、不熔断，交人工核实（ADR-0011）
+                record["verdict"] = "unknown_needs_review"
+                append_ledger(ledger, record)
+                print(json.dumps({"ok": False, "stage": "verify", **record},
+                                 ensure_ascii=False, indent=2)[:4000])
+                return 1
             if found is None:
                 # 查不到 → 视为未发出，但不重发（ADR-0011）
                 record["verdict"] = "not_published_needs_review"

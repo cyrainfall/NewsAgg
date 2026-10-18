@@ -105,15 +105,17 @@ python3 .agents/skills/newsagg-publish/scripts/publish.py \
 
 5. **dry-run 有副作用**（ADR-0032）：它走 `--draft`，会在真实账号上**创建真实草稿**。它不是无痕验证，每次都会留痕，需人工到 `mp.toutiao.com` 草稿箱清理。**草稿无法被 `content list` 反查**（`--status` 只有 published/reviewing/rejected），因此 dry-run 只靠退出码判定。
 
-6. **反查的三种结果**：
+6. **反查的四种结果**（`verdict` 取值）：
 
-| 反查结果 | 判定 |
-| --- | --- |
-| 查到 `published` | 成功 |
-| 查到 `reviewing` | **视为已成功提交**（审核中，不是失败） |
-| 查到 `rejected` | **熔断 + 告警**——内容违规信号，直接关系信用分（ADR-0013） |
-| 查不到 | 视为未发出，**不重发**，标为待处理 |
-| 解析失败 | **不可判为"未找到"**，必须报告（静默误判会诱使重发） |
+| 反查结果 | `verdict` | 判定 |
+| --- | --- | --- |
+| 查到 `published` | `title_found:published` | 成功 |
+| 查到 `reviewing` | `title_found:reviewing` | **视为已成功提交**（审核中，不是失败） |
+| 查到 `rejected` | `rejected` | **熔断 + 告警**——内容违规信号，直接关系信用分（ADR-0013） |
+| 查不到 | `not_published_needs_review` | 视为未发出，**不重发**，标为待处理 |
+| 输出解析失败 | `unknown_needs_review` | **不可判为"未找到"**，交人工核实（静默误判会诱使重发） |
+
+**`run_toutiao` 必须把 stdout 重定向到文件，不能用管道捕获**（ADR-0045）。toutiao-ops 的 runner 在 `console.log` 之后**立刻** `process.exit(0)`，Node 对管道的写是异步的，未 flush 的部分会被丢掉：`content list --limit 20` 的 103KB 输出走管道只回收到 64KB，且断在一个 JSON 字符串中间。写文件描述符是同步的，不受影响。2026-10-18 就因为这一点，把一次**成功发布**报成了 `title_not_found`。
 
 ## 熔断
 

@@ -342,15 +342,28 @@ def section_article(decision, publish_recs, body_dir: Path, perf: dict | None = 
     return out
 
 
-def section_assets(decision, cards_dir: Path) -> list[str]:
+def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -> list[str]:
     out = ["## ④ 资产变动", ""]
     before = len(list(cards_dir.glob("*.md"))) if cards_dir.exists() else 0
     out += [f"- 观点卡总数：{before}"]
     d = unwrap(decision)
     if d.get("action") == "new":
+        cf = d.get("card_file")
+        exists = bool(cf) and (cards_dir / str(cf)).exists()
         out += [f"- **新建卡**：{d.get('new_issue')}（可复用性：{clip(d.get('reusable_because',''), 300)}）"]
+        out += [f"- 卡文件：{cf or '（决策未给出）'}{'' if exists else '——**文件不存在**'}"]
     elif d.get("action") == "continue":
-        out += [f"- **修订**：{d.get('card_file')}（待发布成功后写回，带未复核标记）"]
+        cf = str(d.get("card_file") or "")
+        # 写回是否真的落地，只能看卡里有没有「来源 <slug>」这一行——
+        # 它是 writeback.py 写入修订时的固定格式，也是它自己的幂等判据。
+        # 此前这里印的是固定文案「待发布成功后写回」，在发布成功且写回已完成时
+        # 会长期显示成"还没写"，与事实相反（2026-10-18 实测）。
+        landed = False
+        card_path = cards_dir / cf if cf else None
+        if card_path and card_path.exists() and article_slug:
+            landed = f"来源 {article_slug}" in card_path.read_text(encoding="utf-8")
+        status = "已写回，带**未复核**标记（ADR-0026 循环 A）" if landed else "**未写回**（发布未成功，或写回失败）"
+        out += [f"- **修订**：{cf} — {status}"]
     # 治理建议（退役/合并）由分拣层在需要时提供
     for key, label in (("retire_suggestions", "退役建议"), ("merge_suggestions", "合并建议")):
         items = (decision or {}).get(key) or []
@@ -467,7 +480,7 @@ def main() -> int:
     lines += section_conclusion(decision, publish_recs, date, perf, run_status)
     lines += section_overview(cand, decision)
     lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies", perf)
-    lines += section_assets(decision, root / "knowledge" / "cards")
+    lines += section_assets(decision, root / "knowledge" / "cards", slug)
     lines += section_actions(publish_recs, cand, decision, cover, slug, perf, run_status)
 
     lines += ["---", f"*生成于 {now.isoformat()} ｜ 时区 Asia/Shanghai*"]

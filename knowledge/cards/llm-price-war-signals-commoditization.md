@@ -33,11 +33,7 @@ source: 种子卡（人工植入，ADR-0007）
   - 新增依据：Tavily 官方定价页：Pay-as-you-go 每信用 0.008 美元，Basic Search 每次 1 信用 → 单次搜索 0.008 美元；折合人民币约 0.057 元，是 DeepSeek 单次 0.005 元的约 11 倍
   - 新增依据：DeepSeek 模型本身价格未变：峰时输入 0.30 元 / 输出 1.20 元每百万 tokens，谷时减半；API 名字仍是 deepseek-flash，10-17 18:07 三端同步切换、无发布会
   - 新增依据：官方模型卡全部为自报且用自家选的 harness 跑（Terminal-Bench 4.0 用 Claude Code 框架、DeepSWE 用 mini-swe-v2），无第三方复核；在 Terminal-Bench 4.0 / ProgramBench / HLE 上仍明显落后 Claude Opus 5，所谓「超越旗舰」是挑项目说的
-  - 新增依据：掘金实测：同一 prompt 下 Flash-1017 生成 16
-  - 新增依据：735 字节、71.7 秒、1.22 credit，V4-Pro 为 9
-  - 新增依据：906 字节、118.3 秒、6.29 credit；思考 token 占 15
-  - 新增依据：349 / 21
-  - 新增依据：333
+  - 新增依据：掘金实测：同一 prompt 下 Flash-1017 生成 16,735 字节、71.7 秒、1.22 credit，V4-Pro 为 9,906 字节、118.3 秒、6.29 credit；思考 token 占 15,349 / 21,333
 
 ## 可接住的事件类型
 

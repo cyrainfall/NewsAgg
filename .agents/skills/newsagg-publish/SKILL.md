@@ -116,6 +116,22 @@ python3 .agents/skills/newsagg-publish/scripts/publish.py \
 
 **`run_toutiao` 必须把 stdout 重定向到文件，不能用管道捕获**（ADR-0045）。toutiao-ops 的 runner 在 `console.log` 之后**立刻** `process.exit(0)`，Node 对管道的写是异步的，未 flush 的部分会被丢掉：`content list --limit 20` 的 103KB 输出走管道只回收到 64KB，且断在一个 JSON 字符串中间。写文件描述符是同步的，不受影响。2026-10-18 就因为这一点，把一次**成功发布**报成了 `title_not_found`。
 
+## 绝不附带发微头条（ADR-0047）
+
+`--no-weitoutiao` 每次都必须传。它看起来是个多余的防御，其实是必需的：
+**头条发布页的「发布得更多收益」（= 同时发布微头条）默认是未勾选的**，
+而 `toutiao-ops` 的 `uncheckWeitoutiao()` 曾经无条件点它一下 ——
+那一次点击不是取消，而是**勾上**，于是文章和微头条各发一条。
+10-14 与 10-18 各发生过一次，两次都被反查判成 `title_found`、无人知晓。
+
+上游已修（先读 class 里的 `byte-checkbox-checked`，只在确实已勾选时才点，
+点后再验一次）。**但这条规则仍然必须保留**：发布页是平台页面，
+它的默认值随时会变，而我们唯一可靠的姿态是「每次都显式要求不要」。
+
+反查会数同一标题下有几条文章、几条微头条，写进账本 `verify_kinds`；
+出现微头条时置 `weitoutiao_leak`，简报 ⑤ 段会列出来等你手工删除
+（本 CLI **没有删除能力**，发出去就删不掉）。
+
 ## 作品声明：当前是「个人观点」，这是有意的偏离（ADR-0046）
 
 `--declaration` 默认 **`个人观点`**（平台显示为「个人观点，仅供参考」），

@@ -208,6 +208,45 @@ def memory_check(min_free_mb: int) -> tuple[bool, str]:
     return True, f"可用内存 {avail_mb:.0f}MB ≥ {min_free_mb}MB"
 
 
+def count_title_kinds(payload: dict, title: str) -> dict:
+    """数一数这个标题下有几条文章、几条微头条（ADR-0047）。
+
+    反查原本只问「标题出现没有」，因此量不出「多发了一条微头条」——
+    10-14 与 10-18 各发生一次，两次都被判成 `title_found` 而无人知晓。
+    这里补上计数，让重复出现在账本里变成可查证的事实。
+
+    与 `performance.py:classify_kind` 同一套判据（gid 位数 / URL 形态 /
+    `content` 是否非空），因为它和循环 C 必须对「什么算一篇文章」有同一答案。
+    """
+    kinds = {"article": 0, "weitoutiao": 0}
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return kinds
+    for wrapper in items:
+        data = wrapper.get("data") if isinstance(wrapper, dict) else None
+        if not isinstance(data, list):
+            continue
+        for cell in data:
+            base = ((cell.get("assembleCell") or {}).get("itemCell") or {}).get("articleBase") \
+                if isinstance(cell, dict) else None
+            if not isinstance(base, dict):
+                continue
+            if str(base.get("title") or "").strip() != title.strip():
+                continue
+            gid = str(base.get("gidStr") or "")
+            url = str(base.get("articleURL") or base.get("displayURL") or "")
+            content = str(base.get("content") or "").strip()
+            votes = 0
+            if gid and len(gid) <= 17:
+                votes += 1
+            if "/a" in url and "/item/" not in url:
+                votes += 1
+            if content:
+                votes += 1
+            kinds["weitoutiao" if votes >= 2 else "article"] += 1
+    return kinds
+
+
 def read_publish_snapshot(out_dir: Path, slug: str) -> tuple[str, str] | None:
     """读成稿（标题 + 正文）。成稿由写作阶段写入 outputs/。"""
     md = out_dir / f"{slug}.md"
@@ -429,6 +468,17 @@ def main() -> int:
                             if status in blob:
                                 found = f"title_found:{status}"
                                 break
+                    # ADR-0047：数一数这个标题下有几条**文章**、几条微头条。
+                    # 一次发布动作本该只产出一篇文章；若同时出现微头条，
+                    # 那是 --no-weitoutiao 没生效——这在 10-14 和 10-18 各发生过一次，
+                    # 而反查只查标题、量不出「多了一条」，所以两次都没被发现。
+                    kinds = count_title_kinds(payload, title)
+                    record["verify_kinds"] = kinds
+                    if kinds.get("weitoutiao", 0) > 0:
+                        record["weitoutiao_leak"] = (
+                            f"同一标题下发现 {kinds['weitoutiao']} 条微头条："
+                            "`--no-weitoutiao` 未生效（ADR-0047）"
+                        )
                 except json.JSONDecodeError as exc:
                     # SKILL.md：解析失败**不可判为"未找到"**——两者会导向完全不同的
                     # 人工动作（前者去后台核实，后者可能诱使重发）。

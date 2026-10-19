@@ -215,14 +215,55 @@ async function addToCollection(page, collectionName) {
   }
 }
 
+/**
+ * 读取某个勾选框的真实勾选状态。
+ *
+ * 头条发布页的勾选框是 `label.byte-checkbox`，**没有原生 input、没有
+ * aria-checked**，状态只体现在 label 的 className 上（含 `byte-checkbox-checked`
+ * 即为已勾选）。所以只能读 class，不能读 `checked` property。
+ *
+ * 返回 null 表示页面上找不到这个勾选框。
+ */
+async function readCheckboxState(page, labelText) {
+  return page.evaluate((text) => {
+    const labels = [...document.querySelectorAll('label.byte-checkbox')];
+    const hit = labels.find((l) => (l.innerText || '').includes(text));
+    if (!hit) return null;
+    return String(hit.className).includes('byte-checkbox-checked');
+  }, labelText);
+}
+
 async function uncheckWeitoutiao(page) {
-  try {
-    // "同时发布微头条" 默认已勾选，点击取消
-    const checkbox = page.locator('text=发布得更多收益').first();
-    await checkbox.click({ timeout: 5000 });
-    await sleep(200, 400);
-  } catch {
-    // 取消失败不阻塞
+  // ⚠️ 这里曾经是「无条件点一下」，注释说「默认已勾选，点击取消」。
+  // 2026-10-19 的 DOM 探针实测：全新打开页面、填完标题正文之后，
+  // 「发布得更多收益」始终是**未勾选**。于是那一次点击不是取消，而是**勾上**，
+  // 导致 10-18 那篇同时发了文章和微头条（ADR-0034 判为「包装层漏传参数」是错的）。
+  // 现在改为：先读状态，只有确实已勾选才点，点完再验一次。
+  const label = '发布得更多收益';
+  let before = await readCheckboxState(page, label);
+  if (before === null) {
+    // 有些账号/有些时候这个勾选框根本不存在。等一会儿再确认一次：
+    // 若确实不存在，那就不可能有微头条随之发出，属于安全情形。
+    await sleep(800, 1200);
+    before = await readCheckboxState(page, label);
+  }
+  if (before === null) {
+    process.stderr.write('[warn] 未找到「发布得更多收益」勾选框：视为该账号无此项，不发布微头条\n');
+    return;
+  }
+  if (before === false) {
+    return; // 已经是未勾选，不需要点（点了反而会勾上）
+  }
+
+  const checkbox = page.locator('text=' + label).first();
+  await checkbox.scrollIntoViewIfNeeded().catch(() => {});
+  await checkbox.click({ timeout: 5000 });
+  await sleep(200, 400);
+
+  const after = await readCheckboxState(page, label);
+  if (after !== false) {
+    // 不能静默通过：多发一条微头条是平台侧可见的重复内容。
+    throw new Error(`取消「同时发布微头条」失败：点击后状态仍为 ${after}（true=已勾选）`);
   }
 }
 
@@ -249,12 +290,37 @@ async function setDeclarations(page, declarationStr) {
 
   for (const decl of declarations) {
     const fullLabel = labelMap[decl] || decl;
-    try {
-      const checkbox = page.locator(`text=${fullLabel}`).first();
-      await checkbox.scrollIntoViewIfNeeded().catch(() => {});
-      await checkbox.click({ timeout: 3000 });
-      await sleep(200, 400);
-    } catch {}
+    const checkbox = page.locator(`text=${fullLabel}`).first();
+    await checkbox.scrollIntoViewIfNeeded().catch(() => {});
+    await checkbox.click({ timeout: 3000 });
+    await sleep(200, 400);
+  }
+
+  // 读回校验：这里过去是 try{}catch{} 静默吞掉，点没点上「系统自己不知道」
+  // （ADR-0046 已记录该风险）。声明是法规义务（《AI 生成合成内容标识办法》
+  // 第十条），失败了必须让调用方知道，而不能当作发布成功。
+  //
+  // 另：实测声明之间是**单选互斥**（点「个人观点」后再点「引用AI」，
+  // 前者会自动取消）。所以逗号分隔多个声明只有最后一个真正生效——
+  // 这里显式报错，避免上层以为传多个就都生效。
+  const states = [];
+  for (const decl of declarations) {
+    const fullLabel = labelMap[decl] || decl;
+    states.push({ decl, checked: await readCheckboxState(page, fullLabel) });
+  }
+  const checkedList = states.filter((s) => s.checked === true).map((s) => s.decl);
+  const unchecked = states.filter((s) => s.checked !== true).map((s) => s.decl);
+
+  if (checkedList.length === 0) {
+    throw new Error(
+      `作品声明勾选失败：${declarations.join('、')} 均未生效（读回状态全部为未勾选）`
+    );
+  }
+  if (unchecked.length > 0) {
+    throw new Error(
+      `作品声明未全部生效：已勾选 [${checkedList.join('、')}]，未勾选 [${unchecked.join('、')}]。` +
+        '头条的声明是单选互斥的，一次只能选一个——请只传一个声明。'
+    );
   }
 }
 

@@ -365,9 +365,15 @@ def merge_candidates(existing: dict, fresh: dict) -> dict:
         old = meta_by_source.get(m["source"])
         meta_by_source[m["source"]] = {**m, "observations": (old or {}).get("observations", 0) + 1}
 
-    failed_sources = {f["source"] for f in fresh.get("failures", [])}
+    # 失败的源：本次失败的直接用；旧的失败只在「本次也没成功」时保留。
+    # ⚠️ 原实现只排除了「本次也失败」的源，于是**已恢复的源永远不会从 failures 里消失**
+    # ——实测 10-19 第 1、2 次采集 csdn/sspai 报 500、第 3 次成功，简报却同时印出
+    # 「源：7 成功 / 0 失败」与「失效源：csdn, sspai」（ADR-0047）。
+    fresh_failed = {f["source"] for f in fresh.get("failures", [])}
+    recovered = {m["source"] for m in fresh.get("source_meta", []) if m.get("ok")}
     failures = [f for f in fresh.get("failures", [])]
-    failures += [f for f in existing.get("failures", []) if f["source"] not in failed_sources]
+    failures += [f for f in existing.get("failures", [])
+                 if f["source"] not in fresh_failed and f["source"] not in recovered]
 
     runs = list(existing.get("collection_runs", []))
     runs.append({"at": fresh["collected_at"], **fresh.get("counts", {})})
@@ -395,7 +401,9 @@ def merge_candidates(existing: dict, fresh: dict) -> dict:
             "kept": len(items),
             "dropped": len(dropped),
             "sources_ok": fresh.get("counts", {}).get("sources_ok", 0),
-            "sources_failed": fresh.get("counts", {}).get("sources_failed", 0),
+            # 用合并后的 failures 长度，而不是本次的 sources_failed：否则会出现
+            # 「0 失败」与「失效源：csdn」同时出现在简报里的自相矛盾（ADR-0047）
+            "sources_failed": len(failures),
             "kept_new": len([i for i in items if i.get("first_seen") == fresh["collected_at"]]),
             "runs_today": len(runs),
         },

@@ -50,6 +50,28 @@ def read_ledger(path: Path, date_prefix: str) -> list[dict]:
     return out
 
 
+def read_ledger_all(path: Path) -> list[dict]:
+    """读**全部**账本记录，不管日期。
+
+    `read_ledger()` 按日期前缀过滤，那是给「今天发了什么」用的。但有些事实没有
+    过期日期——比如一条已经发出去、删不掉的微头条（ADR-0047）。它发生在哪天不重要，
+    重要的是它现在还在平台上。只在当天简报里提一次，等于让它静默消失。
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
 def unwrap(raw):
     """决策文件形状是 {date, decision:{...}, ...}；也接受扁平对象。
 
@@ -59,6 +81,21 @@ def unwrap(raw):
     if not raw:
         return {}
     return raw.get("decision", raw) if isinstance(raw, dict) else {}
+
+
+def _is_weitoutiao(rec: dict) -> bool:
+    """这条记录是不是微头条（ADR-0047）。
+
+    `content list` 把文章与微头条混在同一个列表返回，两者都能匹配上本地标题。
+    微头条是同一次发布动作的产物，不能算成「我们的文章」——否则简报会多出
+    一行与文章同名、数字极小的「文章」，读起来像是发重了（10-18 就是如此）。
+    老记录没有 `kind` 字段，按 gid 位数回退：文章 19 位、微头条 16 位。
+    """
+    kind = rec.get("kind")
+    if kind in ("article", "weitoutiao"):
+        return kind == "weitoutiao"
+    gid = str(rec.get("gid") or "")
+    return bool(gid) and len(gid) <= 17
 
 
 def read_performance(root: Path) -> dict:
@@ -96,6 +133,8 @@ def read_performance(root: Path) -> dict:
     for r in out["records"]:
         if not r.get("ours"):
             continue
+        if _is_weitoutiao(r):
+            continue  # ADR-0047：微头条不算一篇文章
         key = r.get("gid") or r.get("slug")
         if key:
             out["articles"][key] = r
@@ -375,7 +414,7 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -
     return out
 
 
-def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None) -> list[str]:
+def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None) -> list[str]:
     out = ["## ⑤ 需你介入的事项", ""]
     any_item = False
 
@@ -408,6 +447,30 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
     if failed:
         any_item = True
         out += [f"**信源失效**：{', '.join(map(str, failed))}", ""]
+
+    # 微头条泄漏（ADR-0047）：一次发布动作本该只产出一篇文章。若反查发现同一
+    # 标题下还有微头条，说明 `--no-weitoutiao` 没生效——10-14 与 10-18 各发生过一次，
+    # 两次都被反查判成 title_found、无人知晓。平台侧无法经本 CLI 删除，
+    # 只能人工处置，所以必须在这里显式列出。
+    #
+    # ⚠️ 这里读的是**全部**账本，不是当天那几条：泄漏一旦发生就永久存在（删不掉），
+    # 只在当天简报里提醒一次等于让它消失。你手工删完之后，在那条账本记录上写
+    # `"leak_resolved_at": "<日期>"`，提醒才会停——否则它会每天出现，直到有人处理。
+    all_recs = read_ledger_all(ledger_path) if ledger_path else []
+    leaks = [r for r in all_recs
+             if r.get("weitoutiao_leak") and not r.get("leak_resolved_at")]
+    if leaks:
+        any_item = True
+        out += ["**同发了微头条，需要你手工删除**（ADR-0047）："]
+        for r in leaks:
+            out += [f"- {str(r.get('at',''))[:10]}《{r.get('title','')}》"
+                    f" ← gid {r.get('weitoutiao_leak')}"]
+        out += ["  发布页的「发布得更多收益」默认**未勾选**，旧代码却无条件点了一下、",
+                "  反而把它勾上。发布链已改为「先读状态、只在该取消时点、点后读回验证」，",
+                "  但已经发出去的删不掉（CLI 无删除能力）。",
+                "  删完在 `.newsagg/publish-ledger.jsonl` 对应记录加 `\"leak_resolved_at\": \"<日期>\"`，",
+                "  这条提醒才会停。",
+                ""]
 
     # 运行失败（ADR-0038）：`.newsagg/run-status.json` 不入库、看守读不到，
     # 所以它必须在这里出现——否则"系统今天跑挂了"就没有任何出口。
@@ -481,7 +544,8 @@ def main() -> int:
     lines += section_overview(cand, decision)
     lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies", perf)
     lines += section_assets(decision, root / "knowledge" / "cards", slug)
-    lines += section_actions(publish_recs, cand, decision, cover, slug, perf, run_status)
+    lines += section_actions(publish_recs, cand, decision, cover, slug, perf, run_status,
+                             ledger_path=root / ".newsagg" / "publish-ledger.jsonl")
 
     lines += ["---", f"*生成于 {now.isoformat()} ｜ 时区 Asia/Shanghai*"]
     md = "\n".join(lines)

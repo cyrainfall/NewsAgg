@@ -163,8 +163,8 @@ fail_soft() {  # $1 stage  $2 reason  $3 detail  $4 allow_push(1/0)
   exit 1
 }
 
-dec_field() {  # $1 = 键路径；先在 decision 对象里找，再回退到顶层（abstain_reason 等）
-  DEC="$DEC" FIELD="$1" python3 - <<'PY'
+dec_field() {  # $1 = 键路径；$2 = 列表分隔符（默认换行）。先在 decision 对象里找，再回退到顶层（abstain_reason 等）
+  DEC="$DEC" FIELD="$1" FIELD_SEP="${2-$'\n'}" python3 - <<'PY'
 import json, os
 
 raw = json.load(open(os.environ["DEC"], encoding="utf-8"))
@@ -184,7 +184,8 @@ cur = walk(d, os.environ["FIELD"])
 if cur is None and isinstance(raw, dict):
     cur = walk(raw, os.environ["FIELD"])
 if isinstance(cur, list):
-    cur = ",".join(str(x) for x in cur)
+    # 默认换行分隔：证据/摘要文本自身含英文逗号，用逗号切会切断千分位数字（ADR-0047）
+    cur = os.environ.get("FIELD_SEP", "\n").join(str(x) for x in cur)
 print("" if cur is None else cur)
 PY
 }

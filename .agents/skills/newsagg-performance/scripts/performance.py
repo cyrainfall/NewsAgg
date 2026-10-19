@@ -103,6 +103,44 @@ def epoch_to_iso(ts) -> str | None:
 
 # ────────────────────────── 归一化 ──────────────────────────
 
+def classify_kind(base: dict) -> str:
+    """判定一条作品是 `article`（图文文章）还是 `weitoutiao`（微头条）。
+
+    ADR-0047：`content list` 把文章和微头条混在同一个列表里返回，两者都能
+    匹配上本地标题，于是「我们发了几篇」会被算多。2026-10-18 实测：一次发布
+    动作产出了一篇文章 + 一条微头条，标题相同、各自独立计数，导致
+    `reports/performance.jsonl` 里同一篇出现两个 gid。
+
+    三条互相独立的判据（实测样本 5 条，全部一致）：
+    - gid 位数：文章 19 位、微头条 16 位；
+    - URL 形态：文章 `/item/<gid>/`、微头条 `/a<gid>`；
+    - `content` 字段：文章为空，微头条**非空**（内容就是正文/标题本身）。
+
+    用多数票而不是单条判据：任何一条判据都可能因平台改版失效，
+    三条同时看能在改版时退化成「仍大致正确」而不是全错。
+    """
+    gid = str(base.get("gidStr") or "")
+    url = str(base.get("articleURL") or base.get("displayURL") or "")
+    content = str(base.get("content") or "").strip()
+
+    votes = {"article": 0, "weitoutiao": 0}
+    if gid:
+        if len(gid) >= 18:
+            votes["article"] += 1
+        elif len(gid) <= 17:
+            votes["weitoutiao"] += 1
+    if "/a" in url and "/item/" not in url:
+        votes["weitoutiao"] += 1
+    elif "/item/" in url:
+        votes["article"] += 1
+    if content:
+        votes["weitoutiao"] += 1
+    else:
+        votes["article"] += 1
+
+    return "weitoutiao" if votes["weitoutiao"] > votes["article"] else "article"
+
+
 def extract_articles(raw: dict) -> tuple[list[dict], dict]:
     """从 `content list` 的原始信封里抽出每篇文章（ADR-0030 决策四）。
 
@@ -162,6 +200,10 @@ def extract_articles(raw: dict) -> tuple[list[dict], dict]:
                 "published_at": epoch_to_iso(base.get("publishTime")),
                 "item_status": base.get("itemStatus"),
                 "url": base.get("articleURL") or base.get("displayURL"),
+                # ADR-0047：区分文章与微头条。两者出现在同一个作品列表里，
+                # 若不区分，「我们的文章」会把一条微头条也算成一篇——
+                # 冷启动豁免（5 篇）提前耗尽、基准被稀释。
+                "kind": classify_kind(base),
                 "metrics": metrics,
                 "read_rate": round(rate, 6) if rate is not None else None,
             })
@@ -203,11 +245,30 @@ def local_title_index(root: Path) -> tuple[dict[str, str], dict[str, str]]:
 
 # ────────────────────────── 基准与降频 ──────────────────────────
 
+def record_kind(rec: dict) -> str:
+    """历史记录里的 `kind`；老记录没有这个字段，按 gid 位数回退（ADR-0047）。
+
+    `reports/performance.jsonl` 是**跨环境保留的**入库文件，里面已经有修复前
+    写下的记录（kind 缺失），而其中一条正是微头条。若只认新字段，那条
+    微头条会继续留在基准序列里，等于没修。所以老记录必须能就地判定。
+    """
+    kind = rec.get("kind")
+    if kind in ("article", "weitoutiao"):
+        return kind
+    gid = str(rec.get("gid") or "")
+    if gid and len(gid) <= 17:
+        return "weitoutiao"
+    return "article"
+
+
 def latest_per_article(records: list[dict], ours_only: bool = True) -> list[dict]:
     """每篇文章取最新一次观测，再按发布时间排序。"""
     latest: dict[str, dict] = {}
     for r in records:
         if ours_only and not r.get("ours"):
+            continue
+        # ADR-0047：微头条不算一篇（同一次发布动作的产物，标题与文章相同）
+        if record_kind(r) != "article":
             continue
         key = r.get("gid") or r.get("slug")
         if not key:
@@ -442,13 +503,18 @@ def main() -> int:
     for a in articles:
         slug = title_index.get(a.get("title") or "")
         a["slug"] = slug
-        a["ours"] = bool(slug)
+        a["matched"] = bool(slug)
+        # ADR-0047：只有**文章**算「我们的文章」。微头条即便标题匹配也不算——
+        # 它与文章是同一次发布动作的产物，算两篇会让冷启动豁免（5 篇）
+        # 与基准都被提前消耗。微头条仍然记录（kind 字段留着），只是不进序列。
+        a["ours"] = bool(slug) and a.get("kind") == "article"
         a["date"] = today
         a["collected_at"] = now.isoformat()
         a["source"] = parse_meta.get("source")
 
     ours = [a for a in articles if a["ours"]]
-    unmatched = [a for a in articles if not a["ours"]]
+    weitoutiao = [a for a in articles if a.get("matched") and a.get("kind") != "article"]
+    unmatched = [a for a in articles if not a.get("matched")]
 
     # ── 落库（每篇每天只留一行；同一天重跑则**就地更新**）──
     # 为什么不追加：一天跑两次不该让同一篇文章在基准里算两遍。
@@ -499,6 +565,8 @@ def main() -> int:
             "ok": True, "at": now.isoformat(), "parse": parse_meta,
             "articles_on_platform": len(articles),
             "articles_matched": len(ours),
+            "weitoutiao_matched": [{"title": a.get("title"), "gid": a.get("gid")}
+                                   for a in weitoutiao],
             "unmatched": [{"title": a.get("title"), "gid": a.get("gid")} for a in unmatched],
             "new_records": len(new_records),
             "updated_records": len(updated_records),
@@ -514,6 +582,8 @@ def main() -> int:
         "index": index_meta,
         "articles_on_platform": len(articles),
         "articles_matched": len(ours),
+        "weitoutiao_matched": [{"title": a.get("title"), "gid": a.get("gid")}
+                               for a in weitoutiao],
         "unmatched": [{"title": a.get("title"), "gid": a.get("gid")} for a in unmatched],
         "new_records": len(new_records),
         "updated_records": len(updated_records),
@@ -522,6 +592,7 @@ def main() -> int:
         "frequency": {"downshifted": bool(freq.get("downshifted")), "since": freq.get("since"),
                       "today_is_skip_day": skip, "why": skip_why},
         "articles": [{"slug": a.get("slug"), "title": a.get("title"), "ours": a["ours"],
+                      "kind": a.get("kind"),
                       "published_at": a.get("published_at"), "read_rate": a.get("read_rate"),
                       "metrics": a.get("metrics")} for a in articles],
     }, ensure_ascii=False, indent=2))

@@ -95,7 +95,7 @@ def main() -> int:
     ap.add_argument("--card", required=True, help="卡文件名，如 llm-price-war-...md")
     ap.add_argument("--event", required=True, help="本次事件的简短描述（写入 covered_events）")
     ap.add_argument("--judgment", default=None, help="本次新增/推进的判断（写入修订史）")
-    ap.add_argument("--evidence", default=None, help="本次新增依据（逗号分隔）")
+    ap.add_argument("--evidence", default=None, help="本次新增依据（换行分隔，不要用逗号——证据本身含逗号）")
     ap.add_argument("--article", default=None, help="来源文章 slug（记录来源）")
     ap.add_argument("--date", default=None, help="日期 YYYY-MM-DD，默认今天")
     ap.add_argument("--dry-run", action="store_true", help="只打印结果，不写文件")
@@ -138,7 +138,9 @@ def main() -> int:
     lines = [f"- {date} 修订（**未复核**，来源 "
              f"{args.article or '（未注明）'}）：{args.judgment or args.event}"]
     if args.evidence:
-        for e in [x.strip() for x in args.evidence.split(",") if x.strip()]:
+        # 分隔符必须是换行：证据文本本身含英文逗号（千分位、并列句），
+        # 用逗号切会把「16,735 字节」切成「16」和「735 字节」（ADR-0047）。
+        for e in [x.strip() for x in args.evidence.split("\n") if x.strip()]:
             lines.append(f"  - 新增依据：{e}")
     revision = "\n".join(lines)
 

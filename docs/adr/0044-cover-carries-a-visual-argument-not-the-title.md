@@ -68,6 +68,50 @@
 `{"layout","kicker","hero","hero_unit","payoff"}` 写进 `.newsagg/covers/<日期>.json`，
 封面阶段读它。优先级是**命令行 > spec > 标题推导**，后者作为兜底保留。
 
+### 五、spec 缺省时，`statement` 分支会把推导结果丢掉并复述标题
+
+2026-10-20 那篇《Codex搬走Cursor配置：选AI编程工具的标准变了》没有写
+`.newsagg/covers/2026-10-20.json`（写作阶段漏给了论据），于是走 `--spec` 缺省
+路径。`derive_parts()` 的推导是**正确的**：
+
+```
+{'layout': 'statement', 'kicker': 'Codex搬走Cursor配置', 'text': '选AI编程工具的标准变了'}
+```
+
+它把标题切成「前半句当标签 + 后半句当断言」，正是这条 ADR 想要的分工。但
+`make_cover()` 的 `statement` 分支当时的写法是：
+
+```python
+img = layout_statement(size, kicker, statement or title, footnote)
+```
+
+`statement` 形参来自 `--statement` 命令行参数，缺省是空串；于是无论推导出了什么，
+这里的 `or` 都会落到 `title`——**推导出的 `text` 从未被读取**。同时 `kicker` 走的是
+`derived.get("kicker")`，正常取到了冒号前半句。结果封面渲染成：
+
+- 顶部蓝字：`Codex搬走Cursor配置`
+- 正文两行：`Codex搬走Cursor配置：` / `选AI编程工具的标准变了`
+
+顶部小字与正文第一行逐字重复，正文还是整条标题。这正是本 ADR 开篇判定为
+「**不增加信息**」的那种封面，而且它**通过了 `edge_check`**、`problems: []`——
+又一个「通过式失败」（同第四条发现里 kicker 那个例子的形状）。
+
+修法是把兜底链补全为「命令行 > 推导 > 标题」：
+
+```python
+statement or derived.get("text", "") or title
+```
+
+修后同一标题渲染为「顶部 `Codex搬走Cursor配置` / 正文 `选AI编程工具的标准变了`」，
+不再重复；对 7 条历史标题（含 `number`、`contrast`、`statement` 三种布局）回归，
+`problems` 全空、无一条出现 kicker 与正文重复。
+
+**这条缺陷的教训比修法重要**：`--spec` 是「更好」的路径，自动推导是「兜底」的
+路径，而兜底路径**没有人的眼睛盯着**。凡是兜底分支，必须做到与显式路径同等自洽
+（这里就是别把推导结果丢掉），否则它会在最不被注意的那一天产出最差的结果。同理，
+`problems: []` 只能证明「没溢出」，证明不了「有信息」——这与 Consequences 里
+「自检是下限保护」是同一条边界。
+
 ## Decision
 
 1. **封面只承载一个元素**，三种布局：`number`（数字占满画面）、`contrast`（两个
@@ -121,3 +165,8 @@
   亮度标准差 **37.2 → 59.9**；主元素在 320px 宽下约 14px 高，可读。
 - 这个改动**不改变发布链路**：`run_all.sh` 只是多传一个可选的 `--spec`，没有 spec
   时行为与之前一致（回退到标题推导）。
+- **兜底路径也要自洽（2026-10-20 补，见发现五）**：没有 spec 时的标题推导不是「临时
+  凑合」，它是**实际会跑很多天的路径**（写作阶段漏给 spec 就会走它）。所以推导结果
+  必须被真正消费，不能推导完又丢掉。当前 `statement` 分支已修，但**没有任何自动检查
+  能发现这类缺陷**：`edge_check` 通过、`problems: []`、`thumb_scale` 正常，输出看上去
+  「像一张封面」。唯一的防线是人看简报时看一眼图。

@@ -448,7 +448,9 @@ if [[ -n "$AFTER_TRIAGE" && -z "$AFTER_WRITE" ]]; then
 形如 {"layout":"number","kicker":"Meta 开源","hero":"8160","hero_unit":"亿参数",
 "payoff":"模型免费，运维不免费"}；无强数字时用
 {"layout":"contrast","kicker":"…","line1":"…","line2":"…"}。
-留空则由标题自动推导（不一定最优，但不会出错）。写完后执行：
+不写这个文件也能发布（回退到标题推导），但推导只会切分标题、选不出论据——
+2026-10-20 那次就因此产出了一张顶部小字与正文重复的封面（ADR-0044 发现五）。
+写完后执行：
   bash ${SELF} --after-write $([[ "$MODE" == "publish" ]] && echo --publish)
 ────────────────────────────────────────────────────────
 EOF
@@ -461,7 +463,13 @@ SLUG="$(find_slug)" || fail_soft "cover" "找不到今日成稿" "outputs/${DATE
 echo "成稿：outputs/${SLUG}.md"
 COVER_SPEC=".newsagg/covers/${DATE}.json"
 COVER_SPEC_ARG=()
-[[ -f "$COVER_SPEC" ]] && COVER_SPEC_ARG=(--spec "$COVER_SPEC")
+if [[ -f "$COVER_SPEC" ]]; then
+  COVER_SPEC_ARG=(--spec "$COVER_SPEC")
+else
+  # 没有 spec 不等于失败（封面仍会生成），但它是「写作阶段漏了一步」的信号。
+  # 2026-10-20 就是静默走了这条路，产出一张复述标题的封面而无人察觉（ADR-0044 发现五）。
+  echo "注意：未找到封面论据 ${COVER_SPEC}，回退到标题推导（封面会复述标题的部分内容）" >&2
+fi
 # ⚠️ 必须写 ${A[@]+"${A[@]}"}：bash 3.2（macOS 自带）在 set -u 下展开**空数组**
 # 会报 "A[@]: unbound variable" 并终止脚本。没有 spec 时（最常见的情形）
 # 这一步会直接失败——一个只在"没写封面 spec"时才触发的静默故障。

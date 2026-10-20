@@ -26,13 +26,20 @@ description: |
 封面只放**一个**元素，且必须能在 320px 宽下读出：
 
 ```bash
-# 自动推导（从标题里找数字/对比，不一定最优但不会出错）
+# 自动推导（从标题里找数字/对比/冒号切分）——能保证不出错，但选不出论据
 .uv-tools/wewrite/bin/python .agents/skills/newsagg-publish/scripts/make_cover.py --slug <slug>
 
 # 显式指定视觉论据（推荐：由写作阶段判断"这篇文章的视觉论据是什么"）
 .uv-tools/wewrite/bin/python .agents/skills/newsagg-publish/scripts/make_cover.py \
   --slug <slug> --spec .newsagg/covers/<日期>.json
 ```
+
+**没写 spec 就走自动推导，而自动推导只会切分标题、回答不了「这篇文章最值得被记住的
+事实是什么」**。2026-10-20 那次漏写 spec，封面渲染成顶部 `Codex搬走Cursor配置`、
+正文 `Codex搬走Cursor配置：/ 选AI编程工具的标准变了`——顶部小字与正文逐字重复，
+且 `problems: []` 全绿，无人察觉（ADR-0044 发现五）。所以发布前要确认
+`.newsagg/covers/<日期>.json` 存在；编排器在没有 spec 时会向 stderr 打一行提醒，
+但那不是阻断。
 
 三种布局：
 

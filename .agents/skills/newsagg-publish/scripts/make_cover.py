@@ -500,7 +500,11 @@ def make_cover(
         else:
             img = layout_contrast(size, kicker, line1, line2, footnote)
     if lay == "statement":
-        img = layout_statement(size, kicker, statement or title, footnote)
+        # 2026-10-20 实测缺陷：这里原先只写 `statement or title`，于是当 derive_parts()
+        # 推出 statement 布局时（无强数字、冒号后只有一个短句），推导出的 text 被丢弃，
+        # 封面正文退化成**整条标题原样**，而 kicker 又取了冒号前半句 → 顶部小字与正文
+        # 前半句逐字重复，正是 ADR-0044 判定「不增加信息」的那种封面。
+        img = layout_statement(size, kicker, statement or derived.get("text", "") or title, footnote)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, "PNG", optimize=True)

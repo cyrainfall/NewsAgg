@@ -207,14 +207,20 @@ git_pull() {
   if [[ -n "$NO_GIT" ]]; then echo "（--no-git：跳过 ① git pull）"; return 0; fi
   log "① git pull --rebase（取得你的编辑）"
   local err=/tmp/newsagg-pull.err
-  if git pull --rebase >/tmp/newsagg-pull.out 2>"$err"; then
-    echo "已同步到 $(git rev-parse --short HEAD)"
-    return 0
-  fi
-  git rebase --abort >/dev/null 2>&1 || true
-  local detail; detail="$(tail -15 "$err")"
-  if grep -qiE 'CONFLICT|Automatic merge failed|could not apply' "$err"; then
-    python3 - <<'PY' || true
+  local attempt=1 max=3 detail
+
+  while true; do
+    if git pull --rebase >/tmp/newsagg-pull.out 2>"$err"; then
+      echo "已同步到 $(git rev-parse --short HEAD)"
+      return 0
+    fi
+    git rebase --abort >/dev/null 2>&1 || true
+    detail="$(tail -15 "$err")"
+
+    # 冲突不是瞬时错误：重试只会三次撞在同一处，而且每次都动工作区。
+    # 冲突即熔断、不自行合并——自动解决可能静默丢弃你在风格或合规规则上的修改。
+    if grep -qiE 'CONFLICT|Automatic merge failed|could not apply' "$err"; then
+      python3 - <<'PY' || true
 import importlib.util
 from pathlib import Path
 spec = importlib.util.spec_from_file_location(
@@ -225,9 +231,26 @@ m.Breaker(Path(".newsagg/breaker.json")).trip(
     "git_conflict",
     {"detail": "git pull --rebase 出现合并冲突；已 abort，未自行合并（ADR-0018）"})
 PY
-    fail_soft "git_pull" "合并冲突（已 abort，未自行合并；已熔断）" "$detail" 0
-  fi
-  fail_soft "git_pull" "拉取失败（工作区可能不干净）" "$detail" 0
+      fail_soft "git_pull" "合并冲突（已 abort，未自行合并；已熔断）" "$detail" 0
+    fi
+
+    # ⚠️ 2026-10-20 实测：一次 HTTP/2 framing 抖动
+    # （`RPC 失败。curl 16 Error in the HTTP2 framing layer`）就让整天的主流程
+    # 中止了，而手工重试**立刻**成功。网络抖动不是「工作区不干净」——
+    # 把它判成后者，会让系统在最平常的失败上停工（ADR-0048）。
+    # 只对传输层错误重试；认证失败/仓库不存在/无权限重试无益，直接报。
+    if [[ "$attempt" -lt "$max" ]] && grep -qiE \
+      'RPC 失败|HTTP2 framing|Could not resolve host|Connection reset|Connection timed out|early EOF|The remote end hung up'; then
+      echo "拉取遇到传输层错误（第 ${attempt} 次），2 秒后重试……" >&2
+      echo "  $(echo "$detail" | head -2 | tr '\n' ' ')" >&2
+      attempt=$((attempt + 1))
+      sleep 2
+      continue
+    fi
+    break
+  done
+
+  fail_soft "git_pull" "拉取失败（已重试 $((attempt - 1)) 次；非冲突，见 detail）" "$detail" 0
 }
 
 # ── ② 风格学习（ADR-0026：必须早于写作）──────────────────────────

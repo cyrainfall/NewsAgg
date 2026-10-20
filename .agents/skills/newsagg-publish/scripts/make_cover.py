@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -63,14 +64,31 @@ BLUE = (64, 140, 255)
 ORANGE = (255, 106, 61)
 MINT = (52, 211, 153)
 
-# 缩略图可读性的下限（按 1200 宽设计，信息流按 320 宽呈现，缩放系数约 0.267）
-# 主元素在 320px 宽下至少 14px 高 → 1200 宽下至少 52px
+# ── 缩略图可读性：从「声明」变成「测量」──────────────────────────────
+#
+# 平台下发到信息流的封面资源实测是 640x360（`tplv-tt-shrink:640:0`）。
+# 640 是给视网膜屏的 2x 资源，对应 CSS 展示宽约 320px；最保守按 320 算。
+FEED_THUMB_W = 320
+# 缩略图宽度下，一段文字要被认出来至少要这么高（px）。
+# iOS/Android 正文最小可读字号约 11-12px；汉字在 8px 以下基本糊成一团。
+READABLE_PX = 11.0
+# 由 FEED_THUMB_W / 画布宽 换算出的**画布内**最小字号（1200 宽、11px 时约 42px）。
+# 注意它只是「下限」，具体每个元素仍由测量决定。
+# ⚠️ 必须向上取整：`int(11.0 / 0.2667) = 41`，而 41 * 0.2667 = 10.9px ——
+# 一个自己都通不过自己检查的下限。这种自相矛盾会让「缩到下限」变成静默失败。
+MIN_READABLE = math.ceil(READABLE_PX / (FEED_THUMB_W / DEFAULT_SIZE[0]))
+
+# 主元素在缩略图下至少 14px 高 → 1200 宽下至少 52px
 MIN_HERO = 52
-# 次要文字（脚注）在 320px 下至少 8px → 1200 宽下至少 30px
-MIN_MUTED = 30
-# kicker 是**标签**不是句子。超过这个长度它就只能被缩到 MIN_MUTED 再截断，
-# 而在 320px 缩略图下那是 8px 高——技术上"放得下"，实际上读不出。
-# 与其让它缩到不可辨，不如先截短，让字号保持在可读区间。
+# 次要文字（kicker / unit）的下限。它必须 >= MIN_READABLE，否则「缩到下限」
+# 与「缩略图可读」两条约束互相打架。
+# ⚠️ 2026-10-20 实测缺陷：这里原先是 30，即缩略图下 8px——技术上"放得下"，
+# 实际上读不出。而自检只回报 `hero_px_at_thumb = MIN_HERO * scale`（一个常量），
+# 于是它从不为 8px 的 kicker 报警。**自检必须测量实际画上去的字号，而不是
+# 复述设计意图的常量。** 这就是 ADR-0044 发现六。
+MIN_MUTED = max(MIN_READABLE, 42)
+# kicker 是**标签**不是句子。超过这个长度它就只能被缩到下限再截断，
+# 而在缩略图下那是一串读不出的字。与其让它缩到不可辨，不如先截短。
 KICKER_MAX = 16
 
 CJK_FONT_CANDIDATES = [
@@ -122,8 +140,15 @@ def text_w(d, text: str, font) -> float:
 
 
 def fit_font(d, text: str, max_w: float, start: int, floor: int = MIN_HERO):
-    """从 start 起逐级缩小，返回第一个能让 text 单行放进 max_w 的字号。"""
-    size = start
+    """从 start 起逐级缩小，返回第一个能让 text 单行放进 max_w 的字号。
+
+    ⚠️ 必须先 `max(start, floor)`：调用方传的 start 是按画布比例算的（如
+    `int(H * 0.062)` = 41），可能**本身就低于 floor**。此时 while 条件
+    `size > floor` 一开始就为假，函数会把低于下限的字号原样返回——
+    于是「缩到下限为止」的约束从第一步就没生效。
+    实测：kicker 用 41px 画出去，缩略图下 10.9px，而它自己的下限是 11px。
+    """
+    size = max(start, floor)
     while size > floor and text_w(d, text, find_font(size)) > max_w:
         size -= 4
     return find_font(size), size
@@ -146,8 +171,11 @@ def wrap_cjk(d, text: str, font, max_w: float) -> list[str]:
 
 
 def fit_block(d, text: str, max_w: float, max_lines: int, start: int, floor: int = MIN_HERO):
-    """在 max_lines 行内放下的最大字号。放不下就缩，缩到 floor 仍放不下则截断。"""
-    size = start
+    """在 max_lines 行内放下的最大字号。放不下就缩，缩到 floor 仍放不下则截断。
+
+    同 `fit_font`：start 可能低于 floor，必须先夹到 floor 之上。
+    """
+    size = max(start, floor)
     while size > floor:
         font = find_font(size)
         lines = wrap_cjk(d, text, font, max_w)
@@ -215,12 +243,15 @@ def edge_check(img, margin: int) -> list[str]:
     return []
 
 
-def draw_kicker(d, text: str, x: int, y: int, max_w: float, start: int, H: int) -> None:
+def draw_kicker(d, text: str, x: int, y: int, max_w: float, start: int, H: int, drawn=None) -> None:
     """顶部小字：先缩字号，缩到下限还放不下就截断。"""
     if not text:
         return
-    font, _ = fit_font(d, text, max_w, start, MIN_MUTED)
-    d.text((x, y), clip_to_width(d, text, font, max_w), font=font, fill=BLUE)
+    font, size = fit_font(d, text, max_w, start, MIN_MUTED)
+    shown = clip_to_width(d, text, font, max_w)
+    d.text((x, y), shown, font=font, fill=BLUE)
+    if drawn is not None:
+        drawn.append({"element": "kicker", "text": shown, "size": size})
 
 
 def _is_color(v) -> bool:
@@ -252,7 +283,9 @@ def draw_lines_center(d, lines: list[str], font, y: int, fills, W: int, line_h: 
 # ── 三种布局 ────────────────────────────────────────────────────
 
 
-def layout_number(size, kicker: str, hero: str, unit: str, payoff: str, note: str) -> Image.Image:
+def layout_number(
+    size, kicker: str, hero: str, unit: str, payoff: str, note: str, drawn: list | None = None
+) -> Image.Image:
     """数字英雄：一个数字占满画面。缩略图下最抗缩放。
 
     分四个**垂直带**，先算下面的带再给上面剩下的空间：
@@ -312,6 +345,8 @@ def layout_number(size, kicker: str, hero: str, unit: str, payoff: str, note: st
     hero_px_h = int(big_start * 0.86)  # 视觉上数字的实际高度
     y_hero = band_top + max(0, (band_h - hero_px_h) // 2)
     d.text((x, y_hero), hero, font=hero_font, fill=WHITE)
+    if drawn is not None:
+        drawn.append({"element": "hero", "text": hero, "size": big_start})
     if unit:
         d.text(
             (x + text_w(d, hero, hero_font) + 18, y_hero + int(big_start * 0.58)),
@@ -319,6 +354,8 @@ def layout_number(size, kicker: str, hero: str, unit: str, payoff: str, note: st
             font=unit_font,
             fill=BLUE,
         )
+        if drawn is not None:
+            drawn.append({"element": "unit", "text": unit, "size": unit_size(big_start)})
 
     # ③ payoff 贴底
     if payoff and plines:
@@ -326,8 +363,10 @@ def layout_number(size, kicker: str, hero: str, unit: str, payoff: str, note: st
         block_h = line_h * len(plines)
         y = H - note_h - block_h - int(H * 0.04)
         draw_lines_center(d, plines, pf, y, ORANGE, W, line_h)
+        if drawn is not None:
+            drawn.append({"element": "payoff", "text": " / ".join(plines), "size": psize})
 
-    draw_kicker(d, kicker, margin, kicker_y, max_w, int(H * 0.068), H)
+    draw_kicker(d, kicker, margin, kicker_y, max_w, int(H * 0.068), H, drawn)
 
     if note:
         nf = find_font(max(MIN_MUTED, int(H * 0.042)))
@@ -335,7 +374,9 @@ def layout_number(size, kicker: str, hero: str, unit: str, payoff: str, note: st
     return img
 
 
-def layout_contrast(size, kicker: str, line1: str, line2: str, note: str) -> Image.Image:
+def layout_contrast(
+    size, kicker: str, line1: str, line2: str, note: str, drawn: list | None = None
+) -> Image.Image:
     """对比双行：两个短句撞在一起，第二句用暖色。"""
     W, H = size
     img = Image.new("RGB", size, INK)
@@ -345,7 +386,7 @@ def layout_contrast(size, kicker: str, line1: str, line2: str, note: str) -> Ima
     margin = int(W * 0.065)
     max_w = W - margin * 2
 
-    draw_kicker(d, kicker, margin, int(H * 0.068), max_w, int(H * 0.062), H)
+    draw_kicker(d, kicker, margin, int(H * 0.068), max_w, int(H * 0.062), H, drawn)
 
     # 两句各自测量，取能放下的较大字号，且两句同号（视觉上成对）
     start = int(H * 0.30)
@@ -357,6 +398,9 @@ def layout_contrast(size, kicker: str, line1: str, line2: str, note: str) -> Ima
     # 缩到 MIN_HERO 仍超宽时必须截断，否则文字会溢出画布两侧
     line1 = clip_to_width(d, line1, font, max_w)
     line2 = clip_to_width(d, line2, font, max_w)
+    if drawn is not None:
+        drawn.append({"element": "line1", "text": line1, "size": fs})
+        drawn.append({"element": "line2", "text": line2, "size": fs})
 
     line_h = int(fs * 1.16)
     gap = int(H * 0.055)
@@ -375,7 +419,9 @@ def layout_contrast(size, kicker: str, line1: str, line2: str, note: str) -> Ima
     return img
 
 
-def layout_statement(size, kicker: str, text: str, note: str) -> Image.Image:
+def layout_statement(
+    size, kicker: str, text: str, note: str, drawn: list | None = None
+) -> Image.Image:
     """一句断言：单行（最多两行）占满画面。"""
     W, H = size
     img = Image.new("RGB", size, INK)
@@ -385,13 +431,15 @@ def layout_statement(size, kicker: str, text: str, note: str) -> Image.Image:
     margin = int(W * 0.065)
     max_w = W - margin * 2
 
-    draw_kicker(d, kicker, margin, int(H * 0.072), max_w, int(H * 0.064), H)
+    draw_kicker(d, kicker, margin, int(H * 0.072), max_w, int(H * 0.064), H, drawn)
 
     font, fsize, lines = fit_block(d, text, max_w, 2, int(H * 0.30), MIN_HERO)
     line_h = int(fsize * 1.18)
     block_h = line_h * len(lines)
     y = (H - block_h) // 2 + int(H * 0.02)
     draw_lines_center(d, lines, font, y, WHITE, W, line_h)
+    if drawn is not None:
+        drawn.append({"element": "statement", "text": " / ".join(lines), "size": fsize})
 
     if note:
         nf = find_font(max(MIN_MUTED, int(H * 0.042)))
@@ -464,22 +512,36 @@ def make_cover(
     # 显式参数优先；缺失的从标题推导
     derived = derive_parts(title) if layout == "auto" else {"layout": layout}
     lay = derived["layout"] if layout == "auto" else layout
+    # 记录「实际画上去的每个元素及其字号」，供自检测量。空列表由布局函数填充。
+    drawn: list[dict] = []
 
+    kicker_given = bool(kicker)
     kicker = kicker or derived.get("kicker", "")
     warnings: list[str] = []
     if len(kicker) > KICKER_MAX:
-        # 截到最后一个分隔符，避免把词切一半
-        cut = kicker[:KICKER_MAX]
-        for sep in ("，", ",", "、", " ", "：", ":"):
-            i = cut.rfind(sep)
-            if i >= KICKER_MAX // 2:
-                cut = cut[:i]
-                break
-        warnings.append(
-            f"kicker 过长（{len(kicker)} 字）已截为 {cut!r}："
-            f"kicker 是标签不是句子，过长只能靠缩小字号容纳，缩到缩略图下就读不出了"
-        )
-        kicker = cut
+        if not kicker_given:
+            # 推导出来的 kicker 过长时**整条丢掉**，不截断。
+            # 理由：它本来就是标题的一个前缀片段，截到 16 字只会剩一个残句
+            # （实测「DeepSeek API 每 1000 次请求 5 元」→「DeepSeek API 每」），
+            # 而残句既不是标签、又在复述标题——正是 ADR-0044 要消灭的那种封面。
+            warnings.append(
+                f"推导出的 kicker 过长（{len(kicker)} 字 > {KICKER_MAX}），已整条省略："
+                f"截断只会留下残句，而残句仍在复述标题"
+            )
+            kicker = ""
+        else:
+            # 显式传入的 kicker 是作者意图，截到最后一个分隔符，避免把词切一半
+            cut = kicker[:KICKER_MAX]
+            for sep in ("，", ",", "、", " ", "：", ":"):
+                i = cut.rfind(sep)
+                if i >= KICKER_MAX // 2:
+                    cut = cut[:i]
+                    break
+            warnings.append(
+                f"kicker 过长（{len(kicker)} 字）已截为 {cut!r}："
+                f"kicker 是标签不是句子，过长只能靠缩小字号容纳，缩到缩略图下就读不出了"
+            )
+            kicker = cut
 
     if lay == "number":
         hero = hero or derived.get("hero", "")
@@ -490,7 +552,7 @@ def make_cover(
             line1 = line1 or derived.get("line1", "")
             line2 = line2 or derived.get("line2", "")
         else:
-            img = layout_number(size, kicker, hero, hero_unit, payoff, footnote)
+            img = layout_number(size, kicker, hero, hero_unit, payoff, footnote, drawn)
     if lay == "contrast":
         line1 = line1 or derived.get("line1", "")
         line2 = line2 or derived.get("line2", "")
@@ -498,13 +560,13 @@ def make_cover(
             lay = "statement"
             statement = statement or derived.get("text", "") or title
         else:
-            img = layout_contrast(size, kicker, line1, line2, footnote)
+            img = layout_contrast(size, kicker, line1, line2, footnote, drawn)
     if lay == "statement":
         # 2026-10-20 实测缺陷：这里原先只写 `statement or title`，于是当 derive_parts()
         # 推出 statement 布局时（无强数字、冒号后只有一个短句），推导出的 text 被丢弃，
         # 封面正文退化成**整条标题原样**，而 kicker 又取了冒号前半句 → 顶部小字与正文
         # 前半句逐字重复，正是 ADR-0044 判定「不增加信息」的那种封面。
-        img = layout_statement(size, kicker, statement or derived.get("text", "") or title, footnote)
+        img = layout_statement(size, kicker, statement or derived.get("text", "") or title, footnote, drawn)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, "PNG", optimize=True)
@@ -513,9 +575,63 @@ def make_cover(
     margin = int(size[0] * 0.065)
     problems = edge_check(img, margin)
 
-    # 缩略图可读性：按信息流 320px 宽量化
-    thumb_w = 320
-    scale = thumb_w / size[0]
+    # ── 自检二：缩略图可读性（测量实际画上去的字号）──────────────────
+    #
+    # ⚠️ 这里必须用 `drawn` 里记录的**实际字号**，不能用 MIN_HERO 之类的常量。
+    # 旧版自检返回 `hero_px_at_thumb = MIN_HERO * scale`——那是把设计意图乘以
+    # 一个比例再报出来，与画布上真正画了多大毫无关系。于是 2026-10-20 的封面
+    # kicker 只有 38px（缩略图下 10px），自检却一声不响。ADR-0044 发现六。
+    scale = FEED_THUMB_W / size[0]
+    for d_el in drawn:
+        px_at_thumb = d_el["size"] * scale
+        if px_at_thumb < READABLE_PX:
+            problems.append(
+                f"{d_el['element']} 在 {FEED_THUMB_W}px 缩略图下仅 {px_at_thumb:.1f}px 高"
+                f"（需 ≥{READABLE_PX:.0f}px）：{d_el['text'][:24]!r}"
+            )
+
+    # ── 自检三：封面是否只是在复述标题 ──────────────────────────────
+    #
+    # ADR-0044 的核心决定是「封面承载论据，不复述标题」，但它一直只是文字约定，
+    # 没有可执行检查。2026-10-20 就产出了一张 kicker 与正文首行逐字重复的封面。
+    #
+    # 判据：把封面上所有文字按顺序拼起来，与标题（都去掉标点空白后）比较。
+    # 相等 / 互为子串 → 这张封面没有说出标题以外的任何东西。
+    #
+    # ⚠️ 注意这条**只是警告不是错误**。原因：`derive_parts()` 只能切分标题，
+    # 它在原理上就造不出论据——论据必须由写作阶段写进 `--spec`。所以自动推导
+    # 几乎必然复述标题，这是「没人写 spec」的症状，不是这张图本身的缺陷。
+    # 把它判成 fatal 会让缺 spec 的那天直接发不出去，代价比一张平庸封面更大。
+    body_els = [e for e in drawn if e["element"] != "kicker"]
+    kick = next((e["text"] for e in drawn if e["element"] == "kicker"), "")
+
+    def _norm(s: str) -> str:
+        # ⚠️ 必须把 `/` 也去掉：`layout_statement` 记录折行结果是
+        # `" / ".join(lines)`，折行点会留下一个斜杠。第一版没有剥离它，
+        # 于是「推导出的封面」永远判不出复述——combined 变成
+        # `'…选AI编程工具/的标准变了'`，与标题差一个字符，比较全部为假。
+        # 这是「自检只在手工构造的样例上验过、没在真实推导路径上验」的典型后果。
+        return re.sub(r"[\s：:，,、。！？!?·—\-/／|]", "", s or "")
+
+    combined = _norm(kick) + "".join(_norm(e["text"]) for e in body_els)
+    title_n = _norm(title)
+    restates = bool(title_n) and bool(combined) and (
+        combined == title_n or title_n in combined or combined in title_n
+    )
+    if restates:
+        warnings.append(
+            f"封面复述标题（{combined[:20]!r} ≈ 标题）：自动推导只能切分标题、"
+            f"造不出论据。要在写作阶段写 .newsagg/covers/<日期>.json 给出 --spec（ADR-0044）"
+        )
+
+    # 主元素占画布高度比：低于 1/4 说明视觉重心不够，缩略图里认不出来
+    hero_el = next((e for e in drawn if e["element"] in ("hero", "statement", "line1")), None)
+    hero_ratio = (hero_el["size"] / size[1]) if hero_el else 0.0
+    if hero_ratio < 0.25:
+        warnings.append(
+            f"主元素只占画布高度 {hero_ratio:.0%}（建议 ≥25%）：缩略图下视觉重心不足"
+        )
+
     return {
         "out": str(out_path),
         "size": list(size),
@@ -524,7 +640,10 @@ def make_cover(
         "title_chars": len(title),
         "bytes": out_path.stat().st_size,
         "thumb_scale": round(scale, 3),
-        "hero_px_at_thumb": round(MIN_HERO * scale, 1),
+        "drawn": [{"element": e["element"], "size": e["size"],
+                   "px_at_thumb": round(e["size"] * scale, 1)} for e in drawn],
+        "hero_ratio": round(hero_ratio, 3),
+        "restates_title": restates,
         "ok": not problems,
         "problems": problems,
         "warnings": warnings,

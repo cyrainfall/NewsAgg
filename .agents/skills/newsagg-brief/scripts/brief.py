@@ -414,7 +414,7 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -
     return out
 
 
-def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None) -> list[str]:
+def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None) -> list[str]:
     out = ["## ⑤ 需你介入的事项", ""]
     any_item = False
 
@@ -471,6 +471,26 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
                 "  删完在 `.newsagg/publish-ledger.jsonl` 对应记录加 `\"leak_resolved_at\": \"<日期>\"`，",
                 "  这条提醒才会停。",
                 ""]
+
+    # 封面自检（ADR-0044 发现六）：封面质量问题的旧形态是**静默**——自检只回报
+    # 一个常量、警告没人读。而「封面只是在复述标题」「缩略图下字太小」都不会让
+    # 发布失败，只会让这篇白写。无人值守时没有第二双眼睛，所以必须在这里出现。
+    # 数据来自 run_all.sh 存下的 `.newsagg/covers/<date>.report.json`。
+    if cover_report:
+        warns = cover_report.get("warnings") or []
+        probs = cover_report.get("problems") or []
+        if warns or probs or cover_report.get("restates_title"):
+            any_item = True
+            out += ["**封面自检**（ADR-0044）："]
+            for p in probs:
+                out += [f"- ✗ {p}"]
+            for w in warns:
+                out += [f"- ! {w}"]
+            if cover_report.get("restates_title"):
+                out += ["  这张封面没有说出标题以外的任何东西。信息流里标题就印在封面",
+                        "  旁边，复述等于浪费了唯一一块视觉位置。修法：写作阶段写",
+                        "  `.newsagg/covers/<日期>.json` 给出视觉论据（`--spec`）。"]
+            out += [""]
 
     # 运行失败（ADR-0038）：`.newsagg/run-status.json` 不入库、看守读不到，
     # 所以它必须在这里出现——否则"系统今天跑挂了"就没有任何出口。
@@ -545,7 +565,8 @@ def main() -> int:
     lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies", perf)
     lines += section_assets(decision, root / "knowledge" / "cards", slug)
     lines += section_actions(publish_recs, cand, decision, cover, slug, perf, run_status,
-                             ledger_path=root / ".newsagg" / "publish-ledger.jsonl")
+                             ledger_path=root / ".newsagg" / "publish-ledger.jsonl",
+                             cover_report=read_json(root / ".newsagg" / "covers" / f"{date}.report.json"))
 
     lines += ["---", f"*生成于 {now.isoformat()} ｜ 时区 Asia/Shanghai*"]
     md = "\n".join(lines)

@@ -473,9 +473,39 @@ fi
 # ⚠️ 必须写 ${A[@]+"${A[@]}"}：bash 3.2（macOS 自带）在 set -u 下展开**空数组**
 # 会报 "A[@]: unbound variable" 并终止脚本。没有 spec 时（最常见的情形）
 # 这一步会直接失败——一个只在"没写封面 spec"时才触发的静默故障。
+COVER_JSON="$(mktemp -t newsagg-cover)"
+set +e
 "$COVER_PY" .agents/skills/newsagg-publish/scripts/make_cover.py --slug "$SLUG" \
-  ${COVER_SPEC_ARG[@]+"${COVER_SPEC_ARG[@]}"} \
-  || fail_soft "cover" "封面生成失败（解释器：${COVER_PY}；spec：${COVER_SPEC}）" "$SLUG" 1
+  ${COVER_SPEC_ARG[@]+"${COVER_SPEC_ARG[@]}"} > "$COVER_JSON"
+COVER_RC=$?
+set -e
+# 把封面的自检结果打出来。ADR-0044 发现六：封面质量问题的旧形态是**静默**——
+# 自检只回报常量、警告没人读。既然无人值守时没有第二双眼睛，
+# 这些警告就必须落到运行输出与简报里，否则等于没检查。
+python3 - "$COVER_JSON" <<'PY' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for w in d.get("warnings") or []:
+    print(f"[封面警告] {w}", file=sys.stderr)
+for p in d.get("problems") or []:
+    print(f"[封面自检未通过] {p}", file=sys.stderr)
+drawn = d.get("drawn") or []
+if drawn:
+    print("封面元素（缩略图 320px 宽下的实际高度）：", file=sys.stderr)
+    for e in drawn:
+        print(f"  {e['element']:9} {e['size']:>4}px -> {e['px_at_thumb']}px", file=sys.stderr)
+PY
+# 留一份自检结果给简报。无人值守时 stderr 没人看，而「封面只是在复述标题」
+# 恰恰是那种「不报错、只是效果差」的问题——它必须落到 reports/ 里（ADR-0044 发现六）。
+mkdir -p .newsagg/covers
+cp "$COVER_JSON" ".newsagg/covers/${DATE}.report.json" 2>/dev/null || true
+rm -f "$COVER_JSON"
+if [[ $COVER_RC -ne 0 ]]; then
+  fail_soft "cover" "封面生成失败（解释器：${COVER_PY}；spec：${COVER_SPEC}）" "$SLUG" 1
+fi
 
 log "⑤ 发布（${MODE}）"
 if [[ "$MODE" == "publish" ]]; then PUB_FLAG="--mode publish"; else PUB_FLAG=""; fi

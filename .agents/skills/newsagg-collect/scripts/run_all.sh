@@ -463,6 +463,7 @@ SLUG="$(find_slug)" || fail_soft "cover" "找不到今日成稿" "outputs/${DATE
 echo "成稿：outputs/${SLUG}.md"
 COVER_SPEC=".newsagg/covers/${DATE}.json"
 COVER_SPEC_ARG=()
+PHOTO_ARG=()
 if [[ -f "$COVER_SPEC" ]]; then
   COVER_SPEC_ARG=(--spec "$COVER_SPEC")
 else
@@ -470,13 +471,57 @@ else
   # 2026-10-20 就是静默走了这条路，产出一张复述标题的封面而无人察觉（ADR-0044 发现五）。
   echo "注意：未找到封面论据 ${COVER_SPEC}，回退到标题推导（封面会复述标题的部分内容）" >&2
 fi
+
+# ── 照片层（ADR-0048）──────────────────────────────────────────────
+#
+# 只有 spec 里写了 `photo_query` 才取图。这不是省事，是**责任划分**：
+# 只有写作阶段知道这篇文章讲的是什么，也只有它能判断「机房照片配一篇
+# 讲 Codex 迁移的文章」算不算图文无关。没有 query 就说明没人做过这个判断，
+# 此时加一张来路不明的照片，只是把「图文无关」变成系统自动决定的。
+if [[ -f "$COVER_SPEC" ]]; then
+  PHOTO_QUERY="$(python3 - "$COVER_SPEC" <<'PY' || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("photo_query") or "")
+except Exception:
+    print("")
+PY
+)"
+  if [[ -n "$PHOTO_QUERY" ]]; then
+    PHOTO_JSON="$(mktemp -t newsagg-photo)"
+    set +e
+    "$COVER_PY" .agents/skills/newsagg-publish/scripts/fetch_photo.py \
+      --query "$PHOTO_QUERY" > "$PHOTO_JSON" 2>/dev/null
+    set -e
+    PHOTO_PATH="$(python3 - "$PHOTO_JSON" <<'PY' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("local") or "" if d.get("ok") else "")
+except Exception:
+    print("")
+PY
+)"
+    if [[ -n "$PHOTO_PATH" ]]; then
+      PHOTO_ARG=(--photo "$PHOTO_PATH")
+      echo "照片：${PHOTO_PATH}（查询：${PHOTO_QUERY}）"
+    else
+      # 取不到照片不是错误：回退到纯模板封面。但必须说出来——
+      # 「今天这张封面本来该有照片」这个信息，只有这里能留下。
+      echo "注意：未能取到合格照片（查询：${PHOTO_QUERY}），回退到纯模板封面" >&2
+    fi
+    rm -f "$PHOTO_JSON"
+  fi
+fi
+
 # ⚠️ 必须写 ${A[@]+"${A[@]}"}：bash 3.2（macOS 自带）在 set -u 下展开**空数组**
 # 会报 "A[@]: unbound variable" 并终止脚本。没有 spec 时（最常见的情形）
 # 这一步会直接失败——一个只在"没写封面 spec"时才触发的静默故障。
 COVER_JSON="$(mktemp -t newsagg-cover)"
 set +e
 "$COVER_PY" .agents/skills/newsagg-publish/scripts/make_cover.py --slug "$SLUG" \
-  ${COVER_SPEC_ARG[@]+"${COVER_SPEC_ARG[@]}"} > "$COVER_JSON"
+  ${COVER_SPEC_ARG[@]+"${COVER_SPEC_ARG[@]}"} \
+  ${PHOTO_ARG[@]+"${PHOTO_ARG[@]}"} > "$COVER_JSON"
 COVER_RC=$?
 set -e
 # 把封面的自检结果打出来。ADR-0044 发现六：封面质量问题的旧形态是**静默**——

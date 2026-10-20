@@ -52,6 +52,41 @@ description: |
 **数字要拆成 `hero` + `hero_unit`**：`hero` 放大到占满画面（`8160`），`hero_unit` 缩到
 三分之一（`亿参数`）。把两者塞进同一个字符串会让主字号被压小。
 
+## 可选照片层：只有你能提出查询时才取图（ADR-0048）
+
+封面可以在上半幅放一张真实照片（下半幅仍是实心黑块承载文字，中间一条蓝分隔线）。
+**照片只在 spec 里写了 `photo_query` 时才取**：
+
+```json
+{
+  "layout": "contrast", "kicker": "AI 编程工具",
+  "line1": "配置能带走了", "line2": "迁移没到零",
+  "photo_query": "data center servers"
+}
+```
+
+`run_all.sh` 读到这个字段才调 `fetch_photo.py` 去 Wikimedia Commons 取图；
+没有这个字段就**不取**——这不是省事，是责任划分：**只有写作阶段知道这篇文章讲的是什么，
+也只有它能判断「机房照片配一篇讲 Codex 迁移的文章」算不算图文无关。**
+没有 query 就说明没人做过这个判断，此时加一张来路不明的照片，
+只是把「图文无关」变成系统自动决定的（ADR-0048 决定 4）。
+
+**照片只接受 CC0 / 公有领域，不接 CC BY。** 理由不是 CC BY 不能用，而是
+**无人值守没有「记得署名」这个环节，忘一次就是违约一次**。许可证与来源全部写进
+`.newsagg/photos/ledger.jsonl`（`license` / `license_url` / `artist` / `descriptionurl` /
+`sha256`）——「我们当时以为它是 CC0」不是抗辩理由。
+
+**取不到图是设计行为，不是错误。** `fetch_photo.py` 取不到也返回退出码 0，
+编排器回退到纯模板封面并向 stderr 打一行 `注意：未能取到合格照片（查询：…）`。
+实测 10 个真实话题里 `DeepSeek` 与 `GPU server rack` 合格 CC0 候选为 0——
+最相关的话题往往恰好没有免费素材，这是 Commons 的供给结构。**多数日子会回退，这是正常的。**
+
+单独试取（不进流水线）：
+
+```bash
+.uv-tools/wewrite/bin/python .agents/skills/newsagg-publish/scripts/fetch_photo.py --query "data center servers"
+```
+
 ## 封面自检：量的是画布上的像素，不是设计常量（ADR-0044 发现六、七）
 
 `make_cover.py` 在每个**实际绘制点**记录元素字号（`drawn`），然后按

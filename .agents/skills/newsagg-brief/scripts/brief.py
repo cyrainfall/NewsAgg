@@ -98,6 +98,45 @@ def _is_weitoutiao(rec: dict) -> bool:
     return bool(gid) and len(gid) <= 17
 
 
+def _photo_attribution(root: Path, photo_path: str) -> str:
+    """从照片账本里查出这张图当时依据的许可证与出处（ADR-0048）。
+
+    为什么要进简报：照片层只接受 CC0 / 公有领域，但「图文无关」没有自动检查
+    （残余风险 37）。这条来源行是给人抽查用的唯一抓手——否则「今天用了哪张图、
+    凭什么说它能用」在流水线里完全没有出口。
+
+    查不到就返回空串而不是编一句。**账本读不到不等于这张图有问题，
+    也不等于它没问题**——简报里少一行，比印一行假来源好。
+    """
+    if not photo_path:
+        return ""
+    ledger = root / ".newsagg" / "photos" / "ledger.jsonl"
+    if not ledger.exists():
+        return ""
+    want = str(photo_path)
+    for line in ledger.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(rec.get("local") or "") != want:
+            continue
+        parts = []
+        if rec.get("license"):
+            parts.append(f"许可证 {rec['license']}")
+        if rec.get("file_title"):
+            parts.append(f"来源 {rec['file_title']}")
+        if rec.get("artist"):
+            parts.append(f"作者 {rec['artist']}")
+        if rec.get("descriptionurl"):
+            parts.append(str(rec["descriptionurl"]))
+        return "；".join(parts)
+    return ""
+
+
 def read_performance(root: Path) -> dict:
     """读表现数据回路的状态（ADR-0010 循环 C）。
 
@@ -414,7 +453,7 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -
     return out
 
 
-def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None) -> list[str]:
+def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None, photo_line: str = "") -> list[str]:
     out = ["## ⑤ 需你介入的事项", ""]
     any_item = False
 
@@ -479,6 +518,18 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
     if cover_report:
         warns = cover_report.get("warnings") or []
         probs = cover_report.get("problems") or []
+        # 照片来源（ADR-0048）：只要这篇用了 Commons 照片，就把许可证与出处列出来。
+        # 「图文无关」没有自动检查（残余风险 37），这条来源行是给人抽查用的抓手；
+        # 同时也是唯一能证明「这张图当时被判为 CC0」的位置。
+        if cover_report.get("photo_enabled"):
+            any_item = True
+            out += [f"**封面照片**：{cover_report.get('photo') or ''}"]
+            if photo_line:
+                out += [f"  - {photo_line}"]
+            else:
+                out += ["  - （照片账本里查不到这张图的许可证记录——ADR-0048 要求可回查，"
+                        "请确认 .newsagg/photos/ledger.jsonl 是否被清空过）"]
+            out += [""]
         if warns or probs or cover_report.get("restates_title"):
             any_item = True
             out += ["**封面自检**（ADR-0044）："]
@@ -564,9 +615,12 @@ def main() -> int:
     lines += section_overview(cand, decision)
     lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies", perf)
     lines += section_assets(decision, root / "knowledge" / "cards", slug)
+    cover_report = read_json(root / ".newsagg" / "covers" / f"{date}.report.json")
     lines += section_actions(publish_recs, cand, decision, cover, slug, perf, run_status,
                              ledger_path=root / ".newsagg" / "publish-ledger.jsonl",
-                             cover_report=read_json(root / ".newsagg" / "covers" / f"{date}.report.json"))
+                             cover_report=cover_report,
+                             photo_line=_photo_attribution(
+                                 root, (cover_report or {}).get("photo_path") or ""))
 
     lines += ["---", f"*生成于 {now.isoformat()} ｜ 时区 Asia/Shanghai*"]
     md = "\n".join(lines)

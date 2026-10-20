@@ -44,7 +44,7 @@ import sys
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 except ImportError:  # 提示用 wewrite 的 python 运行
     print(
         "错误：未安装 Pillow。本脚本需用 wewrite 的 Python 运行：\n"
@@ -90,6 +90,27 @@ MIN_MUTED = max(MIN_READABLE, 42)
 # kicker 是**标签**不是句子。超过这个长度它就只能被缩到下限再截断，
 # 而在缩略图下那是一串读不出的字。与其让它缩到不可辨，不如先截短。
 KICKER_MAX = 16
+
+# ── 照片层（ADR-0048）────────────────────────────────────────────
+#
+# 照片占上方，文字占下方**实心黑块**，中间一条蓝线分隔。
+#
+# 为什么不是「照片铺满 + 半透明黑遮罩」（更常见的做法）：
+# 实测那张 CC0 机房照片，左渐变遮罩方案下橙字压在格子衬衫上，局部对比度塌陷
+# （line1 区亮度均值 119.5 / 标准差 90.9，而纯模板封面是 80.7 / 107.6）；
+# 全幅压暗到 86% 文字才够读，但那时照片本身只剩模糊剪影，等于花复杂度换一张
+# 几乎无效的底图。上下分区是唯一同时满足「照片完整可见」和「文字对比度最好」
+# 的方案：文字区是纯 INK 底色，与无照片封面完全一致。
+PHOTO_BAND = 0.50        # 照片占画布高度比例
+PHOTO_DIVIDER = 6        # 照片与文字区之间的蓝线高度
+MIN_PANEL_H = 240        # 文字区最小高度：再小就会把字压到缩略图读不出
+# 文字区内，kicker 带占的高度比例。布局函数靠它把「正文居中区」压到 kicker 之下。
+#
+# ⚠️ 为什么需要这个：布局函数原本是在**整幅 675 高**的画布上居中的，kicker 在
+# 6.8% 处、正文在 35% 处，天然不撞。一旦画布变成 300 多高的文字区，两个比例
+# 同时缩下来就叠在一起了——实测第一版照片封面上「AI 编程工具」与正文首行
+# 基线只差十几像素，看着像漏对齐。比例缩放不会保持间距，只会保持比例。
+KICKER_BAND = 0.24
 
 CJK_FONT_CANDIDATES = [
     "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -212,7 +233,7 @@ def clip_to_width(d, text: str, font, max_w: float) -> str:
     return (cur + "…") if cur else ""
 
 
-def edge_check(img, margin: int) -> list[str]:
+def edge_check(img, margin: int, y_from: int = 0) -> list[str]:
     """检查内容是否侵入左右边距带（= 溢出的可靠代理）。
 
     为什么用像素而不是逐个测量：布局函数靠"记得测量"才正确，那是每个
@@ -223,12 +244,16 @@ def edge_check(img, margin: int) -> list[str]:
     横跨全宽的装饰条（顶部/底部蓝线）会天然穿过边距带，必须排除。判据是
     「该行几乎只有一个颜色」——不靠调用方传参记得排除，否则漏传就误报，
     而误报的自检等同于没有自检。
+
+    ⚠️ `y_from`：照片层是**满幅**的（它本来就该铺到画布边缘），从 y_from
+    以上检查它必然把每一行都判成侵入。所以照片带必须排除在检查之外——
+    但排除的是「照片那一段」，不是「照片存在时整张图」，文字区仍要查。
     """
     W, H = img.size
     px = img.load()
     band = max(2, margin - 2)
     intruders = 0
-    for y in range(H):
+    for y in range(max(0, y_from), H):
         row = [px[x, y][:3] for x in range(W)]
         uniq = len(set(row))
         # 单一颜色的整行 = 装饰带（顶线/底线/纯色底），跳过
@@ -280,11 +305,47 @@ def draw_lines_center(d, lines: list[str], font, y: int, fills, W: int, line_h: 
     return y
 
 
-# ── 三种布局 ────────────────────────────────────────────────────
+# ── 照片层（ADR-0048）────────────────────────────────────────────
+
+def _load_photo_band(path: str, size) -> tuple[Image.Image | None, str]:
+    """把照片裁成画布宽度 × PHOTO_BAND 高度的横条。返回 (图, 说明)。
+
+    ⚠️ 必须居中裁切而不是拉伸：拉伸会让机房照片里的人变形，而变形是那种
+    「说不上哪里不对但就是廉价」的观感来源——与本项目封面一直追求的
+    「像一张设计过的图」正好相反。
+
+    只做轻微压暗（0.94），不做大幅压暗：文字区已经是纯黑，照片带只需要
+    不刺眼，不需要为文字让路。这与「照片铺满 + 重遮罩」方案的区别就在这里。
+    """
+    p = Path(path)
+    if not p.exists():
+        return None, f"照片不存在：{p}"
+    try:
+        src = Image.open(p).convert("RGB")
+    except Exception as e:
+        return None, f"照片打不开（{e}）"
+
+    W, H = size
+    band_h = int(H * PHOTO_BAND)
+    # 保证文字区不至于被压到读不出
+    if H - band_h - PHOTO_DIVIDER < MIN_PANEL_H:
+        band_h = max(1, H - PHOTO_DIVIDER - MIN_PANEL_H)
+
+    scale = max(W / src.width, band_h / src.height)
+    resized = src.resize(
+        (max(1, int(src.width * scale + 0.5)), max(1, int(src.height * scale + 0.5))),
+        Image.LANCZOS,
+    )
+    left = (resized.width - W) // 2
+    top = (resized.height - band_h) // 2
+    band = resized.crop((left, top, left + W, top + band_h))
+    band = ImageEnhance.Brightness(band).enhance(0.94)
+    return band, f"{src.width}x{src.height} → {W}x{band_h}"
 
 
 def layout_number(
-    size, kicker: str, hero: str, unit: str, payoff: str, note: str, drawn: list | None = None
+    size, kicker: str, hero: str, unit: str, payoff: str, note: str,
+    drawn: list | None = None, top_pad: int = 0,
 ) -> Image.Image:
     """数字英雄：一个数字占满画面。缩略图下最抗缩放。
 
@@ -375,7 +436,8 @@ def layout_number(
 
 
 def layout_contrast(
-    size, kicker: str, line1: str, line2: str, note: str, drawn: list | None = None
+    size, kicker: str, line1: str, line2: str, note: str,
+    drawn: list | None = None, top_pad: int = 0,
 ) -> Image.Image:
     """对比双行：两个短句撞在一起，第二句用暖色。"""
     W, H = size
@@ -405,7 +467,9 @@ def layout_contrast(
     line_h = int(fs * 1.16)
     gap = int(H * 0.055)
     block = line_h * 2 + gap
-    y = (H - block) // 2 + int(H * 0.015)
+    # top_pad 之上留给 kicker。`(H + top_pad - block) // 2` 是「在
+    # [top_pad, H] 这个区间里居中」的等价写法；top_pad=0 时与原来逐字相同。
+    y = max(top_pad, (H + top_pad - block) // 2 + int(H * 0.015))
 
     d.text(((W - text_w(d, line1, font)) / 2, y), line1, font=font, fill=WHITE)
     # 中间分隔短线
@@ -420,7 +484,8 @@ def layout_contrast(
 
 
 def layout_statement(
-    size, kicker: str, text: str, note: str, drawn: list | None = None
+    size, kicker: str, text: str, note: str,
+    drawn: list | None = None, top_pad: int = 0,
 ) -> Image.Image:
     """一句断言：单行（最多两行）占满画面。"""
     W, H = size
@@ -436,7 +501,7 @@ def layout_statement(
     font, fsize, lines = fit_block(d, text, max_w, 2, int(H * 0.30), MIN_HERO)
     line_h = int(fsize * 1.18)
     block_h = line_h * len(lines)
-    y = (H - block_h) // 2 + int(H * 0.02)
+    y = max(top_pad, (H + top_pad - block_h) // 2 + int(H * 0.02))
     draw_lines_center(d, lines, font, y, WHITE, W, line_h)
     if drawn is not None:
         drawn.append({"element": "statement", "text": " / ".join(lines), "size": fsize})
@@ -508,6 +573,7 @@ def make_cover(
     line1: str = "",
     line2: str = "",
     statement: str = "",
+    photo: str = "",
 ) -> dict:
     # 显式参数优先；缺失的从标题推导
     derived = derive_parts(title) if layout == "auto" else {"layout": layout}
@@ -543,6 +609,31 @@ def make_cover(
             )
             kicker = cut
 
+    # ── 照片层：先把「文字区」的尺寸定下来 ──────────────────────────
+    #
+    # 关键决定：布局函数仍然在**一整块画布**上画，只是这块画布是「文字区」，
+    # 尺寸为 (W, panel_h)，最后整体贴到照片下方。这样布局函数里的所有
+    # 相对坐标（kicker_y = H*0.075 之类）自动按文字区缩放，一行都不用改，
+    # 也不会出现「按整图算位置、但只画在下半部分」这种错位。
+    photo_band = None
+    photo_note = ""
+    W, H = size
+    if photo:
+        photo_band, photo_note = _load_photo_band(photo, size)
+        if photo_band is None:
+            warnings.append(f"照片层未启用：{photo_note}")
+    if photo_band is not None:
+        band_h = photo_band.height
+        panel_h = H - band_h - PHOTO_DIVIDER
+        panel_size = (W, panel_h)
+    else:
+        panel_h = H
+        panel_size = size
+
+    # 有照片时，文字区变矮，正文的「居中」必须排除 kicker 占的那一带，
+    # 否则两者会撞在一起（见 KICKER_BAND 的注释）。
+    top_pad = int(panel_h * KICKER_BAND) if (photo_band is not None and kicker) else 0
+
     if lay == "number":
         hero = hero or derived.get("hero", "")
         hero_unit = hero_unit or derived.get("unit", "")
@@ -552,7 +643,9 @@ def make_cover(
             line1 = line1 or derived.get("line1", "")
             line2 = line2 or derived.get("line2", "")
         else:
-            img = layout_number(size, kicker, hero, hero_unit, payoff, footnote, drawn)
+            panel = layout_number(
+                panel_size, kicker, hero, hero_unit, payoff, footnote, drawn, top_pad
+            )
     if lay == "contrast":
         line1 = line1 or derived.get("line1", "")
         line2 = line2 or derived.get("line2", "")
@@ -560,20 +653,38 @@ def make_cover(
             lay = "statement"
             statement = statement or derived.get("text", "") or title
         else:
-            img = layout_contrast(size, kicker, line1, line2, footnote, drawn)
+            panel = layout_contrast(
+                panel_size, kicker, line1, line2, footnote, drawn, top_pad
+            )
     if lay == "statement":
         # 2026-10-20 实测缺陷：这里原先只写 `statement or title`，于是当 derive_parts()
         # 推出 statement 布局时（无强数字、冒号后只有一个短句），推导出的 text 被丢弃，
         # 封面正文退化成**整条标题原样**，而 kicker 又取了冒号前半句 → 顶部小字与正文
         # 前半句逐字重复，正是 ADR-0044 判定「不增加信息」的那种封面。
-        img = layout_statement(size, kicker, statement or derived.get("text", "") or title, footnote, drawn)
+        panel = layout_statement(
+            panel_size, kicker, statement or derived.get("text", "") or title,
+            footnote, drawn, top_pad,
+        )
+
+    if photo_band is not None:
+        img = Image.new("RGB", size, INK)
+        img.paste(photo_band, (0, 0))
+        d = ImageDraw.Draw(img)
+        y_div = photo_band.height
+        d.rectangle([0, y_div, W, y_div + PHOTO_DIVIDER - 1], fill=BLUE)
+        img.paste(panel, (0, y_div + PHOTO_DIVIDER))
+    else:
+        img = panel
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, "PNG", optimize=True)
 
     # 自检：内容是否溢出到边距带（装饰条所在行排除）
     margin = int(size[0] * 0.065)
-    problems = edge_check(img, margin)
+    # ⚠️ 照片带满幅铺到画布边缘，从第 0 行开始查它必然每行都算侵入。
+    # 所以只查文字区；照片带本身不承载文字，不需要这项检查。
+    check_from = (photo_band.height + PHOTO_DIVIDER) if photo_band is not None else 0
+    problems = edge_check(img, margin, y_from=check_from)
 
     # ── 自检二：缩略图可读性（测量实际画上去的字号）──────────────────
     #
@@ -624,12 +735,14 @@ def make_cover(
             f"造不出论据。要在写作阶段写 .newsagg/covers/<日期>.json 给出 --spec（ADR-0044）"
         )
 
-    # 主元素占画布高度比：低于 1/4 说明视觉重心不够，缩略图里认不出来
+    # 主元素占画布高度比：低于 1/4 说明视觉重心不够，缩略图里认不出来。
+    # ⚠️ 分母是**文字区**高度而不是整图高度：有照片时文字区更矮，
+    # 若按整图算，同一个字号会被判成「更小」，判断基准就随照片有无而漂移。
     hero_el = next((e for e in drawn if e["element"] in ("hero", "statement", "line1")), None)
-    hero_ratio = (hero_el["size"] / size[1]) if hero_el else 0.0
+    hero_ratio = (hero_el["size"] / panel_size[1]) if hero_el else 0.0
     if hero_ratio < 0.25:
         warnings.append(
-            f"主元素只占画布高度 {hero_ratio:.0%}（建议 ≥25%）：缩略图下视觉重心不足"
+            f"主元素只占文字区高度 {hero_ratio:.0%}（建议 ≥25%）：缩略图下视觉重心不足"
         )
 
     return {
@@ -644,6 +757,13 @@ def make_cover(
                    "px_at_thumb": round(e["size"] * scale, 1)} for e in drawn],
         "hero_ratio": round(hero_ratio, 3),
         "restates_title": restates,
+        "photo": photo_note if photo_band is not None else "",
+        "photo_enabled": photo_band is not None,
+        # 路径要带出去：简报靠它去 `.newsagg/photos/ledger.jsonl` 里查许可证与出处
+        # （ADR-0048）。只给「有没有照片」不够——「这张图当时依据什么被判为 CC0」
+        # 才是需要留痕的那部分。
+        "photo_path": photo if photo_band is not None else "",
+        "panel_height": panel_size[1],
         "ok": not problems,
         "problems": problems,
         "warnings": warnings,
@@ -669,9 +789,14 @@ def main() -> int:
     ap.add_argument("--line2", default="", help="对比第二句（contrast 布局）")
     ap.add_argument("--statement", default="", help="断言（statement 布局）")
     ap.add_argument(
+        "--photo",
+        default="",
+        help="背景照片路径（CC0/公有领域，来自 fetch_photo.py）。留空则纯模板封面（ADR-0048）",
+    )
+    ap.add_argument(
         "--spec",
         default="",
-        help="JSON 文件：显式指定封面论据（layout/kicker/hero/hero_unit/payoff/line1/line2/statement）",
+        help="JSON 文件：显式指定封面论据（layout/kicker/hero/hero_unit/payoff/line1/line2/statement/photo）",
     )
     args = ap.parse_args()
 
@@ -723,6 +848,7 @@ def main() -> int:
         line1=pick(args.line1, "line1"),
         line2=pick(args.line2, "line2"),
         statement=pick(args.statement, "statement"),
+        photo=pick(args.photo, "photo"),
     )
     # ok 由自检决定（是否溢出）。溢出时退出码非 0，让编排器挡住发布——
     # 一张溢出画布的封面比没有封面更糟：它会被发出去，而没人看见。

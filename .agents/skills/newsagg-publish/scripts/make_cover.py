@@ -56,6 +56,20 @@ except ImportError:  # 提示用 wewrite 的 python 运行
 # 头条要求：建议 16:9，尺寸不小于 400x200（ADR-0024 记录的平台约束）
 DEFAULT_SIZE = (1200, 675)
 
+# ── 信息流卡片是 3:2，不是 16:9 ────────────────────────────────────
+#
+# 2026-10-21 实测（Playwright 遍历首页信息流 img 的 getBoundingClientRect）：
+# 桌面网页的图片槽是 **156x104**，`object-fit: cover`，自然尺寸 1035x582 /
+# 1280x720 等。也就是说我们 1200x675（16:9）的封面会被**居中裁切**成 3:2。
+#
+# 后果：左右各丢 (1200 - 675*1.5)/2 = 93.75px → int() 取整为 93px，约 7.8%。5 张历史封面逐像素统计
+# 全部有内容落在安全区外，最严重那张把「做应用的人省钱」的「钱」字切掉一半。
+#
+# 所以排版必须**先保证内容在 3:2 安全区内**，再谈字号。
+FEED_CARD_ASPECT = 1.5
+# 3:2 安全区左右各被切掉多少（1200x675 时 = 93px；理论值 93.75，向下取整）
+SAFE_INSET = max(0, int((DEFAULT_SIZE[0] - DEFAULT_SIZE[1] * FEED_CARD_ASPECT) / 2))
+
 INK = (8, 10, 16)
 INK_SOFT = (22, 34, 54)
 WHITE = (247, 249, 253)
@@ -67,8 +81,13 @@ MINT = (52, 211, 153)
 # ── 缩略图可读性：从「声明」变成「测量」──────────────────────────────
 #
 # 平台下发到信息流的封面资源实测是 640x360（`tplv-tt-shrink:640:0`）。
-# 640 是给视网膜屏的 2x 资源，对应 CSS 展示宽约 320px；最保守按 320 算。
+# 640 是给视网膜屏的 2x 资源，对应 CSS 展示宽约 320px。
+# 平台自己选 640 而不是 320 下发，说明它预期的最大展示面就是 320 CSS px，
+# 所以 320 是「正常展示」尺寸，也是可读性阈值该用的基准。
 FEED_THUMB_W = 320
+# 但桌面网页的信息流图片槽实测只有 156x104 —— 那是最差展示尺寸。
+# 主元素在这个尺寸下也必须认得出，否则「缩略图可读」只是个平均值幻觉。
+FEED_CARD_W = 156
 # 缩略图宽度下，一段文字要被认出来至少要这么高（px）。
 # iOS/Android 正文最小可读字号约 11-12px；汉字在 8px 以下基本糊成一团。
 READABLE_PX = 11.0
@@ -214,10 +233,6 @@ def fit_block(d, text: str, max_w: float, max_lines: int, start: int, floor: int
     return font, floor, lines
 
 
-def draw_center(d, text: str, font, y: int, fill, W: int) -> None:
-    d.text(((W - text_w(d, text, font)) / 2, y), text, font=font, fill=fill)
-
-
 def clip_to_width(d, text: str, font, max_w: float) -> str:
     """把 text 截到 max_w 内，末位加省略号。
 
@@ -295,12 +310,16 @@ def _is_color(v) -> bool:
     )
 
 
-def draw_lines_center(d, lines: list[str], font, y: int, fills, W: int, line_h: int) -> int:
-    """逐行居中绘制；fills 可以是单色或逐行颜色列表。返回结束 y。"""
+def draw_lines_center(d, lines: list[str], font, y: int, fills, cx: float, line_h: int) -> int:
+    """逐行以 cx 为中线居中绘制；fills 可以是单色或逐行颜色列表。返回结束 y。
+
+    ⚠️ 中线是**安全区中线**而不是画布中线（W/2）：1200x675 进信息流会被居中
+    裁成 3:2，左右各丢 93px（理论 93.75，向下取整）。按画布中线居中会让长句的两端落进被裁掉的部分。
+    """
     per_line = not _is_color(fills)
     for i, line in enumerate(lines):
         fill = fills[i] if per_line else fills
-        d.text(((W - text_w(d, line, font)) / 2, y), line, font=font, fill=fill)
+        d.text((cx - text_w(d, line, font) / 2, y), line, font=font, fill=fill)
         y += line_h
     return y
 
@@ -343,6 +362,70 @@ def _load_photo_band(path: str, size) -> tuple[Image.Image | None, str]:
     return band, f"{src.width}x{src.height} → {W}x{band_h}"
 
 
+def safe_zone_check(img, inset: int, y_from: int = 0, tolerance: float = 0.001) -> list[str]:
+    """检查内容是否落到 3:2 裁切区（左右各 inset 像素）里。
+
+    为什么需要它，而 `edge_check` 不够：`edge_check` 查的是「有没有画到画布
+    边缘之外」，而真实问题是「画在画布内、但会被平台裁掉」。这是两个不同的
+    失败，前者是我们画错了，后者是我们画对了地方、平台不给你看。
+
+    判据同样是像素而不是逐个测量：布局函数靠「记得用安全区宽度」才正确，
+    那是每个绘制点都要维持的不变量。像素统计与实现方式无关——内容落进
+    裁切区就会看见。
+
+    ⚠️ 分母必须是**亮像素**（我们画上去的墨），不是「总像素」。
+    总像素作分母时，1200x675 的 0.2% 阈值等于 1620 个像素——实测 5 张历史
+    封面「越界亮像素/全部亮像素」是 0.18% / 0.57% / 0.50% / 0.41% / 0.27%，
+    除以总像素后全部降到 0.1% 以下，于是检查一声不响。这就是 ADR-0044 发现六
+    的同一个错误：**分母选错，检查就会变成装饰**。改用亮像素作分母后，
+    新排版是 0.00%，旧产物 0.18% 起，阈值 0.1% 能把两者干净分开。
+
+    与 `edge_check` 一样，横跨全宽的装饰带（顶部/底部蓝线）会天然穿过裁切区，
+    必须按「该行几乎只有一个颜色」排除，而不是靠调用方记得传参。
+    `y_from` 排除照片带：照片是**故意**满幅铺的，它被裁是设计的一部分。
+    """
+    W, H = img.size
+    if inset <= 0:
+        return []
+    px = img.load()
+    outside = 0
+    ink = 0
+    for y in range(max(0, y_from), H):
+        row = [px[x, y][:3] for x in range(W)]
+        if len(set(row)) <= 2:  # 装饰带（顶线/底线/纯色底）
+            continue
+        for x in range(W):
+            r, g, b = row[x]
+            if abs(r - 8) + abs(g - 10) + abs(b - 16) > 60:  # 是墨不是底
+                ink += 1
+                if x < inset or x >= W - inset:
+                    outside += 1
+    ratio = (outside / ink) if ink else 0.0
+    if ratio > tolerance:
+        return [
+            f"内容落入 3:2 裁切区：{outside}/{ink} 个墨点（{ratio:.2%} > {tolerance:.2%}）"
+            f"——信息流会把左右各 {inset}px 切掉，这些字看不到（ADR-0049）"
+        ]
+    return []
+
+
+def text_bounds(W: int) -> tuple[int, float]:
+    """返回可排版的左边界与最大宽度（右边界 = left + max_w）。
+
+    为什么不是「画布宽 - 两侧边距」：1200x675 的封面进信息流会被**居中裁成
+    3:2**（`object-fit: cover`），左右各丢 93px（理论 93.75）。按整幅画布排版，等于把内容
+    排进了会被切掉的那块区域。5 张历史封面逐像素统计**全部**有内容越界，
+    最严重那张把「做应用的人省钱」的「钱」字切掉一半。
+
+    所以排版区间 = 3:2 安全区再内缩一个边距。代价是可用宽度从 1044 降到 856
+    （-18%），字号相应变小；换来的是「信息流里看到的字，一个都不缺」。
+    """
+    margin = int(W * 0.065)
+    left = SAFE_INSET + margin
+    right = W - SAFE_INSET - margin
+    return left, float(right - left)
+
+
 def layout_number(
     size, kicker: str, hero: str, unit: str, payoff: str, note: str,
     drawn: list | None = None, top_pad: int = 0,
@@ -358,8 +441,7 @@ def layout_number(
     d = ImageDraw.Draw(img)
     d.rectangle([0, H - 11, W, H], fill=BLUE)
 
-    margin = int(W * 0.065)
-    max_w = W - margin * 2
+    margin, max_w = text_bounds(W)
 
     note_h = int(H * 0.075) if note else 0
     kicker_y = int(H * 0.075)
@@ -401,7 +483,7 @@ def layout_number(
         big_start = int(big_start * grow)
         total, hero_font, unit_font = measure(big_start)
 
-    x = (W - total) / 2
+    x = margin + (max_w - total) / 2
     # hero 在其带内垂直居中
     hero_px_h = int(big_start * 0.86)  # 视觉上数字的实际高度
     y_hero = band_top + max(0, (band_h - hero_px_h) // 2)
@@ -423,7 +505,7 @@ def layout_number(
         line_h = int(psize * 1.22)
         block_h = line_h * len(plines)
         y = H - note_h - block_h - int(H * 0.04)
-        draw_lines_center(d, plines, pf, y, ORANGE, W, line_h)
+        draw_lines_center(d, plines, pf, y, ORANGE, margin + max_w / 2, line_h)
         if drawn is not None:
             drawn.append({"element": "payoff", "text": " / ".join(plines), "size": psize})
 
@@ -445,8 +527,7 @@ def layout_contrast(
     d = ImageDraw.Draw(img)
     d.rectangle([0, 0, W, 9], fill=BLUE)
 
-    margin = int(W * 0.065)
-    max_w = W - margin * 2
+    margin, max_w = text_bounds(W)
 
     draw_kicker(d, kicker, margin, int(H * 0.068), max_w, int(H * 0.062), H, drawn)
 
@@ -471,11 +552,14 @@ def layout_contrast(
     # [top_pad, H] 这个区间里居中」的等价写法；top_pad=0 时与原来逐字相同。
     y = max(top_pad, (H + top_pad - block) // 2 + int(H * 0.015))
 
-    d.text(((W - text_w(d, line1, font)) / 2, y), line1, font=font, fill=WHITE)
+    # 居中必须在**安全区**内居中，不是画布居中：画布居中会把长句的两端推进
+    # 3:2 裁切区（左右各 93px），信息流里看到的就是被切掉半截的字。
+    cx = margin + max_w / 2
+    d.text((cx - text_w(d, line1, font) / 2, y), line1, font=font, fill=WHITE)
     # 中间分隔短线
     bar_y = y + line_h + gap // 2 - 4
-    d.rectangle([W // 2 - int(W * 0.055), bar_y, W // 2 + int(W * 0.055), bar_y + 8], fill=ORANGE)
-    d.text(((W - text_w(d, line2, font)) / 2, y + line_h + gap), line2, font=font, fill=ORANGE)
+    d.rectangle([cx - int(W * 0.055), bar_y, cx + int(W * 0.055), bar_y + 8], fill=ORANGE)
+    d.text((cx - text_w(d, line2, font) / 2, y + line_h + gap), line2, font=font, fill=ORANGE)
 
     if note:
         nf = find_font(max(MIN_MUTED, int(H * 0.042)))
@@ -493,8 +577,7 @@ def layout_statement(
     d = ImageDraw.Draw(img)
     d.rectangle([0, H - 11, W, H], fill=BLUE)
 
-    margin = int(W * 0.065)
-    max_w = W - margin * 2
+    margin, max_w = text_bounds(W)
 
     draw_kicker(d, kicker, margin, int(H * 0.072), max_w, int(H * 0.064), H, drawn)
 
@@ -502,7 +585,7 @@ def layout_statement(
     line_h = int(fsize * 1.18)
     block_h = line_h * len(lines)
     y = max(top_pad, (H + top_pad - block_h) // 2 + int(H * 0.02))
-    draw_lines_center(d, lines, font, y, WHITE, W, line_h)
+    draw_lines_center(d, lines, font, y, WHITE, margin + max_w / 2, line_h)
     if drawn is not None:
         drawn.append({"element": "statement", "text": " / ".join(lines), "size": fsize})
 
@@ -686,6 +769,13 @@ def make_cover(
     check_from = (photo_band.height + PHOTO_DIVIDER) if photo_band is not None else 0
     problems = edge_check(img, margin, y_from=check_from)
 
+    # ── 自检一之二：3:2 裁切区（ADR-0049）────────────────────────────
+    #
+    # `edge_check` 只保证「没画出画布」，但 1200x675 进信息流会被居中裁成 3:2，
+    # 左右各丢 93px（理论 93.75，向下取整）。5 张历史封面逐像素统计**全部**有内容落在这块区域里，
+    # 最严重那张把「做钱」的「钱」字切掉一半——而它在画布上完全合法。
+    problems += safe_zone_check(img, SAFE_INSET, y_from=check_from)
+
     # ── 自检二：缩略图可读性（测量实际画上去的字号）──────────────────
     #
     # ⚠️ 这里必须用 `drawn` 里记录的**实际字号**，不能用 MIN_HERO 之类的常量。
@@ -693,12 +783,34 @@ def make_cover(
     # 一个比例再报出来，与画布上真正画了多大毫无关系。于是 2026-10-20 的封面
     # kicker 只有 38px（缩略图下 10px），自检却一声不响。ADR-0044 发现六。
     scale = FEED_THUMB_W / size[0]
+    card_scale = FEED_CARD_W / size[0]
+    _, text_max_w = text_bounds(size[0])
     for d_el in drawn:
         px_at_thumb = d_el["size"] * scale
         if px_at_thumb < READABLE_PX:
             problems.append(
                 f"{d_el['element']} 在 {FEED_THUMB_W}px 缩略图下仅 {px_at_thumb:.1f}px 高"
                 f"（需 ≥{READABLE_PX:.0f}px）：{d_el['text'][:24]!r}"
+            )
+
+    # ── 自检二之二：最差展示尺寸（桌面信息流 156px 卡片）──────────────
+    #
+    # 320px 是「平台下发的资源宽」，但桌面网页信息流实测图片槽只有 156x104。
+    # 在 156px 下，320px 时刚好 11px 的字只剩 5.4px——技术上过了上面的检查，
+    # 实际上没人读得出。
+    #
+    # ⚠️ 这条只对**主元素**做警告而不是错误，因为能不能达标主要由内容决定：
+    # 856px 宽的安全区里，一行 10 个汉字最多排到 ~85px，想更大就必须把句子
+    # 改短——那是写作阶段的选择，不是排版能修的。判成 fatal 会让「句子稍长」
+    # 直接发不出去，代价大于收益。
+    main_el = next((e for e in drawn if e["element"] in ("hero", "statement", "line1")), None)
+    if main_el is not None:
+        px_at_card = main_el["size"] * card_scale
+        if px_at_card < READABLE_PX:
+            warnings.append(
+                f"主元素在 {FEED_CARD_W}px 信息流卡片下仅 {px_at_card:.1f}px 高"
+                f"（建议 ≥{READABLE_PX:.0f}px）：{main_el['text'][:20]!r} ——"
+                f"想让它更大只能把这句话改短（ADR-0049）"
             )
 
     # ── 自检三：封面是否只是在复述标题 ──────────────────────────────
@@ -754,9 +866,12 @@ def make_cover(
         "bytes": out_path.stat().st_size,
         "thumb_scale": round(scale, 3),
         "drawn": [{"element": e["element"], "size": e["size"],
-                   "px_at_thumb": round(e["size"] * scale, 1)} for e in drawn],
+                   "px_at_thumb": round(e["size"] * scale, 1),
+                   "px_at_card": round(e["size"] * card_scale, 1)} for e in drawn],
         "hero_ratio": round(hero_ratio, 3),
         "restates_title": restates,
+        "safe_inset": SAFE_INSET,
+        "text_width": round(text_max_w, 1),
         "photo": photo_note if photo_band is not None else "",
         "photo_enabled": photo_band is not None,
         # 路径要带出去：简报靠它去 `.newsagg/photos/ledger.jsonl` 里查许可证与出处

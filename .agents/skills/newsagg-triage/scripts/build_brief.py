@@ -176,7 +176,19 @@ def build_brief(decision: dict, card: dict | None, style: dict, target_words: st
     lines.append("   并紧跟一行边界说明（是换算还是实测、前提是什么）。")
     lines.append("10. 至少给一个具体场景（谁在什么情况下会这样用/受影响），")
     lines.append("    不能通篇只有抽象名词。")
-    return "\n".join(lines)
+    lines.append("")
+    lines.append("### 钱落点（2026-10-21 改赛道，ADR-0050）")
+    lines.append("11. **全文必须回答一个问题：这件事跟读者的钱或工作处境有什么关系。**")
+    lines.append("    答案是**具体到角色**的，不是「对行业有影响」：")
+    lines.append("    反例：`这标志着 AI 行业进入新阶段`（谁的钱/工作受影响了？没有答案）")
+    lines.append("    正例：`接外包的前端，这类单子的报价这半年在被压`")
+    lines.append("12. **技术细节是证据，不是主题。** 允许、而且鼓励写模型参数、API 计费、")
+    lines.append("    迁移成本这些硬细节——但它们的作用是**支撑钱的判断**，不能变成")
+    lines.append("    技术综述。判据：删掉技术段落，钱落点的结论还站得住吗？")
+    lines.append("    站不住 = 技术是主题（违反本方向）；站得住 = 技术是证据（正确）。")
+    lines.append("13. 读者是「正在为钱或工作处境焦虑的技术人」。不要写给「想了解技术进展的人」")
+    lines.append("    ——后者在头条推荐流里根本不会点开（站内搜 Codex/MCP 零相关结果）。")
+    return "\n".join(lines) + "\n"
 
 
 def main() -> int:

@@ -56,7 +56,7 @@
 2. **风格访谈** → 产出 `style/style.yaml`：
 ```yaml
 name: "（你的号名）"
-industry: "AI/开发者工具"
+industry: "AI 变现与开发者职业 · 技术深度作证据"  # 2026-10-21 改赛道，见 ADR-0050
 tone: "直接、有判断、不端着"
 voice: "第一人称，像一个踩过坑的从业者在复盘"
 word_count: "1500"

@@ -247,6 +247,50 @@ def count_title_kinds(payload: dict, title: str) -> dict:
     return kinds
 
 
+def find_gid(payload: dict, title: str) -> str | None:
+    """反查时顺手把这篇的 gid 记下来（ADR-0053）。
+
+    gid 是平台分配的、不受输入路径影响的唯一标识。没有它，循环 C 只能用
+    **标题**把平台作品关联回本地 slug，而标题恰好会被输入框吞字（ADR-0051）——
+    2026-10-21 那篇就因为「中间层岗位」被收成「中间层位」而判成 `matched: false`，
+    既不进基准序列也不消耗冷启动豁免。账本从这一天起记 gid，但**历史记录没有**，
+    所以 `performance.py` 仍是「gid 优先、标题兜底」，不能只靠 gid。
+
+    同一标题下若有多条（微头条泄漏，ADR-0047），优先返回**文章**那条。
+    """
+    fallback = None
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return None
+    for wrapper in items:
+        data = wrapper.get("data") if isinstance(wrapper, dict) else None
+        if not isinstance(data, list):
+            continue
+        for cell in data:
+            base = ((cell.get("assembleCell") or {}).get("itemCell") or {}).get("articleBase") \
+                if isinstance(cell, dict) else None
+            if not isinstance(base, dict):
+                continue
+            if str(base.get("title") or "").strip() != title.strip():
+                continue
+            gid = str(base.get("gidStr") or "").strip()
+            if not gid:
+                continue
+            url = str(base.get("articleURL") or base.get("displayURL") or "")
+            content = str(base.get("content") or "").strip()
+            votes = 0
+            if len(gid) <= 17:
+                votes += 1
+            if "/a" in url and "/item/" not in url:
+                votes += 1
+            if content:
+                votes += 1
+            if votes < 2:      # 文章优先
+                return gid
+            fallback = fallback or gid
+    return fallback
+
+
 def read_publish_snapshot(out_dir: Path, slug: str) -> tuple[str, str] | None:
     """读成稿（标题 + 正文）。成稿由写作阶段写入 outputs/。"""
     md = out_dir / f"{slug}.md"
@@ -490,6 +534,11 @@ def main() -> int:
                     # 而反查只查标题、量不出「多了一条」，所以两次都没被发现。
                     kinds = count_title_kinds(payload, title_on_platform)
                     record["verify_kinds"] = kinds
+                    # ADR-0053：把 gid 记进账本。循环 C 用它关联平台作品与本地 slug，
+                    # 比标题可靠——标题会被输入框吞字（ADR-0051）。
+                    gid = find_gid(payload, title_on_platform)
+                    if gid:
+                        record["gid"] = gid
                     if kinds.get("weitoutiao", 0) > 0:
                         record["weitoutiao_leak"] = (
                             f"同一标题下发现 {kinds['weitoutiao']} 条微头条："

@@ -213,21 +213,37 @@ def extract_articles(raw: dict) -> tuple[list[dict], dict]:
     return articles, meta
 
 
-def local_title_index(root: Path) -> tuple[dict[str, str], dict[str, str]]:
-    """标题 → slug 的索引。**发布账本优先**，成稿兜底。
+def local_title_index(root: Path) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """平台作品 → slug 的索引。**gid 优先，其次标题；账本优先于成稿。**
 
     ⚠️ 为什么账本优先（实测踩到）：本人在平台上改过标题之后，本地成稿的一级标题
     已经是**新**标题，而平台上那篇作品的标题仍是**发布当时**的旧标题。只按
     `outputs/*.md` 匹配会把自己唯一发出去的文章匹配不上——数据在，关联断了。
     账本里记的正是发布当时的标题，这是唯一可靠的关联。
+
+    ⚠️ 为什么还要按 gid 匹配（ADR-0051 的后遗症）：平台标题可能被输入框吞字
+    （2026-10-21「中间层岗位」→「中间层位」），此时**任何**基于标题的索引都
+    匹配不上——账本里的 `title` 是成稿标题、`title_on_platform` 是平台实际值，
+    两个都收才够；而 gid 是平台分配的、不受输入路径影响，是更强的关联。
+    2026-10-21 这天就是靠这里补上的：那篇被吞字的文章本来判成 `matched: false`，
+    既不进基准序列、也不消耗冷启动豁免的 5 篇额度——数据在，关联又断了一次。
     """
     from_ledger: dict[str, str] = {}
     from_outputs: dict[str, str] = {}
+    by_gid: dict[str, str] = {}
 
     for rec in read_jsonl(root / ".newsagg" / "publish-ledger.jsonl"):
-        title, slug = rec.get("title"), rec.get("slug")
-        if title and slug:
-            from_ledger.setdefault(str(title).strip(), str(slug))
+        slug = rec.get("slug")
+        if not slug:
+            continue
+        gid = str(rec.get("gid") or "").strip()
+        if gid:
+            by_gid.setdefault(gid, str(slug))
+        # 成稿标题与平台实际标题都收：吞字时只有后者能匹配上（ADR-0051）
+        for key in ("title", "title_on_platform"):
+            t = rec.get(key)
+            if t:
+                from_ledger.setdefault(str(t).strip(), str(slug))
 
     for md in sorted((root / "outputs").glob("*.md")):
         try:
@@ -240,7 +256,9 @@ def local_title_index(root: Path) -> tuple[dict[str, str], dict[str, str]]:
 
     index = dict(from_outputs)
     index.update(from_ledger)  # 账本覆盖成稿
-    return index, {"from_ledger": len(from_ledger), "from_outputs": len(from_outputs)}
+    return index, by_gid, {"from_ledger": len(from_ledger),
+                           "from_outputs": len(from_outputs),
+                           "by_gid": len(by_gid)}
 
 
 # ────────────────────────── 基准与降频 ──────────────────────────
@@ -498,10 +516,12 @@ def main() -> int:
         return 0
 
     articles, parse_meta = extract_articles(raw)
-    title_index, index_meta = local_title_index(root)
+    title_index, gid_index, index_meta = local_title_index(root)
 
     for a in articles:
-        slug = title_index.get(a.get("title") or "")
+        # gid 优先（不受输入路径影响），标题兜底（老账本没有 gid）
+        slug = gid_index.get(str(a.get("gid") or "").strip()) \
+            or title_index.get(a.get("title") or "")
         a["slug"] = slug
         a["matched"] = bool(slug)
         # ADR-0047：只有**文章**算「我们的文章」。微头条即便标题匹配也不算——

@@ -312,6 +312,12 @@ def section_conclusion(decision, publish_recs, date: str, perf: dict | None = No
             else:
                 state = v.split(":")[-1] if ":" in v else v
                 out += [f"**已发布**：《{r.get('title','')}》（状态：{state}）", ""]
+                # ADR-0051：平台实际收到的标题可能被输入框吞字，与成稿标题不同。
+                # 不写出来，你会照着简报里的标题去后台搜，然后搜不到。
+                shown = str(r.get("title_on_platform") or "").strip()
+                if shown and shown != str(r.get("title") or "").strip():
+                    out += [f"> ⚠ 平台实际标题是《{shown}》——成稿标题「{r.get('title','')}」"
+                            f"在输入框里被吞了字（ADR-0051）。到后台按**实际标题**查。", ""]
         else:
             summary = clip((d.get("event") or {}).get("summary", ""), 120)
             out += [f"**已成稿，尚未发布**。选题：{summary}", ""]

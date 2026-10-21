@@ -42,8 +42,22 @@ export async function publishArticle(opts) {
     const titleSelector = 'textarea[placeholder*="标题"], input[placeholder*="标题"], [class*="title"] textarea, [class*="title"] input';
     await page.waitForSelector(titleSelector, { timeout: 15000 });
     await sleep(300, 600);
-    await page.click(titleSelector, { force: true });
-    await page.keyboard.type(title, { delay: 50 + Math.random() * 80 });
+    // NewsAgg patch (ADR-0051)：逐字输入必须读回校验。
+    // 2026-10-21 实测：标题「中间层岗位已经换成外包」被平台收成「中间层位」，
+    // 少了一个「岗」字——`keyboard.type` 没有抛异常，调用方拿到的 `title`
+    // 仍是本地变量（正确的那一份），于是发布"成功"而反查按原标题查不到，
+    // 把一次真实发布报成 not_published_needs_review。
+    // 这里输入后读回 DOM 值比对，不一致就重试；仍不一致则用 fill 直接设值。
+    const typedTitle = await typeTitleVerified(page, titleSelector, title);
+    if (typedTitle !== title) {
+      process.stderr.write(
+        `[warn] 标题读回与预期不一致：预期 ${title.length} 字，实际 ${typedTitle.length} 字\n` +
+        `  预期：${title}\n  实际：${typedTitle}\n`,
+      );
+    }
+    // 平台实际收到的标题（ADR-0051）：反查必须按**这个**去查，否则一次
+    // 真实发布会因为标题被吞字而被判成「查不到」，导向错误的人工动作。
+    const titleOnPage = typedTitle || title;
     await sleep(500, 1000);
 
     // ── 正文 ──
@@ -102,7 +116,8 @@ export async function publishArticle(opts) {
       return {
         success: true,
         action: 'draft_saved',
-        title,
+        title: titleOnPage,
+        expected_title: title,
         url: page.url(),
       };
     }
@@ -131,12 +146,60 @@ export async function publishArticle(opts) {
     return {
       success: true,
       action: 'published',
-      title,
+      title: titleOnPage,
+      expected_title: title,
+      title_truncated_by_platform: titleOnPage !== title,
       url: page.url(),
     };
   } finally {
     await closeBrowser(context);
   }
+}
+
+/**
+ * 输入标题并**读回校验**（ADR-0051）。
+ *
+ * 为什么需要：`page.keyboard.type(text, {delay})` 逐字敲键，平台输入框对
+ * 中文输入有防抖/联想行为，个别字符会被吞掉。2026-10-21 实测标题
+ * 「老板叫停AI裁员，中间层岗位已经换成外包」在平台上变成「…中间层位…」，
+ * 少了一个「岗」字——而 `keyboard.type` 全程没有抛异常，返回给调用方的
+ * `title` 是本地变量（正确的那一份）。于是：
+ *   ① 发布动作"成功"，反查按原标题查不到 → 被误判成 not_published_needs_review；
+ *   ② 即使反查通过，平台上挂着的标题也已经是错的。
+ * 这是 ADR-0047「动作成功 ≠ 结果正确」的第二个实例，判据同一条：
+ * **凡是有外部可见结果的输入，都必须读回产出物本身，而不是相信调用没报错。**
+ *
+ * 策略：先逐字敲；读回不一致则清空重敲一次；仍不一致则用 fill 直接设值
+ * （fill 走一次性赋值，绕过按键路径）；最后无论如何返回实际值，由调用方决定。
+ */
+async function typeTitleVerified(page, selector, title) {
+  const readBack = async () => {
+    try {
+      return (await page.inputValue(selector)) ?? '';
+    } catch {
+      return '';
+    }
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    await page.click(selector, { force: true });
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+    await page.keyboard.press('Backspace');
+    await page.keyboard.type(title, { delay: 50 + Math.random() * 80 });
+    await sleep(500, 1000);
+    const got = (await readBack()).trim();
+    if (got === title.trim()) return got;
+    process.stderr.write(`[warn] 标题第 ${attempt} 次逐字输入被吞字，重试\n`);
+  }
+
+  // 逐字路径两次都失败 → 一次性赋值（fill 不经过按键，不会被输入法吞）
+  try {
+    await page.fill(selector, title);
+    await sleep(500, 800);
+  } catch (err) {
+    process.stderr.write(`[warn] 标题 fill 失败：${err.message}\n`);
+  }
+  return (await readBack()).trim();
 }
 
 async function setCoverMode(page, mode, coverPath) {

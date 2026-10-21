@@ -421,8 +421,23 @@ def main() -> int:
         steps.append({"step": "publish" if args.mode == "publish" else "draft",
                       "mode": args.mode, "code": code, "kind": kind})
 
+        # ADR-0051：平台实际收到的标题可能被吞字。toutiao-ops 现在会读回输入框
+        # 并把真实值放在 `title` 字段、把我们的原值放在 `expected_title`。
+        # 反查必须按**平台实际标题**去查：按原标题查不到会把一次真实发布
+        # 误判成 not_published_needs_review（2026-10-21 实测）。
+        title_on_platform = title
+        try:
+            published = json.loads(out[out.find("{"):]) if "{" in out else {}
+            if isinstance(published, dict):
+                got = str(published.get("title") or "").strip()
+                if got and got != title.strip():
+                    title_on_platform = got
+        except (json.JSONDecodeError, ValueError):
+            pass
+
         record = {
             "at": now.isoformat(), "slug": args.slug, "title": title,
+            "title_on_platform": title_on_platform,
             "mode": args.mode, "steps": steps, "stdout_tail": out[-800:],
             # ADR-0037：把「这篇属于哪张卡」记下来。没有它，循环 C 读回来的
             # 表现数据只能停在文章粒度，无法回答"哪些卡跑出了数据"——
@@ -450,7 +465,8 @@ def main() -> int:
                                  ensure_ascii=False, indent=2)[:4000])
                 return 1
 
-            # 反查：按标题在作品列表中查找
+            # 反查：按**平台实际标题**在作品列表中查找（ADR-0051）。
+            # 用原标题查会在被吞字时找不到，把真实发布报成未发出。
             time.sleep(8)  # 给平台一点时间
             rc, cout, cerr = run_toutiao(["content", "list", "--limit", "20",
                                           "--account", args.account], env, timeout=240)
@@ -461,7 +477,7 @@ def main() -> int:
                 try:
                     payload = json.loads(cout)
                     blob = json.dumps(payload, ensure_ascii=False)
-                    if title in blob:
+                    if title_on_platform in blob:
                         found = "title_found"
                         # 尽力判断状态（reviewing / rejected / published）
                         for status in ("rejected", "reviewing", "published"):
@@ -472,7 +488,7 @@ def main() -> int:
                     # 一次发布动作本该只产出一篇文章；若同时出现微头条，
                     # 那是 --no-weitoutiao 没生效——这在 10-14 和 10-18 各发生过一次，
                     # 而反查只查标题、量不出「多了一条」，所以两次都没被发现。
-                    kinds = count_title_kinds(payload, title)
+                    kinds = count_title_kinds(payload, title_on_platform)
                     record["verify_kinds"] = kinds
                     if kinds.get("weitoutiao", 0) > 0:
                         record["weitoutiao_leak"] = (

@@ -224,6 +224,15 @@ python3 .agents/skills/newsagg-publish/scripts/publish.py \
 
 1. **绝不信任发布返回值。** `toutiao-ops` 的发布是乐观返回（点完按钮即 `success: true`）。判定"发出去了没有"只认 `content list` 的反查结果。
 
+1b. **反查必须按「平台实际标题」，不是成稿标题**（ADR-0051）。`publish-article.js`
+   用 `page.keyboard.type()` 逐字敲标题，平台输入框会**吞字**且不抛异常；
+   2026-10-21 实测「中间层**岗**位」被收成「中间层位」，于是按成稿标题反查查不到、
+   一次真实发布被判成 `not_published_needs_review`，`verify_kinds` 也数成 0/0。
+   现在 CLI 会读回输入框、不一致就重试、仍不一致回落 `fill`，并返回
+   `title`（平台实际值）+ `expected_title`（原值）；`publish.py` 落库
+   `title_on_platform` 并用它反查与计数。**若两者不同，简报 ① 段会显式提醒
+   ——到后台按实际标题查，不要按成稿标题搜。**
+
 2. **两类重试严格区分**（ADR-0011）：
    - **只读探测可重试**（登录检查、信用分、表现数据）——重试无副作用。
    - **发布绝不自动重试**——重发会造成重复发文，而平台明令禁止"批量发布重复内容"。

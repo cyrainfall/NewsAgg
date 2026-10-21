@@ -95,6 +95,36 @@ else
   COVER_PY="python3"
 fi
 
+# ── node 解释器（ADR-0052）──────────────────────────────────────────
+# 同一个理由的第二个实例：发布（publish.py）、表现数据（performance.py）都经
+# run_toutiao() 调 node，而 node 由 nvm 装在用户目录、不在系统 PATH 里。
+# 交互式 shell 里 `node` 能用，是因为 nvm 的 init 脚本改过 PATH；**定时任务的
+# shell 没有这段 init**，于是 `FileNotFoundError: 'node'`。
+# 2026-10-21 这一天它造成了两次失败：第 3 段发布直接崩，②b 表现数据则被
+# `|| true` + `json.load` 兜住，静默丢掉一整天的数据（连着两天没人发现）。
+# 退化路径：找不到就把 PATH 原样留着，让错误在调用点显式暴露。
+node_dir() {
+  # 优先用已验证过的版本（2026-10 之前几次成功发布都跑在 v22.23.3 上），
+  # 否则取 nvm 目录下最新的一版。不猜，只在这两档里选。
+  if [[ -x "$HOME/.nvm/versions/node/v22.23.3/bin/node" ]]; then
+    printf '%s' "$HOME/.nvm/versions/node/v22.23.3/bin"
+    return 0
+  fi
+  local c last=""
+  for c in "$HOME"/.nvm/versions/node/*/bin; do
+    [[ -x "$c/node" ]] && last="$c"
+  done
+  [[ -n "$last" ]] && { printf '%s' "$last"; return 0; }
+  return 1
+}
+if ! command -v node >/dev/null 2>&1; then
+  if NODE_DIR="$(node_dir)"; then
+    export PATH="$NODE_DIR:$PATH"
+  else
+    echo "警告：PATH 与 ~/.nvm 下都找不到 node——发布与表现数据会失败（ADR-0052）" >&2
+  fi
+fi
+
 log() { printf '\n=== %s ===\n' "$*"; }
 
 # ── 运行状态（简报 ⑤ 段与看守的输入）──────────────────────────────
@@ -285,7 +315,18 @@ import json
 try:
     d = json.load(open("/tmp/newsagg-perf.json", encoding="utf-8"))
 except Exception:
+    # ADR-0052：这里原来只打印「无法解析」，把 traceback 留在 /tmp 里没人看，
+    # 于是「node 不在 PATH」被当成「数据读不到」静默丢了整整两天。
+    # 现在把最后一行原样带出来——失败必须自带它的原因。
+    tail = ""
+    try:
+        lines = [l for l in open("/tmp/newsagg-perf.json", encoding="utf-8",
+                                 errors="replace").read().splitlines() if l.strip()]
+        tail = lines[-1][:300] if lines else "(空输出)"
+    except Exception as e:
+        tail = f"(读不到输出文件：{e})"
     print("（表现数据输出无法解析——本次读回失败，不影响本轮运行）")
+    print(f"  输出末行：{tail}")
     raise SystemExit(0)
 if not d.get("ok"):
     print(f"  读回失败（阶段 {d.get('stage')}）：{d.get('reason')}")

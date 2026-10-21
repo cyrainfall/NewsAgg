@@ -88,3 +88,11 @@ python3 .agents/skills/newsagg-collect/scripts/collect.py
   `bash .agents/skills/newsagg-collect/scripts/run_all.sh --collect-only`（纯脚本、不碰 git）；
   21:00 的主流程才跑 `--no-collect` / `--after-triage` / `--after-write` 三段（ADR-0038）。
   单独跑 `collect.py` 仅用于调试。
+
+- **`run_all.sh` 自己钉住解释器，不要绕过它直接调脚本。** 开头有两处硬编码：
+  `COVER_PY`（`.uv-tools/wewrite/bin/python`，Pillow 只装在那里，ADR-0039）与
+  `node_dir()`（`~/.nvm/versions/node/v22.23.3/bin`，发布与表现数据都靠 node，
+  ADR-0052）。**DSH 定时任务的 shell 不加载 `~/.zshrc` 里的 nvm init**，所以
+  那里 `node` 不在 PATH——手动在交互式 shell 里跑通，不代表定时任务能跑通。
+  2026-10-21 就是因为这个，发布直接崩、表现数据静默丢了两天（ADR-0052）。
+  所以：**调试可以手跑单脚本，但验证必须走 `run_all.sh`**。

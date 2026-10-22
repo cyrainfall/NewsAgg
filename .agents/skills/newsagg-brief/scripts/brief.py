@@ -459,7 +459,7 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -
     return out
 
 
-def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None, photo_line: str = "") -> list[str]:
+def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None, photo_line: str = "", date: str = "") -> list[str]:
     out = ["## ⑤ 需你介入的事项", ""]
     any_item = False
 
@@ -499,11 +499,17 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
     # 只能人工处置，所以必须在这里显式列出。
     #
     # ⚠️ 这里读的是**全部**账本，不是当天那几条：泄漏一旦发生就永久存在（删不掉），
-    # 只在当天简报里提醒一次等于让它消失。你手工删完之后，在那条账本记录上写
-    # `"leak_resolved_at": "<日期>"`，提醒才会停——否则它会每天出现，直到有人处理。
+    # 只在当天简报里提醒一次等于让它消失。提醒在两个终态下才停，而这两个终态
+    # **不是同一件事**（ADR-0055）：
+    #   `leak_resolved_at`  = 人删掉了那条微头条
+    #   `leak_accepted_at`  = 人决定保留（2026-10-22 用户明确表示「保留即可」）
+    # 早先只有前者，于是「决定保留」只能被记成「已删除」——账本会说谎，
+    # 而账本是复盘时唯一的事实来源。所以宁可多一个字段。
     all_recs = read_ledger_all(ledger_path) if ledger_path else []
     leaks = [r for r in all_recs
-             if r.get("weitoutiao_leak") and not r.get("leak_resolved_at")]
+             if r.get("weitoutiao_leak")
+             and not r.get("leak_resolved_at")
+             and not r.get("leak_accepted_at")]
     if leaks:
         any_item = True
         out += ["**同发了微头条，需要你手工删除**（ADR-0047）："]
@@ -513,9 +519,31 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
         out += ["  发布页的「发布得更多收益」默认**未勾选**，旧代码却无条件点了一下、",
                 "  反而把它勾上。发布链已改为「先读状态、只在该取消时点、点后读回验证」，",
                 "  但已经发出去的删不掉（CLI 无删除能力）。",
-                "  删完在 `.newsagg/publish-ledger.jsonl` 对应记录加 `\"leak_resolved_at\": \"<日期>\"`，",
-                "  这条提醒才会停。",
+                "  处理方式二选一，写进 `.newsagg/publish-ledger.jsonl` 对应记录：",
+                "    `\"leak_resolved_at\": \"<日期>\"` —— 你删掉了那条微头条",
+                "    `\"leak_accepted_at\": \"<日期>\"` —— 你决定保留它（ADR-0055）",
+                "  写了任一个，这条提醒就会停。",
                 ""]
+
+    # 决定保留的那些，只在**做决定那天**确认一次，之后不再出现。
+    # 若每天都列一遍，「保留」就变成了另一种形式的提醒——用户要的是安静，
+    # 不是换一种措辞的唠叨。事实本身留在账本里，简报不必每天复述。
+    #
+    # 这一段必须独立于上面的 `if leaks`：同一天完全可能既有「刚决定保留的」，
+    # 又有「还没人处理的」。写进 else 分支会让前者在后者存在时静默消失——
+    # 而「我昨天让你保留的那两条，今天没出现在简报里」正是最容易被误读成
+    # 「指令没生效」的形态。
+    accepted_today = [r for r in all_recs
+                      if r.get("weitoutiao_leak")
+                      and not r.get("leak_resolved_at")
+                      and str(r.get("leak_accepted_at", ""))[:10] == date]
+    if accepted_today:
+        any_item = True
+        out += ["**微头条按你的决定保留，不再提醒**（ADR-0055）："]
+        for r in accepted_today:
+            out += [f"- {str(r.get('at',''))[:10]}《{r.get('title','')}》"
+                    f" ← gid {r.get('weitoutiao_leak')}"]
+        out += [""]
 
     # 封面自检（ADR-0044 发现六）：封面质量问题的旧形态是**静默**——自检只回报
     # 一个常量、警告没人读。而「封面只是在复述标题」「缩略图下字太小」都不会让
@@ -626,7 +654,8 @@ def main() -> int:
                              ledger_path=root / ".newsagg" / "publish-ledger.jsonl",
                              cover_report=cover_report,
                              photo_line=_photo_attribution(
-                                 root, (cover_report or {}).get("photo_path") or ""))
+                                 root, (cover_report or {}).get("photo_path") or ""),
+                             date=date)
 
     lines += ["---", f"*生成于 {now.isoformat()} ｜ 时区 Asia/Shanghai*"]
     md = "\n".join(lines)

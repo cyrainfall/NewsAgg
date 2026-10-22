@@ -115,6 +115,8 @@ failures += [f for f in existing.get("failures", []) if f["source"] not in faile
    出现微头条时置 `weitoutiao_leak` 并在简报 ⑤ 段列出。
    反查只问「标题出现没有」，量不出「多发了一条」——这正是 10-14 与 10-18
    两次都判 `title_found` 的原因。
+   *（2026-10-22 补：提醒的**结束方式**后来被 ADR-0055 改写——「决定保留」用
+   `leak_accepted_at`，不再借用 `leak_resolved_at` 表达。检测与记账部分不变。）*
 5. **`performance.py` 与 `brief.py` 都排除微头条**，判据与第 4 条同一套
    （gid 位数 / URL 形态 / `content` 是否非空，三票取多数）。
    老记录没有 `kind` 字段，按 gid 位数回退判定——`reports/performance.jsonl`

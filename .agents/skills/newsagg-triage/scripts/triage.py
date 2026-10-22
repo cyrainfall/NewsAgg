@@ -321,6 +321,23 @@ def main() -> int:
         for key in ("low_confidence_skipped", "no_card_available"):
             if key in raw and not isinstance(raw[key], list):
                 extras.append(f"{key} 应为数组")
+            elif isinstance(raw.get(key), list):
+                # 2026-10-22 实测发现：原先只校验「是数组」，不校验**数组项的字段名**。
+                # 那天我写成 {"cluster": ..., "reason": ...}，校验器一路放行，
+                # 而 brief.py 读的是 it["event"] / it["why"] → 简报里渲染成
+                # 「- （0.78）」五个空条目，原因全部丢失，且退出码仍是 0。
+                # 与 ADR-0042 的三份 parse_frontmatter 漂移同型：字段名是隐式契约，
+                # 消费方读不到时不会报错，只会安静地少显示一行。
+                for i, it in enumerate(raw[key]):
+                    if not isinstance(it, dict):
+                        extras.append(f"{key}[{i}] 应为对象")
+                        continue
+                    for field in ("event", "why"):
+                        if not str(it.get(field) or "").strip():
+                            extras.append(
+                                f"{key}[{i}] 缺 {field} 字段"
+                                f"（简报靠它渲染，缺了会变成空条目；现有键：{sorted(it)}）"
+                            )
         if extras:
             result["problems"].extend(extras)
             result["ok"] = False

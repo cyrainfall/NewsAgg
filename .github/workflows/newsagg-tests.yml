@@ -1,0 +1,112 @@
+name: NewsAgg 测试
+
+# 设计依据 ADR-0056：仓库此前**没有任何测试文件**，第一个测试套件是随「位次趋势」
+# 一起建的（tests/，标准库 unittest，32 个用例）。本工作流是它的**唯一消费者**。
+#
+# 为什么要单独建这个工作流，而不是靠"记得手动跑"：
+# 这正是本仓库反复记录的失败形状——**记录了但没有消费者**。ADR-0038 的
+# `hot_history` 被采集层记了三天却没人读（DESIGN.md 残余风险 18）；ADR-0042 的
+# 三份 `parse_frontmatter` 漂移后没人发现；ADR-0054 的字段名漂移只让简报少显示
+# 一行、退出码仍是 0。一份没人跑的测试与没有测试等价，而且**更糟**：它让人以为
+# 有回归保护。把 `python3 -m unittest discover` 交给 CI 执行，"跑没跑"就不再依赖
+# 人的记忆。
+#
+# 与看守（newsagg-watchdog.yml）的分工：
+# - 看守跑在**独立机器**上、判「主系统整体是否还活着」（简报存在 + 五段齐备）。
+# - 本工作流跑在**代码变更**上、判「这次改动有没有弄坏确定性逻辑」。
+# 两者都跑在 GitHub 的机器上，但触发条件完全不同：看守按 cron，本工作流按 push/PR。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  # ── 单元测试：矩阵覆盖两个真实解释器 ──────────────────────────────
+  # run_all.sh 用**裸 python3** 调绝大多数脚本（服务器上是 3.9），而封面/取图步骤
+  # 钉的是 `COVER_PY=.uv-tools/wewrite/bin/python`（3.12，ADR-0039/0052）。
+  # 两个版本都在生产路径上，所以两个都要测——只测一个等于只保护一半链路。
+  # 3.9 尤其重要：它是**下限**，用了 3.10+ 语法（如运行期求值的 `X | None`）会
+  # 在服务器上直接崩，而本机开发用的 3.12 不会报错。
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - name: 取仓库内容
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 跑单元测试
+        run: |
+          set -euo pipefail
+          # 从**仓库根**跑，且不带 `-s tests`——这是 tests/__init__.py 存在的理由：
+          # 没有它时从根 discover 会静默「发现 0 个测试」并打印 OK，即假阳性。
+          # 这里刻意用最容易被误用的那种调用方式，让"发现不到测试"在 CI 里就暴露。
+          python3 -m unittest discover -v 2>&1 | tee /tmp/unittest.log
+          # 显式断言测试数 > 0：防止将来 tests/ 被移走或改名后，discover 又静默通过。
+          # 只判退出码不够——「0 个测试」的退出码也是 0。
+          RAN=$(grep -oE '^Ran [0-9]+ test' /tmp/unittest.log | grep -oE '[0-9]+' || echo 0)
+          echo "实际跑了 ${RAN} 个测试"
+          if [ "${RAN:-0}" -lt 1 ]; then
+            echo "::error::没有发现任何测试——discover 静默通过了，这不是通过"
+            exit 1
+          fi
+
+  # ── 静态检查：语法与可执行性 ────────────────────────────────────
+  # 单元测试只覆盖了 tests/ 里 import 到的那几个函数。脚本里其余部分（参数解析、
+  # 落盘路径、编排器的 bash 分支）没有测试，但至少可以在每次变更时确认「还能编译、
+  # 还是合法 bash」。这一类检查挡不住逻辑错，挡得住"改完就崩"。
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取仓库内容
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          # 用下限版本做语法检查：能在 3.9 上编译，才可能在服务器上跑（ADR-0039）。
+          python-version: "3.9"
+
+      - name: 编译全部 newsagg 脚本
+        run: |
+          set -euo pipefail
+          # 只查 newsagg-* 的脚本：其余技能目录是 vendored 或本机工具，不属本流水线。
+          FILES=$(find .agents/skills -path '*/newsagg-*/scripts/*.py' | sort)
+          echo "$FILES" | sed 's/^/  /'
+          COUNT=$(echo "$FILES" | grep -c . || true)
+          if [ "${COUNT:-0}" -lt 1 ]; then
+            echo "::error::没有找到任何 newsagg 脚本——find 的条件写错了，这不是通过"
+            exit 1
+          fi
+          python3 -m py_compile $FILES
+          echo "✅ ${COUNT} 个脚本编译通过（Python $(python3 -V 2>&1)）"
+
+      - name: 检查编排器是合法 bash
+        run: |
+          set -euo pipefail
+          bash -n .agents/skills/newsagg-collect/scripts/run_all.sh
+          echo "✅ run_all.sh 语法通过"
+
+      - name: 检查测试目录里有测试
+        run: |
+          set -euo pipefail
+          # 「有 tests/ 目录」不等于「有测试」：__init__.py 单独存在也能让目录非空。
+          N=$(find tests -name 'test_*.py' | wc -l | tr -d ' ')
+          echo "test_*.py 文件数：$N"
+          if [ "$N" -lt 1 ]; then
+            echo "::error::tests/ 下没有任何 test_*.py——测试被删了或改名了"
+            exit 1
+          fi

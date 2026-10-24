@@ -50,8 +50,25 @@ python3 .agents/skills/newsagg-collect/scripts/collect.py
   第二次采集时预筛仍会"保留 100 条"，但可能全是旧的，取 `kept` 会把"没有新东西"
   显示成"采到 100 条新的"（ADR-0039）。
 
-> ⚠️ `hot_history` 目前**只被记录、还没有消费者**：分拣仍按"当前热度"排序。
-> 让分拣用上热度**轨迹**（"正在爬升"比"已经很高"更值得写）是后续优化（ADR-0038）。
+> ✅ `hot_history` 的消费者已接上（[ADR-0056](../../../docs/adr/0056-trend-signal-is-same-source-rank-percentile.md)）：
+> 分拣按同源同快照内的**位次趋势**排序（`climbing` 优先于已很高但 `steady`/`cooling`），
+> 不再只看"当前热度"。为此**观测现在会带 `rank` 与 `rank_total`**——上游位次和
+> **榜单深度**（`payload.total`）一起原样写进每条观测。只记 `hot` 的话位次变化无从计算；
+> 只记 `rank` 而不记深度，下游就只能拿"池内名次"归一，而池子只是赛道预筛后的子集、
+> 条数会变（实测 toutiao 一个下午 8→7→5），池内名次会随池子缩水被拉伸，把**退步**读成
+> **爬升**（`rank` 22→25 曾被判 `climbing`）。另外 `hot` 跨源不可比（同一天 toutiao 到
+> 千万级、36kr 只有 2–44）。
+>
+> 存量观测（ADR-0056 之前落盘的）**没有 `rank` / `rank_total`**，下游的降级方式是：
+> 同一快照内按 `hot` 降序重排得到序位，再按条目数归一（池内相对量，只是近似）。两个来源**在一条轨迹内不混用**（不是按快照——
+> 换尺日会让前几次观测只有 hot、最后一次有 rank，按快照统一就会跨尺相减）。注意这条降级路径
+> 不是临时补丁——`hot` 与 `rank` 在同源内只是粗略相关（10-23 36kr 前 12 名
+> `(1,19) (2,40) (2,42) (3,44) (4,10) (5,14) (7,20) (7,22) (8,9) (8,22) (9,10) (11,3)`，
+> 有并列、有乱序），所以新采集必须写 `rank`，重排只是**没有位次时的近似**。
+>
+> 另：改观测格式时**必须同时改 `normalize_hot_history`**——它重建字典、只保留
+> `at`/`hot`/`hot_raw`，加字段而不同步它，下一次合并就会把新字段抹掉（残余风险 24 的
+> 第三次同型，前两次是 ADR-0042 与 ADR-0043）。
 
 ## 输出形状
 
@@ -65,7 +82,11 @@ python3 .agents/skills/newsagg-collect/scripts/collect.py
                    "stale_threshold_minutes":180.0,"ok":true}],
   "stale_sources": [{"source":"github","age_minutes":2300.0,"threshold_minutes":2160.0}],
   "failures": [],
-  "items":    [{"source","id","title","hot","url","cover","rank","niche_hits"}],
+  "items":    [{"source":"juejin","id":"...","title":"...","hot":51000,
+                "url":"...","cover":"...","rank":3,"rank_total":50,"niche_hits":["..."],
+                "first_seen":"...","seen_in_last_run":true,
+                "hot_history":[{"at":"2026-10-23T08:02:11+08:00","hot":51000,
+                                "rank":3,"rank_total":50}]}],
   "dropped":  [ ... 同上，供审计漏筛 ... ]
 }
 ```

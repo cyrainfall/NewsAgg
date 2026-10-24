@@ -59,6 +59,12 @@ python3 .agents/skills/newsagg-triage/scripts/triage.py --validate <决策文件
 
 4. **限额。** 每日最多成文 1 篇（`max_articles_per_day`）、最多新建 1 张卡（`max_new_cards_per_day`）。多个事件通过分拣时，按「卡匹配度 × 事件热度」排序取第一名，其余记入简报备选。
 
+   **「事件热度」里，位次趋势优先于当前热度。** 输入包的每条候选带 `trend` 对象（`state` 取 `climbing` / `steady` / `cooling` / `unknown` / `absent`，另有 `delta`、`observations`、`first_at`/`last_at`、`position_source`（这条 delta 是哪把尺子量的：`rank` 上游位次 / `hot` 无 rank 时的重排近似）、`reason`；算法见 [ADR-0056](../../../docs/adr/0056-trend-signal-is-same-source-rank-percentile.md)）。它是**位次变化**，刻度是上游榜单深度（`(rank-1)/(rank_total-1)`，所以跨快照可比；`position_source: hot` 的那部分改用同快照重排的池内近似，精度低一档）——`state: climbing` 表示名次在往上走（`delta` 为负），`cooling` 表示在退，`steady` 表示没动。两个聚簇同为高热度时，**正在爬升的优先于已经很高但 steady/cooling 的**：热度是存量，位次变化是正在发生的事。`absent` 表示该条目本轮已掉出榜单（本身是信息，通常意味着事件正在退潮）；`unknown` 表示可算的观测不足两条、或末观测不在最新快照（多为「今天只采了 1 次」），此时该条目的 trend 不可用，**按没有 trend 处理，不要当成 steady**。
+
+   `unknown` / `absent` 的分布看输入包顶层的 `trend_summary`（`by_state` 各状态计数、`snapshots` 快照数、`thresholds` 判定阈值、`by_position_source` 位次来源计数、以及一段 `note`）。当它显示 `unknown + absent` 占了大半时，这一轮的 trend 整体没有信息量，排序退回「当前热度 + 卡匹配度」——不要从残差的几条 `climbing` 里硬读出偏好。
+
+   **trend 参与排序，不参与打分，不设门槛。** 它不改变 `confidence`、不触发 `skip`、不单独决定弃权，与 `performance_reference`（ADR-0010/0037）同级。理由同下一条：每日一篇的样本量下把噪音升成硬规则会适得其反；而且**位次爬升 ≠ 值得写**——它只说「有人在看」，不说「这事跟读者的钱或职业有关」。
+
    **历史表现是排序参考，不是打分项。** 输入包的 `performance_reference`（循环 C，ADR-0010/0037）给出「每张卡接过的文章跑出了什么数据」。当两个候选的「匹配度 × 热度」**相当**时，可参考该卡的历史阅读率定先后；但它**不参与打分、不设阈值、不触发降权或退役**。理由：每日一篇的样本量下，把噪音升成硬规则会适得其反；一张卡历史表现差不等于它该退役——可能是那几篇的标题没写好。该字段为 `available: false` 时照常分拣。
 
 5. **允许弃权。** 无选题是**合法结果**，不是故障。但必须在简报中显式声明「今日弃权」并说明原因（与"系统没跑"必须可区分）。
@@ -85,14 +91,16 @@ python3 .agents/skills/newsagg-triage/scripts/triage.py --validate <决策文件
     "card_file": "ai-coding-workflow-over-model-capability.md",
     "whats_new": "某模型发布并强调 CI 集成，首次把工作流作为卖点而非能力",
     "confidence": 0.88,
-    "event": {"summary": "...", "members": ["..."], "hot": 51000},
-    "ranking_note": "候选 1（匹配度 0.88）胜出；候选 2（0.71）记入简报备选"
+    "event": {"summary": "...", "members": ["..."], "hot": 51000, "trend": "climbing"},
+    "ranking_note": "候选 1（匹配度 0.88，trend climbing，hot 51000）胜出；候选 2（0.71，trend steady，hot 89000）当前热度更高但位次未动，记入简报备选"
   },
   "low_confidence_skipped": [{"event": "...", "confidence": 0.41, "why": "..."}],
   "no_card_available":   [{"event": "...", "why": "一次性突发事件，不够格建卡"}],
   "abstain_reason": null
 }
 ```
+
+`ranking_note` 里写清**用了哪个 trend 状态**（以及它是被采纳还是被忽略）。这一栏是事后复核排序的唯一窗口：`trend_summary` 显示 `unknown` 占大半时，若 `ranking_note` 却写着「按 climbing 优先」，就能看出那一轮用了不可用的信号。
 
 ## 与相邻阶段的接口
 

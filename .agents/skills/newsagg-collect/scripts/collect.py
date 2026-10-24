@@ -122,6 +122,23 @@ def normalize_hot(value) -> int | None:
         return None
 
 
+def normalize_rank_total(value) -> int | None:
+    """把上游榜单深度（payload 的 `total`）读成 int；读不出就 None。
+
+    为什么深度必须跟着 rank 一起存下来：分拣判「正在爬升」用的是位次变化
+    （ADR-0056），而位次必须归一成一个**稳定刻度**才能跨快照相减。第一版用
+    「池内名次」（`(pos-1)/(n-1)`），撞上了赛道预筛这个坑——池子只是榜单的
+    子集，每个快照的池内条数会变（实测 toutiao 7→5），池子一缩水同一名次就被
+    拉伸成更高的位次，凭空造出爬升：toutiao「辽宁舰编队」实测 rank 22→25
+    （**退步**）却被判 climbing，只因池子从 7 条缩到 5 条。
+
+    榜单深度是上游给的、不随我们的预筛变化，`(rank-1)/(total-1)` 才是稳定刻度。
+    读不出 total 时宁可退回 `hot` 近似（消费者按条目降级），也不拿池内名次冒充
+    位次——那是**看起来更准、实际更错**的读数。
+    """
+    return normalize_hot(value)
+
+
 def normalize_dailyhot(source: str, payload: dict) -> tuple[list[dict], dict]:
     """归一化 DailyHotApi 形状：{id,title,cover,hot,url}。"""
     items = []
@@ -138,6 +155,7 @@ def normalize_dailyhot(source: str, payload: dict) -> tuple[list[dict], dict]:
                 "url": raw.get("url") or raw.get("mobileUrl") or "",
                 "cover": raw.get("cover") or "",
                 "rank": rank,
+                "rank_total": normalize_rank_total(payload.get("total")),
                 "shape": "dailyhot",
             }
         )
@@ -167,6 +185,7 @@ def normalize_raw_toutiao(source: str, payload: dict) -> tuple[list[dict], dict]
                 "url": raw.get("Url") or "",
                 "cover": (raw.get("Image") or {}).get("url") if isinstance(raw.get("Image"), dict) else "",
                 "rank": rank,
+                "rank_total": len(payload.get("data") or []),
                 "shape": "raw_toutiao",
             }
         )
@@ -306,6 +325,12 @@ def normalize_hot_history(history) -> list[dict]:
     保留原始值到 `hot_raw` 的理由：归一化可能**改变**数值（`'40,798'` 去掉
     逗号是同一个数，但若上游哪天给出 `'1.2万'` 这类形式，归一化就是一次有
     损转换）。留下原文，将来出现归一化争议时能回溯。
+
+    ⚠️ 只保留 `at`/`hot`/`hot_raw` 是错的：本函数是**重建**字典，凡是它不认识
+    的键都会被静默抹掉。2026-10-24 给观测加 `rank`（ADR-0056：分拣要用同源
+    同快照内的**位次变化**判「正在爬升」）时，这里就是第一个会吞掉新字段的
+    地方——写进去的 rank 会在下一次合并时消失，而且不会有任何报错。所以改成
+    保留所有未知键，只覆盖本函数负责归一化的 `hot`/`hot_raw`。
     """
     out = []
     for h in history or []:
@@ -313,11 +338,35 @@ def normalize_hot_history(history) -> list[dict]:
             continue
         raw = h.get("hot")
         norm = normalize_hot(raw)
-        entry = {"at": h.get("at"), "hot": norm}
+        entry = {**h, "at": h.get("at"), "hot": norm}
         if norm != raw and raw is not None:
             entry["hot_raw"] = raw
         out.append(entry)
     return out
+
+
+def hot_observation(at: str, item: dict) -> dict:
+    """造一条热度轨迹观测。
+
+    `rank` 必须进观测：分拣判「正在爬升」用的是**位次变化**（ADR-0056），而位次
+    只能来自这里。条目的当前 `rank` 会被下一次采集覆盖，只有观测里的那一份留得住。
+    存量观测没有 rank，消费者按「可算观测数」降级——那属于历史，新观测从一开始就带。
+
+    `rank_total`（上游榜单深度）必须跟着 `rank` 一起写：位次要归一成稳定刻度才能
+    跨快照相减，而分母若取「池内条数」就会随赛道预筛的池子大小漂移（见
+    `normalize_rank_total` 的说明）。两个字段要么都有、要么都没有——只有 rank 的
+    观测会被消费者整条退回 hot 近似，不会拿池内名次凑数。
+    """
+    obs = {"at": at, "hot": item.get("hot")}
+    rank = item.get("rank")
+    if rank is not None:
+        obs["rank"] = rank
+        # 深度必须和 rank 一起进观测：位次要归一成稳定刻度才能跨快照相减，
+        # 而「池内名次」会随赛道预筛的池子大小漂移（见 normalize_rank_total）。
+        total = item.get("rank_total")
+        if total is not None:
+            obs["rank_total"] = total
+    return obs
 
 
 def item_key(it: dict) -> str:
@@ -343,12 +392,12 @@ def merge_candidates(existing: dict, fresh: dict) -> dict:
         old = prev_items.pop(item_key(it), None)
         if old is None:
             it = {**it, "first_seen": fresh["collected_at"],
-                  "hot_history": [{"at": fresh["collected_at"], "hot": it.get("hot")}]}
+                  "hot_history": [hot_observation(fresh["collected_at"], it)]}
         else:
             it = {**it,
                   "first_seen": old.get("first_seen", existing.get("collected_at")),
                   "hot_history": normalize_hot_history(old.get("hot_history")) + [
-                      {"at": fresh["collected_at"], "hot": it.get("hot")}]}
+                      hot_observation(fresh["collected_at"], it)]}
         items.append({**it, "seen_in_last_run": True})
     # 上一轮见过、这一轮没再出现的条目：保留并标记，不静默丢弃。
     # hot 与其轨迹同样过一遍归一化——这些条目本轮没有新观测，但它们的**存量**

@@ -328,7 +328,7 @@ def section_conclusion(decision, publish_recs, date: str, perf: dict | None = No
     return out
 
 
-def section_overview(candidates, decision) -> list[str]:
+def section_overview(candidates, decision, trend_summary=None) -> list[str]:
     out = ["## ② 采集与分拣概览", ""]
     if candidates:
         c = candidates.get("counts", {})
@@ -357,6 +357,31 @@ def section_overview(candidates, decision) -> list[str]:
             out += [f"- **失效源**：{', '.join(map(str, failed))}"]
     else:
         out += ["- （无采集记录）"]
+
+    # 位次趋势的**覆盖率**（ADR-0056）。这一行必须出现在简报里：trend 是分拣排序的
+    # 依据之一，而它在「今天只采了一次」时会整池退化成 unknown。若简报只说
+    # 「分拣已完成」，本人会以为排序看过爬升——实际那一轮排序退回了当前热度。
+    # 不呈现信号质量，等于把「看不见」印成「没变化」。
+    ts = trend_summary or {}
+    by_state = ts.get("by_state") or {}
+    if by_state:
+        computable = sum(by_state.get(k, 0) for k in ("climbing", "steady", "cooling"))
+        total = sum(by_state.values())
+        line = (f"- 位次趋势：{computable}/{total} 条可算"
+                f"（climbing {by_state.get('climbing',0)}"
+                f" / steady {by_state.get('steady',0)}"
+                f" / cooling {by_state.get('cooling',0)}"
+                f"；unknown {by_state.get('unknown',0)}"
+                f" / absent {by_state.get('absent',0)} 不参与排序）")
+        srcs = ts.get("by_position_source") or {}
+        if srcs:
+            line += "｜位次来源 " + "、".join(f"{k} {v}" for k, v in sorted(srcs.items()))
+        out += [line]
+        if computable == 0:
+            # 整池不可算是**信号失效**，不是「大家都很稳」。用加粗把它从
+            # 「一行统计」升成「需要你知道的事」，否则它会被扫过去。
+            out += ["- **本轮 trend 不可用**：没有任何条目能算出位次变化，"
+                    "分拣已退回「当前热度 + 卡匹配度」排序（不是「所有条目都没动」）"]
 
     if decision:
         low = decision.get("low_confidence_skipped") or []
@@ -627,6 +652,10 @@ def main() -> int:
     cand = read_json(root / ".newsagg" / "candidates" / f"{date}.json")
     dec_path = root / ".newsagg" / "triage" / f"{date}-decision.json"
     decision = read_json(dec_path)
+    # 分拣**输入包**（不只是决策）：位次趋势的覆盖率只存在于这里（ADR-0056）。
+    # 决策文件里只有模型写下的 ranking_note，看不出「这一轮到底有没有 trend 可用」——
+    # 而简报的职责正是让人一眼看出信号是否退化。
+    triage_input = read_json(root / ".newsagg" / "triage" / f"{date}-input.json")
     publish_recs = read_ledger(root / ".newsagg" / "publish-ledger.jsonl", date)
 
     # 找当日成稿与封面
@@ -646,7 +675,7 @@ def main() -> int:
     perf = read_performance(root)
     run_status = read_run_status(root, date)
     lines += section_conclusion(decision, publish_recs, date, perf, run_status)
-    lines += section_overview(cand, decision)
+    lines += section_overview(cand, decision, (triage_input or {}).get("trend_summary"))
     lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies", perf)
     lines += section_assets(decision, root / "knowledge" / "cards", slug)
     cover_report = read_json(root / ".newsagg" / "covers" / f"{date}.report.json")

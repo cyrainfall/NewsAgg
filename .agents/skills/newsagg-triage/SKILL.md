@@ -91,6 +91,7 @@ python3 .agents/skills/newsagg-triage/scripts/triage.py --validate <决策文件
     "card_file": "ai-coding-workflow-over-model-capability.md",
     "whats_new": "某模型发布并强调 CI 集成，首次把工作流作为卖点而非能力",
     "confidence": 0.88,
+    "money_point": "① 接外包的前端——这类单子的报价这半年在被压，要盯的是甲方有没有把「用 AI」写进交付要求；② 团队里负责引入 AI 工具的——产出指标会从「写了多少行」换成「少了几个人」",
     "event": {"summary": "...", "members": ["..."], "hot": 51000, "trend": "climbing"},
     "ranking_note": "候选 1（匹配度 0.88，trend climbing，hot 51000）胜出；候选 2（0.71，trend steady，hot 89000）当前热度更高但位次未动，记入简报备选"
   },
@@ -101,6 +102,18 @@ python3 .agents/skills/newsagg-triage/scripts/triage.py --validate <决策文件
 ```
 
 `ranking_note` 里写清**用了哪个 trend 状态**（以及它是被采纳还是被忽略）。这一栏是事后复核排序的唯一窗口：`trend_summary` 显示 `unknown` 占大半时，若 `ranking_note` 却写着「按 climbing 优先」，就能看出那一轮用了不可用的信号。
+
+### `money_point` 与 `abstain_reason` 是必填的（ADR-0058）
+
+`action` 为 `continue` / `new` 时，**必须**给出非空的 `money_point`：这件事跟读者的钱或工作处境有什么关系，**具体到角色**（不是「对行业有影响」）。`action` 为 `abstain` 时，**必须**给出非空的 `abstain_reason`。`skip` 不要求 `money_point`（它不进写作阶段，没有落点可写），非弃权日不要求 `abstain_reason`。
+
+这两条由 `triage.py --validate` 硬校验，缺失会让编排器在第 2 阶段就停下。为什么值得卡住：
+
+- **`money_point` 有真正的下游消费者。** 它被整段写进 `build_brief.py` 生成的写作任务书（`## 钱落点（分拣已判定，写作必须落到这些角色上）`），并在简报③段整段印出供人事后复核。所以它不是「写给人看的备注」，而是**写作阶段的硬约束**：写作模型拿不到它，就会自己另猜一套角色划分，与你在这里的判断不一致。
+- **它此前一个消费者都没有。** 2026-10-21 起模型自发每天写 300+ 字，但既没进写作任务书也没进简报，全仓只有一个 ADR 提到过它（而且说错了）。这是本仓库第四次「记录了但没有消费者」。判据：**一个字段只有生产方、没有消费方，等于没写**。
+- **弃权理由是对外可区分的唯一依据。** 简报①段要写出「今天为什么不写」。缺了它，看守（ADR-0038）与人都无法区分「今日无选题」和「系统没跑」。
+
+**质量仍然验不了。** 校验只拦「空」不拦「差」——钱落点写得空泛（「对行业有影响」）、或与文章实际内容对不上，机器看不出来。那是残余风险 40 说的同一类东西，只能靠人读简报。所以**别把校验通过当成写对了**。
 
 ## 与相邻阶段的接口
 

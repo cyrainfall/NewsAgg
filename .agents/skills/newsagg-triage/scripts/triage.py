@@ -531,6 +531,35 @@ def validate_decision(decision: dict, cards: list[dict], cooldown: dict, limits:
         except (TypeError, ValueError):
             problems.append(f"confidence 非数值：{decision['confidence']!r}")
 
+    # ── 被下游消费的展示字段（ADR-0058）──
+    # ADR-0054 只校验了 `low_confidence_skipped` / `no_card_available` 两个列表，
+    # 并留下一条「`abstain_reason`、`money_point`、`ranking_note` 同样被简报消费
+    # 但本轮未校验」的边界。ADR-0058 落码时实测发现这条边界比原文更糟：
+    # `money_point` **根本没有任何消费者**——分拣从 2026-10-21 起每天写 300+ 字，
+    # 却既不进写作 brief 也不进简报（已补上消费方）。校验必须与消费方同时建立，
+    # 否则「消费者读到空值」与「生产者没写」外部不可区分。
+    #
+    # 这里只校验「该有内容时不能为空」，不校验内容质量——钱落点写得好不好，
+    # 是残余风险 40 里那类机器验不了的东西，只能靠人读。
+    action = decision.get("action")
+    if action in ("continue", "new"):
+        money_point = decision.get("money_point")
+        if not isinstance(money_point, str) or not money_point.strip():
+            problems.append(
+                "continue/new 必须给出 money_point（这件事跟读者的钱或工作处境有什么关系，"
+                "具体到角色）。它会被写进写作 brief 作为硬约束，并在简报③段呈现；"
+                "缺失时写作阶段会自己重新猜一套角色划分，与分拣判断不一致"
+            )
+
+    if action == "abstain":
+        reason = decision.get("abstain_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            problems.append(
+                "abstain 必须给出 abstain_reason（为什么今天不写）。"
+                "弃权是合法结果，但简报①段要把它写出来，否则看守无法区分"
+                "「今日无选题」与「系统没跑」"
+            )
+
     return {"ok": not problems, "problems": problems}
 
 

@@ -117,6 +117,21 @@ def build_brief(decision: dict, card: dict | None, style: dict, target_words: st
             lines.append(boundary)
             lines.append("")
 
+    # ── 钱落点（ADR-0058）──
+    # 分拣每天都在决策里写这一段（2026-10-21 起，300+ 字，具体到角色），
+    # 但它此前**没有任何消费者**：写作阶段拿不到，简报也不印。等于模型每天
+    # 认真做了一次「这事跟谁的什么处境有关」的判断，然后扔掉了。
+    # 这一段是「分拣的判断」到「写作的落点」之间唯一的桥，必须显式传过去，
+    # 而不是让写作阶段自己从素材里重新猜一遍（那会得到另一套角色划分）。
+    money_point = (decision.get("money_point") or "").strip()
+    if money_point:
+        lines.append("## 钱落点（分拣已判定，写作必须落到这些角色上）")
+        lines.append("**这是分拣阶段做的判断，不是建议。文章的钱落点必须与之一致；**")
+        lines.append("**若你认为它错了，不要静默改写，而是在正文里给出更准的角色划分并说明理由。**")
+        lines.append("")
+        lines.append(money_point)
+        lines.append("")
+
     # ── 真实素材锚点（只放输入里真实存在的）──
     lines.append("## 真实素材锚点")
     lines.append("**只使用以下素材。不得补写未提供的数字、引述、案例或个人经历。**")

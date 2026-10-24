@@ -434,6 +434,13 @@ def section_article(decision, publish_recs, body_dir: Path, perf: dict | None = 
         out += [f"- 接卡：{d['card_file']}（匹配度 {d.get('confidence')}）"]
     if d.get("whats_new"):
         out += [f"- 新在哪：{d['whats_new']}"]
+    # 钱落点（ADR-0058）：分拣判定的角色落点。此前它只有生产者、没有消费者——
+    # 写进决策 JSON 就再没人读过（写作阶段拿不到、简报也不印）。现在两头都接上：
+    # 写作阶段作为硬约束（build_brief.py），简报作为人事后复核「这篇文章该对谁说话」
+    # 的唯一窗口。整段印出来而不是截断：它是散文，截断会把「具体到角色」压成空话。
+    money_point = (d.get("money_point") or "").strip()
+    if money_point:
+        out += ["", f"**钱落点（分拣判定）**：{money_point}"]
 
     pending = [r for r in publish_recs if r.get("verdict") in
                ("not_published_needs_review", "publish_failed", "login_lost")]

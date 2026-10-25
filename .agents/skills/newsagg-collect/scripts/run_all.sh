@@ -41,7 +41,10 @@ SELF=".agents/skills/newsagg-collect/scripts/run_all.sh"
 # **决定要不要重试**，这条用于**决定重试耗尽后是降级还是熔断**。
 # 两者混用会把「TLS 握手失败」这种稳定失败也拿去重试三次（无益），
 # 也会把「一次抖动」判成需要人介入（停工）。
-NET_ERR_RE='RPC 失败|HTTP2 framing|Could not resolve host|Connection reset|Connection timed out|early EOF|The remote end hung up|SSL_ERROR_SYSCALL|LibreSSL|SSL connect error|Failed to connect|unable to access|Operation timed out|Network is unreachable|Connection refused' 
+NET_ERR_RE='RPC 失败|HTTP2 framing|Could not resolve host|Connection reset|Connection timed out|early EOF|The remote end hung up|SSL_ERROR_SYSCALL|LibreSSL|SSL connect error|Failed to connect|unable to access|Operation timed out|Network is unreachable|Connection refused'
+# 「要不要重试」用窄表：只收真正的瞬时抖动。SSL_ERROR_SYSCALL / unable to access
+# 这类在代理路径坏掉时是**稳定**失败，重试三次只是白等 4 秒——实测 2026-10-25
+# 每次都在同一处失败。它们仍属「网络类」，由上面的宽表负责分类。
 
 MODE="dry-run"
 COLLECT_ONLY=""
@@ -55,6 +58,12 @@ DATE_OVERRIDE=""
 # 前者只要等网络好；把前者判成后者会让一次代理抖动抹掉整天的产出。
 PULL_DEGRADED=0
 DEGRADED_NOTE=""
+# 2026-10-25 实测：本机 Clash 对 github 的规则坏掉（走 7980 报 LibreSSL
+# SSL_ERROR_SYSCALL），而 baidu 走同一个代理 200、github 直连也 200——
+# 也就是「代理没坏，代理里指向 github 的那一跳坏了」。这种时候禁用代理
+# 反而是通的，所以网络类失败后补一次直连尝试，避免为别人的节点问题
+# 天天攒本地未推送的提交。
+PROXY_FALLBACK=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -141,6 +150,10 @@ log() { printf '\n=== %s ===\n' "$*"; }
 # ── 运行状态（简报 ⑤ 段与看守的输入）──────────────────────────────
 # ADR-0038：`.newsagg/` 不入库，故看守读不到它；但简报可以，所以每次运行
 # 无论成败都先落一份 run-status，再由简报把它呈现给人。
+git_no_proxy() {  # 透传参数给 git，但禁用配置里的代理（空串 = 不用代理）
+  git -c http.proxy= -c https.proxy= "$@"
+}
+
 write_status() {  # $1 ok(1/0)  $2 stage  $3 reason  $4 detail  $5 degraded(可空)
   # degraded 是「跑完了但有让步」：与 ok=0 不同，它不该让看守告警，但必须让人看见。
   ST_OK="$1" ST_STAGE="$2" ST_REASON="$3" ST_DETAIL="${4:-}" ST_DEGRADED="${5:-}" \
@@ -196,6 +209,15 @@ sync_push() {  # $1 = 附加到提交信息的一行
   if git push origin main >/tmp/newsagg-push.out 2>&1; then
     echo "已推送 origin/main"
     return 0
+  fi
+  # push 同样可能只是代理的 github 规则坏了：补一次直连。
+  if grep -qiE "$NET_ERR_RE" /tmp/newsagg-push.out; then
+    printf '[!] push 走代理失败，改用直连重试一次\n' >&2
+    if git_no_proxy push origin main >/tmp/newsagg-push.out 2>&1; then
+      PROXY_FALLBACK=1
+      echo "已推送 origin/main（直连；你的 git 代理对 github 不可用）"
+      return 0
+    fi
   fi
   echo "[X] push 失败：$(tail -3 /tmp/newsagg-push.out)" >&2
   return 1
@@ -291,7 +313,8 @@ PY
     # 中止了，而手工重试**立刻**成功。网络抖动不是「工作区不干净」——
     # 把它判成后者，会让系统在最平常的失败上停工（ADR-0048）。
     # 只对传输层错误重试；认证失败/仓库不存在/无权限重试无益，直接报。
-    if [[ "$attempt" -lt "$max" ]] && grep -qiE "$NET_ERR_RE"; then
+    RETRY_ERR_RE='RPC 失败|HTTP2 framing|Could not resolve host|Connection reset|Connection timed out|early EOF|The remote end hung up'
+    if [[ "$attempt" -lt "$max" ]] && grep -qiE "$RETRY_ERR_RE"; then
       echo "拉取遇到传输层错误（第 ${attempt} 次），2 秒后重试……" >&2
       echo "  $(echo "$detail" | head -2 | tr '\n' ' ')" >&2
       attempt=$((attempt + 1))
@@ -334,6 +357,14 @@ ADR-0018：人的改动优先，系统不得替人决定提交什么。"
   # ② 其余（工作区脏、认证失败、仓库不存在、无权限）：这些要么需要人动手，
   #    要么继续跑也没有意义，保持熔断。
   if grep -qiE "$NET_ERR_RE" "$err"; then
+    # 先试一次禁用代理直连：代理对 github 的那一跳坏了、而直连通，是真实场景。
+    printf '\n[!] ① 走代理失败（重试 %s 次），改用直连重试一次\n' "$((attempt - 1))" >&2
+    if git_no_proxy pull --rebase origin main >/dev/null 2>>"$err"; then
+      PROXY_FALLBACK=1
+      DEGRADED_NOTE="① 你配置的 git 代理（$(git config --get http.proxy || echo '未配置')）对 github 不可用，本轮已改走直连完成同步（同步本身没问题）。建议修一下 Clash 的 github 规则，否则每轮都要多试一次才通。"
+      printf '[✓] ① 直连成功——问题在代理的 github 规则，不在网络\n' >&2
+      return 0
+    fi
     PULL_DEGRADED=1
     DEGRADED_NOTE="① 未能从远端同步（网络不可达，已重试 $((attempt - 1)) 次）：本轮用本地状态跑完，收尾未 push。远端若在你的机器上有新提交，本轮看不到它们——风格与教学副本可能是旧的。"
     printf '\n[!] ① 远端不可达（已重试 %s 次）→ 降级继续，收尾不 push\n' "$((attempt - 1))" >&2

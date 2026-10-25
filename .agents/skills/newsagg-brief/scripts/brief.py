@@ -72,6 +72,28 @@ def read_ledger_all(path: Path) -> list[dict]:
     return out
 
 
+# ADR-0021 Decision 四：Agent-Reach 的渠道体检进第 ⑤ 段。
+# 放在同目录、单独一个模块，是因为它有**自己的失败语义**——它是一个活跃的
+# 外部依赖（ADR-0021 不钉版本），可能没装、可能超时、可能输出不可解析。
+# 这些都必须降级成「读不到」而不是让简报失败：简报必须无条件每日存在
+# （ADR-0006）。ADR-0021 承诺了这条通路五年没实现，这里是第一次接上。
+import importlib.util as _ilu
+
+def _load_source_health():
+    """按路径加载同目录的 source_health 模块。
+
+    不用 `import source_health`：简报是脚本，`python3 path/to/brief.py` 运行时
+    同目录**不一定**在 sys.path 里（脚本所在目录会在，但 `python3 -m` 或
+    被 import 时不一定）。按路径加载最稳，也和 tests/ 里的做法一致。
+    """
+    p = Path(__file__).resolve().parent / "source_health.py"
+    spec = _ilu.spec_from_file_location("newsagg_source_health", p)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+
 def unwrap(raw):
     """决策文件形状是 {date, decision:{...}, ...}；也接受扁平对象。
 
@@ -491,9 +513,10 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -
     return out
 
 
-def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None, photo_line: str = "", date: str = "") -> list[str]:
+def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None, photo_line: str = "", date: str = "", root: Path | None = None) -> list[str]:
     out = ["## ⑤ 需你介入的事项", ""]
     any_item = False
+    root = root or repo_root()
 
     tripped = [r for r in publish_recs if r.get("verdict") in
                ("login_lost", "rejected", "publish_failed", "not_published_needs_review")]
@@ -618,9 +641,25 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
                 "  产出可能不完整。修复后重跑：`bash .agents/skills/newsagg-collect/scripts/run_all.sh`",
                 ""]
 
+    # 信源健康（ADR-0021 Decision 四）：Agent-Reach 的 tier-0 渠道体检。
+    # 这一段**独立取数**，不依赖采集层的 failed_sources——采集层只知道
+    # DailyHotApi 那七个源，而 Agent-Reach 探测的是另外那批深度信源
+    # （github / rss / exa / youtube / v2ex / web）。两者互补：前者说
+    # 「热榜源挂了」，后者说「热榜源之外的那层也没了」。
+    try:
+        _sh = _load_source_health()
+        _health = _sh.read_health(root)
+        _items = _sh.render(_health)
+    except Exception:  # noqa: BLE001 —— 体检跑不起来绝不能让简报出不来（ADR-0006）
+        _items = []
+    if _items:
+        any_item = True
+        out += _items
+
     if perf:
         freq = perf.get("frequency") or {}
         if freq.get("downshifted"):
+
             any_item = True
             out += [f"**系统已自动降频（隔日发文）**，自 {freq.get('since')} 起。",
                     f"  原因：{freq.get('reason') or '（未记录）'}",
@@ -691,7 +730,7 @@ def main() -> int:
                              cover_report=cover_report,
                              photo_line=_photo_attribution(
                                  root, (cover_report or {}).get("photo_path") or ""),
-                             date=date)
+                             date=date, root=root)
 
     lines += ["---", f"*生成于 {now.isoformat()} ｜ 时区 Asia/Shanghai*"]
     md = "\n".join(lines)

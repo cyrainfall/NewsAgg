@@ -340,6 +340,71 @@ def append_ledger(path: Path, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def read_ledger(path: Path) -> list[dict]:
+    """读全部发布账本记录（容忍坏行）。"""
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+# ADR-0014 锁定的运行参数：每日发布上限 1 篇。
+MAX_PUBLISH_PER_DAY = 1
+
+# 算作「已发布」的 verdict。draft_saved 是 dry-run 的草稿——它没发出去，
+# 不该消耗当天的额度（否则一次 dry-run 验证就会把当天堵死）。
+PUBLISHED_VERDICTS = ("title_found", "title_found:reviewing", "title_found:published")
+
+
+def count_published_today(ledger: Path, date: str) -> list[dict]:
+    """今天已经真发出去几篇（ADR-0014：每日发布上限 1 篇）。
+
+    ## 为什么这道闸必须在脚本层
+
+    「每日 1 篇」此前只存在于两处：分拣输入包的 `limits.max_articles_per_day`
+    和 `newsagg-triage/SKILL.md` 的纪律条文。两者都是**约定**，不是**闸门**：
+    约定只在有人（或模型）遵守时有效，而发布是这条流水线上唯一不可撤销的
+    写操作——重复发文是平台明令禁止的（ADR-0047 记录过两次因此被删不掉的
+    微头条）。
+
+    实测：`grep "max_articles_per_day" run_all.sh` 零命中。脚本层根本没有这个
+    概念，全靠上游自觉。无人值守运行时，唯一的执行者是 agent——而 agent
+    可能因为续跑、补写、或者流程被中断后重跑而调用发布两次。
+
+    ## 判据：账本里今天的真发布记录数
+
+    用账本而不是「今天有没有成稿」——成稿可以写好几篇，发布才是消耗额度的事。
+    用 `verdict` 而不是「命令有没有返回 0」——dry-run 存草稿也算返回 0，但它没发。
+
+    ## 误发不占额度
+
+    标了 `accidental: true` 的记录**不计入**额度：那是操作失误或测试跑漏，不是
+    当天的正常产出。若计入，一次误发就会把当天剩下的正常发文也堵死——用一个
+    已经发生的错误去惩罚正确的那一次，没有道理。
+
+    但误发仍然**必须**留在账本里：删掉它会让「今天到底发了几篇」与平台实际状态
+    不符，而账本的意义正是成为唯一可信的本地记录。
+    """
+    today = []
+    for rec in read_ledger(ledger):
+        if not str(rec.get("at", "")).startswith(date):
+            continue
+        if rec.get("accidental"):
+            continue
+        verdict = str(rec.get("verdict") or "")
+        if verdict in PUBLISHED_VERDICTS:
+            today.append(rec)
+    return today
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="NewsAgg 发布包装层")
     ap.add_argument("--slug", required=True, help="成稿 slug（对应 outputs/<slug>.md）")
@@ -358,12 +423,18 @@ def main() -> int:
     ap.add_argument("--account", default="default")
     ap.add_argument("--card-file", default="",
                     help="本篇承接的观点卡文件名（ADR-0037：循环 C 靠它把表现数据归因回卡）")
+    ap.add_argument("--allow-daily-override", action="store_true",
+                    help="越过「每日 1 篇」上限（ADR-0014）。仅用于人工补发/重发，"
+                         "调用方必须同时提供 --daily-override-reason 说明为什么")
+    ap.add_argument("--daily-override-reason", default="",
+                    help="越过每日上限的理由（会写进账本，便于事后回看为什么今天发了两篇）")
     args = ap.parse_args()
 
     root = repo_root()
     now = datetime.now(CST)
     breaker = Breaker(root / ".newsagg" / "breaker.json")
     ledger = root / ".newsagg" / "publish-ledger.jsonl"
+    today = now.strftime("%Y-%m-%d")
 
     # ── 门 0：熔断状态（ADR-0025：这是 guard 要同步读的部分）──
     st = breaker.state()
@@ -374,6 +445,26 @@ def main() -> int:
             "reason": st.get("reason"), "tripped_at": st.get("tripped_at"),
         }, ensure_ascii=False, indent=2))
         return 1
+
+    # ── 门 0.5：每日发布上限（ADR-0014：每日 1 篇）──
+    # 只在真发模式下查。dry-run 不消耗额度（存草稿不算发布），否则一次
+    # 例行验证就会把当天堵死。
+    # 覆盖参数存在，是因为「今天已经发过一篇」不等于「这一篇一定不该发」：
+    # 上一篇可能是误发（ADR-0047 的微头条泄漏、ADR-0045 的截断误判），
+    # 需要人工补发或重发。这时应当由人显式说一句，而不是让系统替人决定。
+    if args.mode == "publish" and not args.allow_daily_override:
+        done = count_published_today(ledger, today)
+        if len(done) >= MAX_PUBLISH_PER_DAY:
+            print(json.dumps({
+                "ok": False, "stage": "daily_limit",
+                "message": (f"今天（{today}）已发布 {len(done)} 篇，"
+                            f"达到 ADR-0014 的每日上限 {MAX_PUBLISH_PER_DAY} 篇。"
+                            "若确需补发/重发，加 --allow-daily-override 并写明理由。"),
+                "published_today": [{"slug": r.get("slug"), "at": r.get("at"),
+                                     "gid": r.get("gid"), "verdict": r.get("verdict")}
+                                    for r in done],
+            }, ensure_ascii=False, indent=2))
+            return 1
 
     # ── 成稿存在性 ──
     snap = read_publish_snapshot(root / "outputs", args.slug)
@@ -483,6 +574,12 @@ def main() -> int:
             "at": now.isoformat(), "slug": args.slug, "title": title,
             "title_on_platform": title_on_platform,
             "mode": args.mode, "steps": steps, "stdout_tail": out[-800:],
+            # ADR-0014：如果这一篇是越过「每日 1 篇」上限发的，把理由记进账本。
+            # 事后回看时，「今天为什么有两篇」不该靠回忆来回答。
+            "daily_override": (
+                {"reason": args.daily_override_reason or "（未说明理由）"}
+                if args.allow_daily_override else None
+            ),
             # ADR-0037：把「这篇属于哪张卡」记下来。没有它，循环 C 读回来的
             # 表现数据只能停在文章粒度，无法回答"哪些卡跑出了数据"——
             # 而那正是 ADR-0010 要的排序参考。空值写 null 而不是省略：

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# 这份 pyproject 不是上游的构建定义，而是**为了从 vendored 源码安装**而写的。
+# 上游发布的是 `wewrite-4.2.1-py3-none-any.whl`（纯 Python），这里按它的
+# METADATA 重建最小可安装描述（ADR-0015、ADR-0060）。
+#
+# 改动原则：只跟着上游 METADATA 走，不在这里加任何本项目的东西。
+# 本项目对 wewrite 的任何行为覆盖都应该发生在调用侧（.agents/skills/），
+# 不要改 vendor 里的代码——改了就无法与上游 diff。
+
+[project]
+name = "wewrite"
+version = "4.2.1"
+description = "微信公众号内容管道的确定性工具层：写作质量评分、排版转换、微信API、生图、混合路由写作"
+readme = "PROVENANCE.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "markdown>=3.10",
+    "beautifulsoup4>=4.14",
+    "cssutils>=2.11",
+    "requests>=2.32",
+    "pyyaml>=6.0",
+    "Pygments>=2.17",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.50", "camoufox[geoip]>=0.4"]
+
+[project.scripts]
+wewrite = "wewrite.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wewrite*"]
+
+[tool.setuptools.package-data]
+wewrite = ["data/*"]

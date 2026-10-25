@@ -8,6 +8,12 @@ node_modules/
 __pycache__/
 *.pyc
 
+# ── vendored 源码的构建残留（ADR-0060）──
+# `uv pip install --no-deps vendor/wewrite` 会在源目录里就地生成这两样，
+# 它们是本机构建产物，换台机器重装就会重生，不该入库。
+vendor/*/build/
+*.egg-info/
+
 # ── 凭证（ADR-0015 / 0018 / 0022：绝不入库）──
 .env
 .wewrite/config.yaml

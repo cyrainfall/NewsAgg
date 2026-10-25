@@ -1,0 +1,19 @@
+# wewrite 4.2.1 的依赖锁定（ADR-0015）
+#
+# 版本取自 2026-10-25 当时实际运行的那个 venv
+# （.uv-tools/wewrite/lib/python3.12/site-packages，Python 3.12.14）。
+# 与 vendor/wewrite/pyproject.toml 的宽松约束不同，这里是**精确钉死**的
+# 上限，目的是让「同一份 vendor 源码」装出来的环境也可复现。
+#
+# 没记 --require-hashes 的原因：这台机器上拿不到每个 sdist/wheel 的哈希
+# 又不装网络依赖，硬编一份手抄哈希比不写更危险（抄错会在下次安装时
+# 以「哈希不匹配」的形式静默变成「装不上」）。ADR-0015 真正在意的是
+# wewrite 本身漂移，而 wewrite 是逐字节 vendor 的，已在
+# vendor/wewrite/PROVENANCE.md 里留了树摘要。
+markdown==3.11.1
+beautifulsoup4==4.15.0
+cssutils==2.15.0
+requests==2.34.2
+pyyaml==6.0.3
+Pygments==2.21.0
+Pillow==12.3.0

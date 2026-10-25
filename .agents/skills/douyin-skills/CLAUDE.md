@@ -1,21 +1,24 @@
 # douyin-skills
 
-抖音自动化 Skills，使用用户的真实浏览器和账号信息操作抖音创作服务平台。
+抖音自动化 Skills，操作抖音创作服务平台。**默认不走浏览器**：读取本机浏览器里已登录的
+Cookie，用纯标准库 HTTP 调接口；需要页面或需要签名的能力用 `--browser` 兜底，走扩展 + 真实 DOM。
 
 ## 开发命令
 
 ```bash
-uv sync                        # 安装依赖
-uv run --extra dev pytest      # 静态一致性测试
+uv sync                        # 安装依赖（只有 --browser 路径需要）
+uv run --extra dev pytest      # 全部测试（静态检查 + 离线单测，都不联网）
 uv run ruff check .            # Lint 检查
 uv run ruff format .           # 代码格式化
-python scripts/cli.py probe    # 抓取当前页面元素（改版时排查选择器）
+python scripts/cli.py probe --browser   # 抓取当前页面元素（改版时排查选择器）
 ```
 
 ## 测试
 
-`tests/test_static_consistency.py` 全是**静态**检查，不需要浏览器、不需要 mock，
-直接在源码上核对三类"只有连上浏览器才会暴露"的接线错误：
+两个文件，**都不联网、不需要浏览器**。
+
+`tests/test_static_consistency.py` 全是**静态**检查，不需要 mock，直接在源码上核对
+"只有连上浏览器才会暴露"的接线错误：
 
 | 检查                                 | 挡住的问题                                   |
 | ------------------------------------ | -------------------------------------------- |
@@ -25,28 +28,61 @@ python scripts/cli.py probe    # 抓取当前页面元素（改版时排查选�
 | 五处 bridge 端口是否一致             | 端口只改了一半，表现是"扩展连不上"           |
 | `selectors.py` 候选列表是否为空      | 空候选会让报错指向"页面改版"而不是真正的原因 |
 
-改动 `bridge.py` / `background.js` / 端口 / `selectors.py` 后请先跑 `pytest`。
+`tests/test_browserless_api.py` 用假 Session 核对 API/浏览器分流与"诚实降级"：
+
+| 检查                                              | 挡住的问题                                     |
+| ------------------------------------------------- | ---------------------------------------------- |
+| 子命令归属登记是否完整（`_API_COMMANDS` / `_BROWSER_ONLY_COMMANDS`） | 新增子命令默认落进不确定分支        |
+| 发布类没加 `--browser` 是否 exit 2                | 悄悄去启动 Chrome 而不是明确报错               |
+| `publish_video` / `save_draft` / `upload_video` 是否抛签名错 | **返回假发布成功**（最严重）         |
+| 抛签名错前是否**没发任何请求**                    | 视频已上传留下孤儿对象、只差最后一步失败       |
+| `status_code: 8` 是否被当成未登录                 | HTTP 200 + 业务码错误被误判成功                |
+| Cookie 读不到是否降级**恰好一次**、未登录是否**不**降级 | 无限绕 / 该登录却偷偷开浏览器            |
+| `iter_paths()` 是否等于逆查得到的端点集合         | 端点被改成"猜的"路径                           |
+
+改动 `bridge.py` / `background.js` / 端口 / `selectors.py` / `api.py` / `cli.py` 后请先跑
+`pytest`。**不要为了让测试过而放宽断言** —— 这些断言挡的都是真实踩过的坑。
 
 ## 架构
 
 双层结构：`scripts/` 是 Python 自动化引擎，`skills/` 是 Skills 定义（SKILL.md 格式）。
+执行路径有两条，`cli.py` 按子命令分流（`_use_browser()`）：
 
-- `scripts/douyin/` — 核心自动化库（模块化，每个功能一个文件）
-- `scripts/cli.py` — 统一 CLI 入口，JSON 结构化输出，自动启动 bridge server 和浏览器
+- `scripts/douyin/api.py` — **默认路径**。纯标准库 HTTP 客户端，只依赖
+  `.agents/lib/browserless`（`chromium.py` 读 Cookie、`http.py` 发请求）。
+- `scripts/douyin/bridge.py` + `publish_video.py` + `login.py` — `--browser` 路径。
+- `scripts/cli.py` — 统一 CLI 入口，JSON 结构化输出，按需自动启动 bridge server 和浏览器
 - `scripts/bridge_server.py` — 本地通信服务（连接 CLI 与浏览器扩展）
 - `extension/` — Chrome 扩展，在用户的真实浏览器中执行操作
 - `skills/*/SKILL.md` — 指导 Agent 如何调用 scripts/
 
+**分层纪律**：`api.py` 不许 import 本技能自己的浏览器模块（bridge / publish_video / login），
+这条由 `test_api_module_does_not_import_browser_bridge` 守着。底座（`.agents/lib/browserless`）
+是共享的，**本技能不改它**。
+
 ### 调用方式
 
 ```bash
-python scripts/cli.py check-login
-python scripts/cli.py publish-video --title-file t.txt --desc-file d.txt --video v.mp4
+python scripts/cli.py check-login          # 无浏览器
+python scripts/cli.py list-works --count 10
+python scripts/cli.py --browser publish-video --title-file t.txt --desc-file d.txt --video v.mp4
 ```
 
-> CLI 会自动检测环境，若桥接服务或浏览器未就绪会尝试自动启动。
+> `--browser` 写在子命令前后等价。没加 `--browser` 跑浏览器专属子命令会立刻 exit 2
+> （JSON 带 `requiresBrowser: true`），不会去启动 Chrome。
 
 ## 数据流
+
+API 模式（默认）：
+
+```
+cli.py → _use_browser(args) == False
+       → DouyinApi(session=Session.from_browser("chrome", ["douyin.com"]))
+       → urllib: creator.douyin.com/web/api/...（带 Cookie header + referer）
+       → 业务码校验（0=成功 / 8=未登录 / 其它=DouyinApiError）→ JSON
+```
+
+浏览器模式（`--browser`）：
 
 ```
 cli.py → BridgePage._call(method, params)
@@ -55,6 +91,20 @@ cli.py → BridgePage._call(method, params)
        → chrome.scripting.executeScript(world:"MAIN") 或 chrome.debugger(CDP)
        → 结果原路返回 JSON
 ```
+
+### 签名缺口（改代码前必须知道）
+
+发布 / 草稿接口（`/web/api/media/aweme/create_v2/`、`/draft`、`/update_v2/`）在前端标了
+`needSign: true`，由 secure-consumer-sdk 在浏览器内现算 `bd-ticket-guard-*` 请求头
+（劫持 `XMLHttpRequest.prototype.setRequestHeader` 注入）。这依赖设备证书上下文 + 时间 +
+请求体，**纯 urllib 复现不了**，而且随平台发版迭代。
+
+所以 `api.py` 里 `publish_video()` / `save_draft()` / `upload_video()` 一律
+`raise SignatureRequiredError`（中文提示 + 让用户加 `--browser`），**且在发任何网络请求之前
+就抛**。不要试图"先传上去再说" —— 那只会留下孤儿 VOD 对象。同理，`upload-preflight`
+只做只读探测，不上传文件。
+
+> **绝对不许**用"返回空成功"或"伪造发布成功"来让某条路径看起来跑通了。
 
 ## 代码规范
 
@@ -74,8 +124,8 @@ cli.py → BridgePage._call(method, params)
 - `selectors.py` 里每个常量都是**候选列表**，改版时**追加**候选而不是替换。
 - `douyin/dom.py` 负责按文本打分定位（优先可点击元素、优先最内层元素），选中后打临时
   `data-dy-target` 标记，再交给扩展派发真实鼠标事件。
-- 排查选择器：`python scripts/cli.py probe`，看输出的 `selector_report`（逐条候选的命中
-  情况）与 `inputs/buttons/...` 清单。
+- 排查选择器：`python scripts/cli.py --browser probe`，看输出的 `selector_report`（逐条候选的
+  命中情况）与 `inputs/buttons/...` 清单。
 
 ### 用 class 猜状态的坑（真实踩过）
 
@@ -132,13 +182,21 @@ Bridge → 刷新图标），否则 Chrome 仍在跑旧代码。判断方法：�
 
 ## CLI 子命令对照表
 
-| CLI 子命令                            | 分类         |
-| ------------------------------------- | ------------ |
-| `check-login`                         | 认证         |
-| `login` / `get-qrcode` / `wait-login` | 认证         |
-| `send-code` / `verify-code`           | 认证         |
-| `fill-publish-video`                  | 发布（填写） |
-| `publish-video`                       | 发布（一步） |
-| `click-publish`                       | 发布（确认） |
-| `save-draft`                          | 发布（草稿） |
-| `probe` / `page-info`                 | 调试         |
+「模式」列就是 `cli.py` 顶部 `_API_COMMANDS` / `_BROWSER_ONLY_COMMANDS` 两张表的真相，
+新增子命令**必须**登记到其中一张，否则 `test_browserless_registry_covers_all_commands`
+会失败（有意为之：不许有"默认落进某个不确定分支"的子命令）。
+
+| CLI 子命令                            | 分类         | 模式               |
+| ------------------------------------- | ------------ | ------------------ |
+| `check-login`                         | 认证         | API（无浏览器）    |
+| `user-info`                           | 账号         | API（无浏览器）    |
+| `creator-info`                        | 账号         | API（无浏览器）    |
+| `list-works`                          | 作品（只读） | API（无浏览器）    |
+| `upload-preflight`                    | 作品（只读） | API（无浏览器）    |
+| `login` / `get-qrcode` / `wait-login` | 认证         | `--browser` 必须   |
+| `send-code` / `verify-code`           | 认证         | `--browser` 必须   |
+| `fill-publish-video`                  | 发布（填写） | `--browser` 必须   |
+| `publish-video`                       | 发布（一步） | `--browser` 必须   |
+| `click-publish`                       | 发布（确认） | `--browser` 必须   |
+| `save-draft`                          | 发布（草稿） | `--browser` 必须   |
+| `probe` / `page-info`                 | 调试         | `--browser` 必须   |

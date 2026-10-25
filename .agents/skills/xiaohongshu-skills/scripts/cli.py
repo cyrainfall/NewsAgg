@@ -1,7 +1,13 @@
-"""统一 CLI 入口（Extension Bridge 版本）
+"""统一 CLI 入口（API 优先，浏览器兜底）
 
-通过浏览器扩展 Bridge 连接用户已打开的浏览器，无需 Chrome 调试端口。
-先启动 bridge_server.py，并在浏览器中安装 XHS Bridge 扩展，再运行此 CLI。
+两种执行模式：
+
+* **API 模式（默认）** —— 只读本机浏览器里已登录的 Cookie，用纯 HTTP 直连，
+  不打开浏览器。见 ``xhs/api.py``。只读类子命令走这条路。
+* **浏览器模式（``--browser``）** —— 通过浏览器扩展 Bridge 连接用户已打开的浏览器，
+  由页面 JS 现算 xs 签名并操作 DOM。需要签名或需要点击/上传的子命令必须用这条路。
+
+判断哪个子命令该用哪种模式，见 ``_BROWSER_ONLY_COMMANDS`` 与 SKILL.md 里的实测表。
 
 输出: JSON（ensure_ascii=False）
 退出码: 0=成功, 1=未登录, 2=错误
@@ -14,6 +20,8 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
+from typing import Any
 
 # Windows 控制台默认编码（如 cp1252）不支持中文，强制 UTF-8
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -34,6 +42,145 @@ logger = logging.getLogger("xhs-cli")
 def _output(data: dict, exit_code: int = 0) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2))
     sys.exit(exit_code)
+
+
+# ─── 模式判定 ────────────────────────────────────────────────────────────────
+
+# 这些子命令必须开浏览器：要么接口需要 xs/xt 签名，要么本身就是在操作页面
+# （点击、上传、扫码）。map 的值是给用户看的中文原因。
+# 每条都对应 SKILL.md 里的实测表，改这里时务必同步更新那张表。
+_BROWSER_ONLY_COMMANDS: dict[str, str] = {
+    "login": "扫码登录需要打开页面读取二维码",
+    "get-qrcode": "二维码来自页面，需要浏览器渲染",
+    "wait-login": "需要轮询页面登录态",
+    "phone-login": "短信登录依赖页面控件",
+    "send-code": "发送验证码依赖页面控件",
+    "verify-code": "填写验证码依赖页面控件",
+    "delete-cookies": "退出登录要清浏览器侧的会话",
+    "search-feeds": "搜索接口（/api/sns/web/v1/search/notes）需要 xs 签名",
+    "get-feed-detail": "完整评论加载需要 xs 签名并滚动页面",
+    "post-comment": "评论接口（/api/sns/web/v2/comment/page）需要 xs 签名",
+    "reply-comment": "评论接口需要 xs 签名",
+    "like-feed": "点赞接口需要 xs 签名与页面上下文",
+    "favorite-feed": "收藏接口需要 xs 签名与页面上下文",
+    "publish": "发布链路需要 xs 签名并依赖页面上传控件",
+    "publish-video": "发布链路需要 xs 签名并依赖页面上传控件",
+    "fill-publish": "填写发布表单是 DOM 操作",
+    "fill-publish-video": "填写发布表单是 DOM 操作",
+    "click-publish": "点击发布按钮是 DOM 操作",
+    "save-draft": "存草稿是 DOM 操作",
+    "long-article": "长文发布依赖页面编辑器",
+    "select-template": "选择模板是 DOM 操作",
+    "next-step": "编辑器下一步是 DOM 操作",
+    "diagnose-404": "需要抓取页面真实跳转与网络事件",
+    "check-risk": "风控探测需要真实页面请求上下文",
+    "get-netlog": "NetLog 来自扩展注入的页面脚本",
+    "risk-report": "报告基于浏览器扩展采集的 NetLog",
+}
+
+# 这些子命令可以在无浏览器模式下工作（走 xhs/api.py）
+_API_COMMANDS = {
+    "check-login",
+    "user-profile",
+    "list-feeds",
+    "list-notes",
+    "note-stats",
+    "user-info",
+}
+
+
+def _use_browser(args: argparse.Namespace) -> bool:
+    """该子命令本次是否走浏览器模式。
+
+    默认是「浏览器」，只有 ``_API_COMMANDS`` 里明确验证过能免签名的才走 API。
+    这样将来新增子命令时即使忘了登记，也会落到原来的 bridge 行为，不会被误判成
+    「已经支持无浏览器」。
+    """
+    if getattr(args, "browser", False):
+        return True
+    command = getattr(args, "command", "")
+    return command not in _API_COMMANDS
+
+
+def _require_browser_mode(args: argparse.Namespace) -> None:
+    """浏览器专属子命令在没加 ``--browser`` 时报错退出，而不是悄悄去起浏览器。
+
+    这样「我忘了加 --browser」会立刻得到一句明确的中文提示 + exit 2，而不是
+    让用户等 20 秒看它去开 Chrome。
+    """
+    command = getattr(args, "command", "")
+    reason = _BROWSER_ONLY_COMMANDS.get(command)
+    if reason is None:
+        return
+    if getattr(args, "browser", False):
+        return
+    _output(
+        {
+            "success": False,
+            "error": f"子命令 {command} 必须使用浏览器模式：{reason}。请加 --browser 重试。",
+            "mode": "browser",
+            "requiresBrowser": True,
+            "reason": reason,
+        },
+        exit_code=2,
+    )
+
+
+def _cookie_error_hint(exc: Exception) -> dict:
+    """读不到浏览器 Cookie 时的结构化提示（不含任何 Cookie 值）。"""
+    return {
+        "success": False,
+        "error": str(exc),
+        "hint": (
+            "无法从本机浏览器读取小红书 Cookie。请确认：1) 已用 Chrome 登录小红书；"
+            "2) 当前系统用户能访问浏览器数据目录；3) 或用 --browser 走浏览器模式。"
+        ),
+    }
+
+
+# ─── API 模式执行 ────────────────────────────────────────────────────────────
+
+
+def _run_api(args: argparse.Namespace, action: Callable[[Any], Any], *,
+             fallback: Callable[[argparse.Namespace], None] | None = None) -> Any:
+    """在 API 模式下跑一次 ``action(api)``。
+
+    ``action`` 抛 ``CookieError``（读不到本机浏览器 Cookie）时，按任务要求
+    **自动降级到浏览器模式一次**：有 ``fallback`` 就调用它（其内部通常
+    ``_output`` 并退出），没有 ``fallback`` 或降级也失败，则以 exit code 2 报错。
+
+    注意：这里只对 ``CookieError`` 降级。「接口需要签名」「未登录」不降级 ——
+    前者该让用户显式加 ``--browser``，后者该让用户去登录，悄悄起浏览器反而更糟。
+    """
+    # 从 xhs.api 导入：它会先把 .agents/lib 加进 sys.path，直接 import
+    # browserless.* 会因为路径没配好而 ModuleNotFoundError
+    from xhs.api import COOKIE_ERRORS, XhsApi
+
+    try:
+        return action(XhsApi())
+    except COOKIE_ERRORS as exc:
+        if fallback is not None and not getattr(args, "browser", False):
+            logger.warning("读不到浏览器 Cookie（%s），自动降级到浏览器模式重试一次", exc)
+            try:
+                fallback(args)
+            except COOKIE_ERRORS as retry_exc:
+                # 降级也读不到 Cookie：如实报错，exit 2，附带排查提示
+                data = _cookie_error_hint(retry_exc)
+                data["error"] = f"{exc}；降级到浏览器模式后仍失败：{retry_exc}"
+                _output(data, exit_code=2)
+            raise  # fallback 正常都会 _output 退出；走到这里说明它没退出
+        _output(_cookie_error_hint(exc), exit_code=2)
+        raise  # 供类型检查；_output 已 sys.exit
+
+
+def _api_or_output(args: argparse.Namespace, action: Callable[[Any], Any], *,
+                   fallback: Callable[[argparse.Namespace], None] | None = None) -> None:
+    """``_run_api`` 的便捷包装：把 action 的返回值直接输出为成功结果。"""
+    result = _run_api(args, action, fallback=fallback)
+    if isinstance(result, dict) and "exit_code" in result:
+        exit_code = result.pop("exit_code")
+        _output(result, exit_code=exit_code)
+    _output(result)
 
 
 def _open_file_if_display(path: str) -> None:
@@ -181,7 +328,26 @@ def _qrcode_fallback(browser, page, args: argparse.Namespace) -> None:
 
 
 def cmd_check_login(args: argparse.Namespace) -> None:
-    """检查登录状态，未登录时自动获取二维码。"""
+    """检查登录状态。默认走 API（不开浏览器）；--browser 时保持原二维码流程。"""
+    if not _use_browser(args):
+        from xhs.api import XhsApi
+
+        def action(_api: Any) -> dict:
+            result = XhsApi().check_login()
+            if result.get("logged_in"):
+                return result
+            # 未登录不是错误，用 exit 1 让上层能区分
+            result["exit_code"] = 1
+            result["hint"] = "未登录或登录已过期，请加 --browser 走扫码登录"
+            return result
+
+        _api_or_output(args, action, fallback=_check_login_browser)
+        return
+    _check_login_browser(args)
+
+
+def _check_login_browser(args: argparse.Namespace) -> None:
+    """原浏览器实现：检查登录状态，未登录时自动获取二维码。"""
     from xhs.login import fetch_qrcode, make_qrcode_url, save_qrcode_to_file
 
     browser, page = _connect(args)
@@ -366,7 +532,21 @@ def cmd_delete_cookies(args: argparse.Namespace) -> None:
 
 
 def cmd_list_feeds(args: argparse.Namespace) -> None:
-    """获取首页 Feed 列表。"""
+    """获取首页 Feed 列表。默认走 API（读 /explore 的 SSR 数据）。"""
+    if not _use_browser(args):
+        from xhs.api import XhsApi
+
+        _api_or_output(
+            args,
+            lambda _api: XhsApi().list_feeds(limit=getattr(args, "limit", 0) or 0),
+            fallback=_list_feeds_browser,
+        )
+        return
+    _list_feeds_browser(args)
+
+
+def _list_feeds_browser(args: argparse.Namespace) -> None:
+    """原浏览器实现。"""
     from xhs.feeds import list_feeds
 
     browser, page = _connect(args)
@@ -375,6 +555,41 @@ def cmd_list_feeds(args: argparse.Namespace) -> None:
         _output({"feeds": [f.to_dict() for f in feeds], "count": len(feeds)})
     finally:
         browser.close()
+
+
+def cmd_list_notes(args: argparse.Namespace) -> None:
+    """获取已发布笔记列表（第一页）。"""
+    from xhs.api import XhsApi
+
+    _api_or_output(
+        args,
+        lambda _api: XhsApi().list_posted_notes(user_id=getattr(args, "user_id", "") or ""),
+    )
+
+
+def cmd_note_stats(args: argparse.Namespace) -> None:
+    """获取单篇笔记的正文与互动数据。"""
+    from xhs.api import XhsApi
+
+    def action(_api: Any) -> dict:
+        api = XhsApi()
+        result = api.note_stats(args.note_id, args.xsec_token or "")
+        result["mode"] = "api"
+        return result
+
+    _api_or_output(args, action)
+
+
+def cmd_user_info(args: argparse.Namespace) -> None:
+    """账号信息（粉丝数、关注数、获赞与收藏、等级）。"""
+    from xhs.api import XhsApi
+
+    def action(_api: Any) -> dict:
+        result = XhsApi().user_info()
+        result["mode"] = "api"
+        return result
+
+    _api_or_output(args, action)
 
 
 def cmd_search_feeds(args: argparse.Namespace) -> None:
@@ -445,9 +660,33 @@ def cmd_get_feed_detail(args: argparse.Namespace) -> None:
 
 
 def cmd_user_profile(args: argparse.Namespace) -> None:
-    """获取用户主页。"""
+    """获取用户主页。默认走 API（读主页的 SSR 数据）。"""
+    if not _use_browser(args):
+        from xhs.api import XhsApi
+
+        _api_or_output(
+            args,
+            lambda _api: XhsApi().user_profile(
+                user_id=args.user_id or "", xsec_token=args.xsec_token or ""
+            ),
+            fallback=_user_profile_browser,
+        )
+        return
+    _user_profile_browser(args)
+
+
+def _user_profile_browser(args: argparse.Namespace) -> None:
+    """原浏览器实现。"""
     from xhs.user_profile import get_user_profile
 
+    if not args.user_id or not args.xsec_token:
+        _output(
+            {
+                "success": False,
+                "error": "浏览器模式下 user-profile 必须同时提供 --user-id 与 --xsec-token",
+            },
+            exit_code=2,
+        )
     browser, page = _connect(args)
     try:
         profile = get_user_profile(page, args.user_id, args.xsec_token)
@@ -832,15 +1071,40 @@ def cmd_publish_video(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xhs-cli",
-        description="小红书自动化 CLI（Extension Bridge 版）",
+        description="小红书自动化 CLI（默认走 API 直连，需要签名/页面的操作用 --browser）",
     )
     parser.add_argument(
         "--bridge-url",
         default="ws://localhost:9333",
         help="Bridge server WebSocket 地址 (default: ws://localhost:9333)",
     )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="强制使用浏览器模式（扩展 Bridge + 页面签名）。默认走纯 HTTP API",
+    )
+
+    # 注意：``--browser`` 既要能写在子命令之前（全局），也要能写在子命令之后 ——
+    # 后者是更符合直觉的写法，argparse 的全局选项默认不支持，故在每个子命令上
+    # 也加一份同名的 store_true，由 ``_merge_browser_flag`` 合并。
+    class _SubParserFactory:
+        """给每个子命令自动补一个 ``--browser``。"""
+
+        def __init__(self, real: Any) -> None:
+            self._real = real
+
+        def add_parser(self, *args: Any, **kwargs: Any) -> Any:
+            sub = self._real.add_parser(*args, **kwargs)
+            sub.add_argument(
+                "--browser",
+                action="store_true",
+                default=argparse.SUPPRESS,
+                help="强制使用浏览器模式（等价于写在子命令前面的 --browser）",
+            )
+            return sub
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = _SubParserFactory(subparsers)  # type: ignore[assignment]
 
     # check-login
     sub = subparsers.add_parser("check-login", help="检查登录状态")
@@ -880,8 +1144,24 @@ def build_parser() -> argparse.ArgumentParser:
     sub.set_defaults(func=cmd_delete_cookies)
 
     # list-feeds
-    sub = subparsers.add_parser("list-feeds", help="获取首页 Feed 列表")
+    sub = subparsers.add_parser("list-feeds", help="获取首页 Feed 列表（默认走 API）")
+    sub.add_argument("--limit", type=int, default=0, help="只取前 N 条 (default: 0=全部首屏)")
     sub.set_defaults(func=cmd_list_feeds)
+
+    # list-notes
+    sub = subparsers.add_parser("list-notes", help="获取已发布笔记列表（API，第一页）")
+    sub.add_argument("--user-id", default="", help="省略则查自己")
+    sub.set_defaults(func=cmd_list_notes)
+
+    # note-stats
+    sub = subparsers.add_parser("note-stats", help="获取单篇笔记正文与互动数据（默认走 API）")
+    sub.add_argument("--note-id", required=True, help="笔记 ID")
+    sub.add_argument("--xsec-token", default="", help="页面授权令牌，取 list-feeds 的 xsecToken")
+    sub.set_defaults(func=cmd_note_stats)
+
+    # user-info
+    sub = subparsers.add_parser("user-info", help="获取当前账号信息（粉丝/关注/获赞，默认走 API）")
+    sub.set_defaults(func=cmd_user_info)
 
     # search-feeds
     sub = subparsers.add_parser("search-feeds", help="搜索 Feeds")
@@ -906,9 +1186,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.set_defaults(func=cmd_get_feed_detail)
 
     # user-profile
-    sub = subparsers.add_parser("user-profile", help="获取用户主页")
-    sub.add_argument("--user-id", required=True)
-    sub.add_argument("--xsec-token", required=True)
+    sub = subparsers.add_parser("user-profile", help="获取用户主页（默认走 API）")
+    sub.add_argument("--user-id", default="", help="省略则查自己（API 模式）")
+    sub.add_argument("--xsec-token", default="", help="xsec_token（浏览器模式必填）")
     sub.set_defaults(func=cmd_user_profile)
 
     # post-comment
@@ -1040,9 +1320,24 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    # 子命令上的 --browser 用 argparse.SUPPRESS，未出现时不写回 namespace，
+    # 因此全局那份的值会保留下来；这里只做一次兜底归一化。
+    args.browser = bool(getattr(args, "browser", False))
+
+    # 浏览器专属子命令在没加 --browser 时立刻报错（而不是悄悄去启动 Chrome）
+    _require_browser_mode(args)
+
     try:
         args.func(args)
+    except SystemExit:
+        raise
     except Exception as e:
+        # 纯 HTTP 模式下的未登录，用 exit 1 与其他错误（2）区分开
+        from xhs.api import AuthRequired
+
+        if isinstance(e, AuthRequired):
+            logger.error("未登录: %s", e)
+            _output({"success": False, "logged_in": False, "error": str(e)}, exit_code=1)
         logger.error("执行失败: %s", e, exc_info=True)
         _output({"success": False, "error": str(e)}, exit_code=2)
 

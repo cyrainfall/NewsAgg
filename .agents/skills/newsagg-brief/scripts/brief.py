@@ -580,6 +580,29 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
                 "  写了任一个，这条提醒就会停。",
                 ""]
 
+    # 误发（ADR-0059）：账本里 `accidental: true` 是「不该发、但已经发出去了」的文章。
+    # `count_published_today` 会跳过它（不占当日额度），但**跳过不等于解决**——平台侧
+    # 还挂着那篇重复文章，只有人能在 Web 后台删掉。
+    #
+    # ADR-0059 当时只做到「留在账本里」，没做消费者：简报不读这两个字段，于是系统
+    # 自己知道自己误发了，却从不告诉唯一能处理这件事的人。这是同一族缺陷（记录了但
+    # 没有实现）的第七次，也是最短命的一次——ADR-0059 写完的第二天就复现了。
+    # 与微头条泄漏同理：一旦发生就永久存在，所以每个终态都要显式写回账本才停。
+    accidents = [r for r in all_recs if r.get("accidental") and not r.get("deleted_at")]
+    if accidents:
+        any_item = True
+        out += ["**误发了一篇，需要你手工删除**（ADR-0059）："]
+        for r in accidents:
+            out += [f"- {str(r.get('at',''))[:10]}《{r.get('title','')}》"
+                    f" ← gid {r.get('gid','')}"]
+        out += ["  这些是绕过「每日 1 篇」上限测试时真的发出去的重复文章。",
+                "  发布链本身没有重试，问题出在测试放行路径等于测试发布（ADR-0059）。",
+                "  toutiao-ops CLI 没有 delete 命令，只能在头条 Web 后台删：",
+                "  创作中心 → 内容管理 → 找到该篇 → 删除。",
+                "  删完把 `\"deleted_at\": \"<日期>\"` 写进 `.newsagg/publish-ledger.jsonl` 对应记录，",
+                "  这条提醒就会停。**不要**只把 `accidental` 改成 false——那会让账本说谎。",
+                ""]
+
     # 决定保留的那些，只在**做决定那天**确认一次，之后不再出现。
     # 若每天都列一遍，「保留」就变成了另一种形式的提醒——用户要的是安静，
     # 不是换一种措辞的唠叨。事实本身留在账本里，简报不必每天复述。

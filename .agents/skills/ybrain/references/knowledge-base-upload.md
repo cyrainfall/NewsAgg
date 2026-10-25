@@ -1,6 +1,8 @@
 # IMA知识库上传操作相关
 
 > **ybrain 环境注记**：文件上传一律走 `core-rules.md` 的「文件上传安全门」（`scripts/preflight-check.cjs` + `scripts/cos-upload.cjs`）；原文档中的 ima 沙箱工具 upload_file.py 一节已移除（本环境不可用）。
+>
+> 安全门里三个 API 的**完整请求体**（`check_repeated_names` 的 `params` 数组、`create_media` 的五个必填字段、`add_knowledge` 的 `file_info`）只写在 `core-rules.md`，本文档不再重复；新增/修改上传流程时以那里为准。
 
 ## 接口详情
 

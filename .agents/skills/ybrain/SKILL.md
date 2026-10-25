@@ -165,3 +165,4 @@ description: |
 | 绕过 `scripts/ima_api.cjs` 直接 curl IMA 接口 | 传输统一走内置 ima_api.cjs，凭证与错误分层复用                                                            |
 | 从 ima-skills 同步更新覆盖内置脚本            | 内置副本是有意冻结的（ADR-0004）；上游修复需手动重新 vendoring 并保留本地补丁                             |
 | 缺凭证时反复重试或另寻他法                    | 无凭证唯一动作是引导用户到 https://ima.qq.com/agent-interface 获取，按「凭证配置」配好再重跑              |
+| 凭字段名直觉拼上传接口的请求体                | 上传安全门五步的完整请求体见 `references/core-rules.md`；`check_repeated_names` 是 `params` 数组不是 `file_name`，猜错只会得到 `code=51` |

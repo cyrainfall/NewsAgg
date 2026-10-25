@@ -2,6 +2,8 @@
 
 本文件收录 ybrain 工作流依赖的通用规则与接口细节，是调用任何 API 前的必读。扩展面接口（建库/移动/标签/块编辑等）见同目录其他 reference。
 
+> **本地补丁**：「文件上传安全门」五步的完整请求体不在上游 ima-skills v1.1.10 的蒸馏范围内（原文只有一句话描述），2026-10-25 按上游 `knowledge-base/references/api.md` 的字段表补写，并用真实上传（Markdown 文件 → `0-收件箱`）逐字段验证过。重新 vendoring 时不要用上游文本覆盖这一段。
+
 ## 传输与响应
 
 - 统一入口：`node "$SKILL_DIR/scripts/ima_api.cjs" <apiPath> <json-body> [opts]`（`$SKILL_DIR` = 本技能目录）
@@ -72,11 +74,48 @@ node "$SKILL_DIR/scripts/note-images.cjs" --note-id <id> --file content.md [--dr
 
 ### 文件上传安全门（顺序不可乱，任一失败即停）
 
-1. `node "$SKILL_DIR/scripts/preflight-check.cjs" --file <path>` → `pass=false` 立即终止并展示 `reason`，不问用户是否继续
-2. `check_repeated_names` → 重名只可选保留副本（文件名追加 `_YYYYMMDDHHmmss`）或取消，不支持覆盖
-3. `create_media` → 取 `media_id` 与 `cos_credential`
-4. `node "$SKILL_DIR/scripts/cos-upload.cjs"`（参数取自 create_media 返回的 cos_credential；大文件加 `--timeout 300000`）→ 非零退出立即停止
-5. `add_knowledge`（`title` 必须原样等于 `file_name`，含扩展名）→ `code=0` 才算完成
+`preflight-check.cjs` 的 stdout 就是后面三步的入参来源（`file_name` / `file_size` / `file_ext` / `media_type` / `content_type`），不要自己猜。
+
+1. **preflight**
+   ```bash
+   node "$SKILL_DIR/scripts/preflight-check.cjs" --file <path>
+   # → {"pass":true,"file_name":"X.md","file_ext":"md","file_size":24810,
+   #    "media_type":7,"content_type":"text/markdown"}
+   ```
+   `pass=false` 立即终止并展示 `reason`，不问用户是否继续。
+
+2. **check_repeated_names**
+   ```json
+   {"params": [{"name": "X.md", "media_type": 7}],
+    "knowledge_base_id": "<kb_id>", "folder_id": "<folder_id>"}
+   ```
+   注意是 **`params` 数组**（1–2000 项，每项 `{name, media_type}`），不是 `file_name`；传单数字段或嵌套对象都会得到 `code=51`。`folder_id` 可选，省略检查根目录。
+   返回 `{"results":[{"name":"X.md","is_repeated":false}]}`。`is_repeated=true` 只可选保留副本（文件名追加 `_YYYYMMDDHHmmss`）或取消，**不支持覆盖**。
+
+3. **create_media**
+   ```json
+   {"file_name": "X.md", "file_size": 24810, "content_type": "text/markdown",
+    "knowledge_base_id": "<kb_id>", "file_ext": "md"}
+   ```
+   官方文档标这五个字段全必填（`file_ext` 不带点）；实测省略 `file_ext` 仍返回 `code=0`，但**照文档传全**，不要赌服务的宽容度。返回 `media_id` + `cos_credential`（`token`/`secret_id`/`secret_key`/`start_time`/`expired_time`/`bucket_name`/`region`/`cos_key` 等）。凭证即刻失效、禁止落盘，用完删临时文件。
+
+4. **cos-upload**
+   ```bash
+   node "$SKILL_DIR/scripts/cos-upload.cjs" --file <path> \
+     --secret-id <secret_id> --secret-key <secret_key> --token <token> \
+     --bucket <bucket_name> --region <region> --cos-key <cos_key> \
+     --content-type <content_type> \
+     --start-time <start_time> --expired-time <expired_time> --timeout 300000
+   ```
+   非零退出立即停止，不要继续第 5 步。
+
+5. **add_knowledge**
+   ```json
+   {"media_type": 7, "media_id": "<media_id>", "title": "X.md",
+    "knowledge_base_id": "<kb_id>", "folder_id": "<folder_id>",
+    "file_info": {"cos_key": "<cos_key>", "file_size": 24810, "file_name": "X.md"}}
+   ```
+   `media_type` / `title` / `knowledge_base_id` 必填；文件上传时 `media_id` 与 `file_info` 亦必填。**`title` 必须原样等于 `file_name`（含扩展名）**。`code=0` 才算完成。
 
 ### URL 类型检测（用户提供 URL 时）
 

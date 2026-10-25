@@ -641,6 +641,14 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
                 "  产出可能不完整。修复后重跑：`bash .agents/skills/newsagg-collect/scripts/run_all.sh`",
                 ""]
 
+    # 降级完成（ADR-0061）：跑完了，但有一处让步。与 ok=0 分开是因为它的处置
+    # 完全不同——不需要「修复后重跑」，只需要人知道「这一轮少了什么」。
+    # 当前唯一来源是 ① 远端不可达（代理/网络问题），让步是「收尾没 push」。
+    degraded = (rs.get("degraded") or "").strip() if rs else ""
+    if degraded:
+        any_item = True
+        out += ["**本轮降级完成**（不是失败，但有一处让步）：", f"- {degraded}", ""]
+
     # 信源健康（ADR-0021 Decision 四）：Agent-Reach 的 tier-0 渠道体检。
     # 这一段**独立取数**，不依赖采集层的 failed_sources——采集层只知道
     # DailyHotApi 那七个源，而 Agent-Reach 探测的是另外那批深度信源

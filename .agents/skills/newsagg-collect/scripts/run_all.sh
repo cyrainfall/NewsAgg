@@ -37,6 +37,12 @@ cd "$REPO"
 
 SELF=".agents/skills/newsagg-collect/scripts/run_all.sh"
 
+# 「网络不可达」类错误的判据。刻意比「传输层抖动」那条宽——抖动那条用于
+# **决定要不要重试**，这条用于**决定重试耗尽后是降级还是熔断**。
+# 两者混用会把「TLS 握手失败」这种稳定失败也拿去重试三次（无益），
+# 也会把「一次抖动」判成需要人介入（停工）。
+NET_ERR_RE='RPC 失败|HTTP2 framing|Could not resolve host|Connection reset|Connection timed out|early EOF|The remote end hung up|SSL_ERROR_SYSCALL|LibreSSL|SSL connect error|Failed to connect|unable to access|Operation timed out|Network is unreachable|Connection refused' 
+
 MODE="dry-run"
 COLLECT_ONLY=""
 AFTER_TRIAGE=""
@@ -44,6 +50,11 @@ AFTER_WRITE=""
 NO_GIT=""
 NO_COLLECT=""
 DATE_OVERRIDE=""
+# ① 没能从远端同步（网络不可达）时置 1：本轮在本地状态下继续，收尾不 push。
+# 见 ADR-0061——远端不可达与「工作区脏 / 合并冲突」是两种事，后者要人动手，
+# 前者只要等网络好；把前者判成后者会让一次代理抖动抹掉整天的产出。
+PULL_DEGRADED=0
+DEGRADED_NOTE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -130,8 +141,9 @@ log() { printf '\n=== %s ===\n' "$*"; }
 # ── 运行状态（简报 ⑤ 段与看守的输入）──────────────────────────────
 # ADR-0038：`.newsagg/` 不入库，故看守读不到它；但简报可以，所以每次运行
 # 无论成败都先落一份 run-status，再由简报把它呈现给人。
-write_status() {  # $1 ok(1/0)  $2 stage  $3 reason  $4 detail
-  ST_OK="$1" ST_STAGE="$2" ST_REASON="$3" ST_DETAIL="${4:-}" \
+write_status() {  # $1 ok(1/0)  $2 stage  $3 reason  $4 detail  $5 degraded(可空)
+  # degraded 是「跑完了但有让步」：与 ok=0 不同，它不该让看守告警，但必须让人看见。
+  ST_OK="$1" ST_STAGE="$2" ST_REASON="$3" ST_DETAIL="${4:-}" ST_DEGRADED="${5:-}" \
   ST_DATE="$DATE" ST_MODE="$MODE" \
   python3 - <<'PY'
 import json, os
@@ -148,6 +160,9 @@ rec = {
     "reason": os.environ["ST_REASON"],
     "detail": (os.environ.get("ST_DETAIL") or "")[-2000:],
 }
+_dg = (os.environ.get("ST_DEGRADED") or "").strip()
+if _dg:
+    rec["degraded"] = _dg[-2000:]
 with open(p, "w", encoding="utf-8") as f:
     json.dump(rec, f, ensure_ascii=False, indent=2)
 print(json.dumps({k: rec[k] for k in ("ok", "stage", "reason")}, ensure_ascii=False))
@@ -170,6 +185,13 @@ sync_push() {  # $1 = 附加到提交信息的一行
     else
       echo "[X] commit 失败" >&2; return 1
     fi
+  fi
+  # 降级轮不 push：① 没拉到远端，我们不知道远端有没有新提交，push 可能被拒；
+  # 也可能把本地「没 rebase 过」的历史直接推上去。本地已提交，产出不会丢，
+  # 等你在有网络时 push 一次即可（简报⑤段会写明这件事）。
+  if [[ "${PULL_DEGRADED:-0}" == "1" ]]; then
+    echo "[!] 跳过 push：本轮未能从远端同步（网络不可达），远端状态未知。改动已本地提交，交人工 push（ADR-0061）" >&2
+    return 1
   fi
   if git push origin main >/tmp/newsagg-push.out 2>&1; then
     echo "已推送 origin/main"
@@ -269,8 +291,7 @@ PY
     # 中止了，而手工重试**立刻**成功。网络抖动不是「工作区不干净」——
     # 把它判成后者，会让系统在最平常的失败上停工（ADR-0048）。
     # 只对传输层错误重试；认证失败/仓库不存在/无权限重试无益，直接报。
-    if [[ "$attempt" -lt "$max" ]] && grep -qiE \
-      'RPC 失败|HTTP2 framing|Could not resolve host|Connection reset|Connection timed out|early EOF|The remote end hung up'; then
+    if [[ "$attempt" -lt "$max" ]] && grep -qiE "$NET_ERR_RE"; then
       echo "拉取遇到传输层错误（第 ${attempt} 次），2 秒后重试……" >&2
       echo "  $(echo "$detail" | head -2 | tr '\n' ' ')" >&2
       attempt=$((attempt + 1))
@@ -298,6 +319,27 @@ ${dirty}
 处置：先 commit 或确认可丢弃后 checkout。无人值守时不自行提交——
 ADR-0018：人的改动优先，系统不得替人决定提交什么。"
     fi
+  fi
+
+  # 走到这里说明重试已耗尽。分两种，处置完全不同：
+  #
+  # ① 网络不可达：本地状态是自洽的，只是没拿到远端的最新改动。这种情况下
+  #    停掉整天是错的——2026-10-25 实测，本机代理节点挂掉，github.com 直连
+  #    超时、走代理 LibreSSL SSL_ERROR_SYSCALL，而国内站点（百度、头条）全部
+  #    200。采集、分拣、写作、发布没有一步需要 github，唯一需要它的是
+  #    同步你那边的编辑。为了一次代理抖动丢掉整天的产出，代价与收益完全不成比例。
+  #    所以：降级继续，用本地状态跑完，收尾不 push（我们不知道远端有没有新提交，
+  #    盲目 push 可能被拒、也可能把本地 rebase 到一半的状态推上去）。
+  #
+  # ② 其余（工作区脏、认证失败、仓库不存在、无权限）：这些要么需要人动手，
+  #    要么继续跑也没有意义，保持熔断。
+  if grep -qiE "$NET_ERR_RE" "$err"; then
+    PULL_DEGRADED=1
+    DEGRADED_NOTE="① 未能从远端同步（网络不可达，已重试 $((attempt - 1)) 次）：本轮用本地状态跑完，收尾未 push。远端若在你的机器上有新提交，本轮看不到它们——风格与教学副本可能是旧的。"
+    printf '\n[!] ① 远端不可达（已重试 %s 次）→ 降级继续，收尾不 push\n' "$((attempt - 1))" >&2
+    printf '    原因：%s\n' "$(echo "$detail" | head -2 | tr '\n' ' ')" >&2
+    printf '    这不熔断：采集/分拣/写作/发布都不需要 github（ADR-0061）\n' >&2
+    return 0
   fi
 
   fail_soft "git_pull" "拉取失败（已重试 $((attempt - 1)) 次；非冲突，见 detail）" "$detail" 0
@@ -650,11 +692,15 @@ else
 fi
 
 log "⑦⑧ 简报与同步"
-write_status 1 "complete" "运行完成" "slug=${SLUG} mode=${MODE}"
+write_status 1 "complete" "运行完成" "slug=${SLUG} mode=${MODE}" "$DEGRADED_NOTE"
 brief_now
 if ! sync_push "发布 ${SLUG}（${MODE}）"; then
-  printf '\n> ⚠ 本次运行结束时 push 失败：产出仍留在本地，未同步到远端。看守会因此告警。\n' >> "$BRIEF"
-  sync_push "push 重试" || true
+  if [[ "${PULL_DEGRADED:-0}" == "1" ]]; then
+    printf '\n> ⚠ 本轮**未 push**（设计如此）：未能从远端同步，远端状态未知。产出已本地提交，\n> 有网络后手动 `git push origin main` 一次即可。\n' >> "$BRIEF"
+  else
+    printf '\n> ⚠ 本次运行结束时 push 失败：产出仍留在本地，未同步到远端。看守会因此告警。\n' >> "$BRIEF"
+    sync_push "push 重试" || true
+  fi
 fi
 
 echo

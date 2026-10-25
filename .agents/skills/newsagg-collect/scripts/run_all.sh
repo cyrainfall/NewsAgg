@@ -280,6 +280,26 @@ PY
     break
   done
 
+  # 「您有未暂存的变更」与上面那批错误不是一回事：它意味着**本地有没提交的
+  # 改动**，而这在生产形态里几乎总是「上一轮运行没跑完」或「有人正在改」。
+  # git 只输出一行英文，不说是哪些文件脏；无人值守时没人能去翻工作区，
+  # 所以这里把脏文件清单补进 detail——否则每次只看到
+  # 「error: cannot pull with rebase」，不知道该 commit 还是该 stash。
+  # 2026-10-25 实测：15:05 那次失败就是这样，我为了修每日 1 篇硬闸而改了
+  # publish.py/brief.py 但还没提交，run_all 的 git_pull 撞上未暂存的变更。
+  if grep -q 'unstaged changes' "$err"; then
+    local dirty
+    dirty="$(git status --porcelain | head -20 | sed 's/^/    /')"
+    if [[ -n "$dirty" ]]; then
+      detail="${detail}
+
+工作区有未提交的改动（前 20 项）：
+${dirty}
+处置：先 commit 或确认可丢弃后 checkout。无人值守时不自行提交——
+ADR-0018：人的改动优先，系统不得替人决定提交什么。"
+    fi
+  fi
+
   fail_soft "git_pull" "拉取失败（已重试 $((attempt - 1)) 次；非冲突，见 detail）" "$detail" 0
 }
 

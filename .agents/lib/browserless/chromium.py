@@ -113,6 +113,27 @@ class Cookie:
         """去掉前导点，便于做后缀匹配。"""
         return self.domain.lstrip(".")
 
+    @property
+    def expires_at(self) -> float:
+        """过期时刻（Unix 秒）。0 = 会话 cookie（浏览器退出即失效）。
+
+        ## 为什么要做这个换算
+
+        Chrome 的 cookie 库把过期时间存成 **WebKit 纪元（1601-01-01）
+        起的微秒数**（`expires_utc` 列）。直接 `datetime.fromtimestamp(那个数)`
+        会得到「年份 425885148」这种荒谬结果——第一次尝试时就是这个报错
+        才让我发现单位不对。
+
+        换算：Unix 纪元与 WebKit 纪元相差 11644473600 秒。
+
+        之前 `to_dict()` **完全没有导出这个字段**，于是导出的 cookie 文件
+        不带任何有效期信息——「这份 cookie 什么时候过期」在服务器上无从
+        得知，ADR-0071 残余风险 69 说的「每月提醒续期」也就无从实现。
+        """
+        if not self.expires_utc:
+            return 0.0
+        return self.expires_utc / 1_000_000.0 - 11644473600.0
+
     def to_dict(self) -> dict:
         return {
             "domain": self.domain,
@@ -121,6 +142,8 @@ class Cookie:
             "path": self.path,
             "secure": self.secure,
             "http_only": self.http_only,
+            # 0 = 会话 cookie（没有明确过期时间）
+            "expires_at": int(self.expires_at),
         }
 
 

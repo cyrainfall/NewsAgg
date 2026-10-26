@@ -46,6 +46,11 @@ ADR-0047 的泄漏判据在 api 路径下会失效。
 导出：`python3 scripts/export-cookies.py --browser chrome --out <path>`。
 cookie 主体约 23 天有效，**每月要重新导出一次**。
 
+**快过期会报出来（ADR-0072）**：每次读表现数据都检查注入文件的
+`earliest_expires_at`，不足 7 天记 `cookie_expiry.level = "expiring"`、
+已过期记 `"expired"`，简报第⑤段会打印重新导出的命令。
+没有注入文件（本机直读 Chrome）时不报——那里 cookie 由浏览器管。
+
 api 后端失败会**自动回落浏览器后端**并记 `fallback: "browser"`。
 
 

@@ -750,6 +750,27 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
             if st.get("lock_timeout"):
                 out += ["  等待浏览器锁超时——检查是否有残留的锁文件或并发进程（ADR-0030）。", ""]
 
+        # 注入的 cookie 快过期（ADR-0071 残余风险 69）。
+        #
+        # 为什么这一段值得单独存在：cookie 过期的症状是「纯 HTTP 全部 401，
+        # 浏览器后端还好」——那个现象看起来像代码坏了，不像凭证过期，
+        # 于是会去查代码而不是查证书。而过期**之前**是唯一能从容处理的时候。
+        #
+        # 判据在 performance 那边算（那里知道 cookie 文件在哪、有没有过期时间），
+        # 这里只负责呈现——同 ADR-0021 的分工：算在产生数据的地方，说在简报里。
+        _ck = (status or {}).get("cookie_expiry") or {}
+        if _ck.get("level") in ("expiring", "expired"):
+            any_item = True
+            out += [f"**注入的 cookie {_ck.get('level') == 'expired' and '已过期' or '快过期'}**"
+                    f"（ADR-0071）：{_ck.get('message')}",
+                    "  纯 HTTP 链路（表现数据、登录预检、反查）依赖它。",
+                    "  重新导出：",
+                    "    python3 scripts/export-cookies.py --browser chrome "
+                    "--out .newsagg/toutiao-cookies.json",
+                    "    scp .newsagg/toutiao-cookies.json <服务器>:/root/.newsagg/toutiao-cookies.json",
+                    "    ssh <服务器> 'chmod 600 /root/.newsagg/toutiao-cookies.json'",
+                    ""]
+
     if not any_item:
         out += ["无。", ""]
     return out

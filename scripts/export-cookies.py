@@ -76,11 +76,18 @@ def main(argv: list[str] | None = None) -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    dated = [(c["name"], c.get("expires_at") or 0) for c in cookies if c.get("expires_at")]
     payload = {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "browser": args.browser,
         "domains": domains,
         "count": len(cookies),
+        # 顶层也记一份最早/最晚过期时间：服务器上的简报要读这个，
+        # 不该去逐条遍历 cookies 数组（ADR-0071 残余风险 69）。
+        "earliest_expires_at": int(min((e for _, e in dated), default=0)),
+        "latest_expires_at": int(max((e for _, e in dated), default=0)),
+        "session_cookie_count": sum(1 for c in cookies if not c.get("expires_at")),
         "cookies": cookies,
     }
     # 先写再 chmod：这样中途失败不会留下一个 0644 的半成品。
@@ -91,6 +98,33 @@ def main(argv: list[str] | None = None) -> int:
     print(f"已导出 {len(cookies)} 条 cookie → {out}")
     print(f"权限 {oct(out.stat().st_mode & 0o777)}")
     print("域：" + "、".join(sorted({c["domain"] for c in cookies})))
+
+    # ── 有效期摘要（ADR-0071 残余风险 69）──────────────────────────
+    #
+    # 这份文件会被 scp 到服务器、存上几周然后没人再看它。如果它在到期后
+    # 才被发现过期，症状是「某天起纯 HTTP 全部 401，而浏览器后端还好」——
+    # 那个现象看起来像代码坏了，不像凭证过期。所以有效期必须**写进文件**
+    # 并且**在导出时就报出来**。
+    now = datetime.now(timezone.utc).timestamp()
+    dated = [(c["name"], c["expires_at"]) for c in cookies if c.get("expires_at")]
+    sessions = [c for c in cookies if not c.get("expires_at")]
+    if dated:
+        soonest = min(exp for _, exp in dated)
+        days = (soonest - now) / 86400
+        latest = max(exp for _, exp in dated)
+        print(f"最早到期：{datetime.fromtimestamp(soonest, timezone.utc):%Y-%m-%d}"
+              f"（约 {days:.0f} 天后）｜最晚到期：{datetime.fromtimestamp(latest, timezone.utc):%Y-%m-%d}")
+    if sessions:
+        print(f"注意：{len(sessions)} 条是会话 cookie（无过期时间），浏览器退出后可能失效："
+              + "、".join(c["name"] for c in sessions))
+    if dated and soonest <= now:
+        print("⚠️ 已经有 cookie 过期了——先在浏览器里重新登录 mp.toutiao.com 再导出。",
+              file=sys.stderr)
+        return 1
+    if dated and days < 7:
+        print(f"⚠️ 最早的 cookie 只剩 {days:.0f} 天——尽快重新导出并替换服务器上的旧文件。",
+              file=sys.stderr)
+
     print("提醒：这是账号凭证，用 scp 传，不要进 git。")
     return 0
 

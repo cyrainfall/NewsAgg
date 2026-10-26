@@ -170,5 +170,185 @@ class TestPerformanceCookieFileEnv(unittest.TestCase):
                         src.index("Client.from_browser()"))
 
 
+class TestCookieExpiry(unittest.TestCase):
+    """cookie 的过期时间必须能一路带到服务器上（ADR-0071 残余风险 69）。
+
+    ## 背景
+
+    Chrome 把 cookie 的过期时间存成 **WebKit 纪元（1601-01-01）起的微秒数**。
+    直接 `datetime.fromtimestamp(那个数)` 会得到「年份 425885148」——
+    这个荒谬的报错正是发现单位不对的契机。
+
+    更严重的是：`Cookie.to_dict()` **原本完全不导出过期时间**，于是导出的
+    cookie 文件不带任何有效期信息，服务器上无从知道它什么时候过期。
+    后果是 cookie 过期只有症状没有预告：症状是「纯 HTTP 全部 401、浏览器
+    后端还好」，那个现象看起来像代码坏了，不像凭证过期。
+
+    所以这一组测试钉住三件事：单位换算对、导出带得上、注入读得回。
+    """
+
+    def test_webkit_epoch_converts_to_unix_seconds(self):
+        from browserless.chromium import Cookie
+        # 2026-11-19 00:00:00 UTC 的 WebKit 微秒数
+        target_unix = 1794432000
+        webkit = (target_unix + 11644473600) * 1_000_000
+        c = Cookie(domain=".toutiao.com", name="sessionid", value="x",
+                   expires_utc=webkit)
+        self.assertAlmostEqual(c.expires_at, target_unix, delta=1)
+
+    def test_session_cookie_has_no_expiry(self):
+        from browserless.chromium import Cookie
+        c = Cookie(domain=".toutiao.com", name="x", value="y", expires_utc=0)
+        self.assertEqual(c.expires_at, 0.0)
+
+    def test_to_dict_carries_expiry(self):
+        from browserless.chromium import Cookie
+        target_unix = 1794432000
+        webkit = (target_unix + 11644473600) * 1_000_000
+        d = Cookie(domain=".toutiao.com", name="sessionid", value="x",
+                   expires_utc=webkit).to_dict()
+        self.assertIn("expires_at", d)
+        self.assertEqual(d["expires_at"], target_unix)
+
+    def test_expiry_survives_export_import_roundtrip(self):
+        """导出 → 注入回来，过期时间必须一样。"""
+        from browserless.chromium import Cookie
+        target_unix = 1794432000
+        webkit = (target_unix + 11644473600) * 1_000_000
+        original = Cookie(domain=".toutiao.com", name="sessionid", value="abc",
+                           path="/", secure=True, http_only=True,
+                           expires_utc=webkit)
+        fd, name = tempfile.mkstemp(prefix="cookie-", suffix=".json")
+        os.close(fd)
+        p = Path(name)
+        p.write_text(json.dumps({"cookies": [original.to_dict()]}), encoding="utf-8")
+        os.chmod(p, 0o600)
+        try:
+            sess = Session.from_cookie_file(p)
+            got = sess.jar.get("sessionid", domain="toutiao.com")
+            self.assertEqual(got, "abc")
+            restored = sess.jar.cookies[0]
+            self.assertAlmostEqual(restored.expires_at, target_unix, delta=1)
+        finally:
+            p.unlink()
+
+    def test_old_file_without_expiry_still_loads(self):
+        """旧格式（没有 expires_at）不能因此加载失败——向后兼容。"""
+        fd, name = tempfile.mkstemp(prefix="cookie-", suffix=".json")
+        os.close(fd)
+        p = Path(name)
+        p.write_text(json.dumps({"cookies": [
+            {"domain": ".toutiao.com", "name": "sessionid", "value": "abc"},
+        ]}), encoding="utf-8")
+        os.chmod(p, 0o600)
+        try:
+            sess = Session.from_cookie_file(p)
+            self.assertEqual(sess.jar.header("www.toutiao.com"), "sessionid=abc")
+            self.assertEqual(sess.jar.cookies[0].expires_utc, 0)
+        finally:
+            p.unlink()
+
+
+class TestCookieExpiryWarning(unittest.TestCase):
+    """表现层要能提前说出「cookie 快过期了」（ADR-0071 残余风险 69）。"""
+
+    def _perf(self):
+        import importlib.util
+        p = REPO / ".agents/skills/newsagg-performance/scripts/performance.py"
+        spec = importlib.util.spec_from_file_location("perf_mod_expiry", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _write(self, payload) -> Path:
+        fd, name = tempfile.mkstemp(prefix="cookie-", suffix=".json")
+        os.close(fd)
+        p = Path(name)
+        p.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(p, 0o600)
+        return p
+
+    def test_no_cookie_file_means_no_warning(self):
+        """本机直读 Chrome 的场景不该被提醒——那里没有「注入文件」可过期。"""
+        mod = self._perf()
+        old = os.environ.pop("NEWSAGG_COOKIE_FILE", None)
+        try:
+            self.assertEqual(mod.cookie_expiry_warning(), {})
+        finally:
+            if old is not None:
+                os.environ["NEWSAGG_COOKIE_FILE"] = old
+
+    def test_expiring_cookie_is_flagged(self):
+        import time
+        mod = self._perf()
+        p = self._write({"earliest_expires_at": int(time.time()) + 3 * 86400,
+                         "cookies": []})
+        old = os.environ.get("NEWSAGG_COOKIE_FILE")
+        os.environ["NEWSAGG_COOKIE_FILE"] = str(p)
+        try:
+            info = mod.cookie_expiry_warning()
+            self.assertEqual(info["level"], "expiring")
+            self.assertLess(info["days_left"], 7)
+            self.assertIn("重新导出", info["message"])
+        finally:
+            if old is None:
+                os.environ.pop("NEWSAGG_COOKIE_FILE", None)
+            else:
+                os.environ["NEWSAGG_COOKIE_FILE"] = old
+            p.unlink()
+
+    def test_expired_cookie_is_flagged(self):
+        import time
+        mod = self._perf()
+        p = self._write({"earliest_expires_at": int(time.time()) - 86400,
+                         "cookies": []})
+        old = os.environ.get("NEWSAGG_COOKIE_FILE")
+        os.environ["NEWSAGG_COOKIE_FILE"] = str(p)
+        try:
+            info = mod.cookie_expiry_warning()
+            self.assertEqual(info["level"], "expired")
+            self.assertIn("过期", info["message"])
+        finally:
+            if old is None:
+                os.environ.pop("NEWSAGG_COOKIE_FILE", None)
+            else:
+                os.environ["NEWSAGG_COOKIE_FILE"] = old
+            p.unlink()
+
+    def test_fresh_cookie_is_not_flagged(self):
+        import time
+        mod = self._perf()
+        p = self._write({"earliest_expires_at": int(time.time()) + 30 * 86400,
+                         "cookies": []})
+        old = os.environ.get("NEWSAGG_COOKIE_FILE")
+        os.environ["NEWSAGG_COOKIE_FILE"] = str(p)
+        try:
+            self.assertEqual(mod.cookie_expiry_warning()["level"], "ok")
+        finally:
+            if old is None:
+                os.environ.pop("NEWSAGG_COOKIE_FILE", None)
+            else:
+                os.environ["NEWSAGG_COOKIE_FILE"] = old
+            p.unlink()
+
+    def test_brief_renders_the_warning(self):
+        """简报第⑤段必须把这件事说出来——不然等于没提醒。"""
+        import importlib.util
+        p = REPO / ".agents/skills/newsagg-brief/scripts/brief.py"
+        spec = importlib.util.spec_from_file_location("brief_mod_expiry", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        lines = mod.section_actions(
+            [], {}, {}, None, None,
+            perf={"status": {"ok": True, "cookie_expiry": {
+                "level": "expiring", "days_left": 3.0,
+                "message": "注入的 cookie 还有 3 天过期（2026-10-30）。"}}},
+        )
+        text = "\n".join(lines)
+        self.assertIn("cookie", text)
+        self.assertIn("快过期", text)
+        self.assertIn("export-cookies.py", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -197,6 +197,11 @@ class Session:
                 path=str(item.get("path") or "/"),
                 secure=bool(item.get("secure")),
                 http_only=bool(item.get("http_only")),
+                # 导出文件里的 `expires_at` 是 Unix 秒（ADR-0071 之后才有的
+                # 字段），这里换回 Cookie 内部用的 WebKit 微秒，保持同一套
+                # 表示。旧文件没有这个字段 → 0 = 会话 cookie。
+                expires_utc=(int(item.get("expires_at") or 0) + 11644473600) * 1_000_000
+                if item.get("expires_at") else 0,
             ))
         if not cookies:
             raise CookieError(f"cookie 文件 {p} 里没有一条可用的 cookie")

@@ -121,6 +121,66 @@ def _api_client(account: str):
     return mod, mod.Client.from_browser()
 
 
+def cookie_expiry_warning() -> dict:
+    """注入的 cookie 快过期了吗（ADR-0071 残余风险 69）。
+
+    ## 为什么要有这个函数
+
+    服务器上的纯 HTTP 链路依赖一份注入的 cookie 文件。那份文件的有效期
+    在**导出时**就被丢掉了——`Cookie.to_dict()` 原本不导出过期时间，Chrome
+    存的是 WebKit 纪元（1601 起）的微秒数，混用单位会得到「年份 425885148」
+    这种荒谬值。
+
+    后果是：cookie 过期这件事，**只有症状没有预告**。症状是「某天起纯 HTTP
+    全部 401，而浏览器后端还好」——那个现象看起来像代码坏了，不像凭证过期，
+    于是会去查代码，查半天。
+
+    所以这里做两件事：
+    1. 导出时把过期时间**写进文件**（`expires_at`，Unix 秒）——修的是源头。
+    2. 每次读表现数据时检查一次，**快过期就报出来**——修的是「没人提醒」。
+
+    ## 为什么用「快过期」而不是「已过期」
+
+    已过期时请求会直接失败，那种情况走 api 失败 → 回落浏览器后端就够了。
+    真正需要提前说的是「还有 3 天就过期了」——那是唯一还能从容处理的时候。
+
+    没有 cookie 文件时返回空 dict：那是本机直读 Chrome 的场景，cookie 由
+    浏览器自己管，不该在这里提醒。
+    """
+    path = os.environ.get("NEWSAGG_COOKIE_FILE", "").strip()
+    if not path:
+        return {}
+    p = Path(path)
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # 读不出来不由这里判：加载时已经报过更具体的错。
+        return {}
+    earliest = int(payload.get("earliest_expires_at") or 0)
+    if not earliest:
+        return {}
+    now_ts = datetime.now(CST).timestamp()
+    days = (earliest - now_ts) / 86400.0
+    info = {
+        "cookie_file": p.name,
+        "earliest_expires_at": earliest,
+        "earliest_expires_date": datetime.fromtimestamp(earliest, CST).strftime("%Y-%m-%d"),
+        "days_left": round(days, 1),
+    }
+    if days < 0:
+        info["level"] = "expired"
+        info["message"] = (f"注入的 cookie 已于 {info['earliest_expires_date']} 过期"
+                           f"（{abs(days):.0f} 天前）。纯 HTTP 链路会全部失败，"
+                           f"请在本机重新登录并重新导出。")
+    elif days < 7:
+        info["level"] = "expiring"
+        info["message"] = (f"注入的 cookie 还有 {days:.0f} 天过期（{info['earliest_expires_date']}）。"
+                           f"请在本机重新导出并替换服务器上的文件。")
+    else:
+        info["level"] = "ok"
+    return info
+
+
 def read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -1080,6 +1140,10 @@ def main() -> int:
             "store": str(store_path.relative_to(root)),
             "fetch": fetch_meta,
             "detail": detail_meta,
+            # ADR-0071 残余风险 69：注入的 cookie 快过期时，简报要提醒。
+            # 判据是「还有几天」，不是「今天有没有失败」——过期前是唯一
+            # 能从容处理的时候。
+            "cookie_expiry": cookie_expiry_warning(),
         })
 
     skip, skip_why = is_skip_day(freq, today)
@@ -1097,6 +1161,7 @@ def main() -> int:
         "updated_records": len(updated_records),
         "dry_run": args.dry_run,
         "verdict": verdict,
+        "cookie_expiry": cookie_expiry_warning(),
         "frequency": {"downshifted": bool(freq.get("downshifted")), "since": freq.get("since"),
                       "today_is_skip_day": skip, "why": skip_why},
         "articles": [{"slug": a.get("slug"), "title": a.get("title"), "ours": a["ours"],

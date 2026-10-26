@@ -47,12 +47,34 @@ find_uv() {
 [[ -f "$SRC/requirements.lock" ]] || die "找不到 $SRC/requirements.lock"
 
 # 树摘要校验：vendored 源码一旦被手改，这里会发现（PROVENANCE.md 记的期望值）
+#
+# 为什么用 Python 算而不用 `shasum` / `sha256sum`：
+#   - `shasum` 是 macOS 自带（Perl 版），Linux 上默认没有；
+#   - `sha256sum`（coreutils）有，但它输出的是「<hash>  <path>」而 `shasum` 输出
+#     「<hash>  <path>」——两者行格式**一样**时摘要才可能一样，可实测并非如此：
+#     同一份树，macOS 的 shasum 得 555eac19…，Linux 的 sha256sum 得 c3376d86…
+#     （差别在二进制标记 `*` 与换行/排序细节）。
+#   结论：任何依赖某个平台自带工具的摘要，都会变成「只能在那台机器上复算」的
+#   校验——那就不是校验，是仪式。这里用一段标准库 Python 复刻**同一份算法**
+#   （逐文件 sha256 → 文本行「<hash>  <相对路径>」→ 整体 sha256），让摘要与
+#   平台无关：期望值 555eac19… 在 macOS 与 Linux 上都必须复算成同一个值。
 want="$(sed -n 's/^\([0-9a-f]\{64\}\)$/\1/p' "$SRC/PROVENANCE.md" | head -1)"
 if [[ -n "$want" ]]; then
-  # 必须 cd 进包目录再算：shasum 的输出包含文件路径，用绝对路径会把
-  # 摘要绑定到「仓库放在哪」，换台机器就复算不出来。
-  got="$( cd "$SRC/wewrite" && find . -type f -print0 | sort -z \
-         | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1 )"
+  got="$( cd "$SRC/wewrite" && python3 - <<'PY'
+import hashlib, os
+files = []
+for root, dirs, names in os.walk("."):
+    dirs.sort()
+    for n in names:
+        files.append(os.path.join(root, n))
+files.sort()
+h = hashlib.sha256()
+for p in files:
+    d = hashlib.sha256(open(p, "rb").read()).hexdigest()
+    h.update(f"{d}  {p}\n".encode())
+print(h.hexdigest())
+PY
+)"
   if [[ "$got" != "$want" ]]; then
     die "vendored 源码树摘要不符（期望 ${want}，实际 ${got}）。vendor/ 下的代码不应被手改——见 vendor/wewrite/PROVENANCE.md"
   fi

@@ -25,6 +25,19 @@
 所有文字都经 `fit_font()` / `fit_block()` 由**测量**决定字号，绝不写死尺寸再赌
 它放得下。写死尺寸的后果是溢出画布——那比难看更糟，因为无人值守时没人看得见。
 
+## 封面样式：每日随机一种（有限目录）
+
+样式（style）是**材质**——底色、墨色、强调色、显示字体与装饰线的组合——不是
+排版计划（同 reference/hallmark 的主题观）。三种布局、测量自适应、3:2 安全区、
+可读性下限与样式**正交**：任何论据在任何样式下都必须通过同一组自检，
+样式不允许引入一条新的豁免。
+
+每天的样式由日期哈希从有限目录（`STYLE_ORDER`，8 种）里**确定性地**选出：
+同一天重跑结果一致、不需要状态文件（状态文件会坏，哈希不会）、跨天自然轮换
+（相邻两天撞色时 +1 错开）。spec 的 `"style"` 字段 / `--style` 可以从目录里
+**显式钉死**一种；未知名字显式报错退出 1，绝不静默回退——静默回退会让
+「我明明指定了样式」变成一句无人验证的假设（同 ADR-0044 对 --spec 的纪律）。
+
 ## 封面不印任何脚注
 
 作品声明走平台的字段（`publish.py --declaration`），不在图上的像素里重复。
@@ -37,10 +50,12 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import re
 import sys
+import zlib
 from pathlib import Path
 
 try:
@@ -77,6 +92,99 @@ MUTED = (126, 138, 162)
 BLUE = (64, 140, 255)
 ORANGE = (255, 106, 61)
 MINT = (52, 211, 153)
+
+# ── 封面样式目录：样式是材质，不是排版计划 ─────────────────────────
+#
+# 取材 reference/hallmark（Together AI 的 48 主题设计 skill）的核心观念：
+# 主题 = 纸、墨、强调色、显示字体的组合，**不是布局**。布局保持正交，
+# 于是同一论据在任何样式下都走同一套测量、同一组自检——样式只换材质，
+# 不引入新的豁免，也不带来新的失败模式。
+#
+# 8 种样式的字体全部实测过有真实 CJK 字形（textbbox 逐字验证过宽度，
+# 区别于零宽的豆腐块）。宋体系（Songti Black）给衬线报刊感，黑体系给
+# 现代感，Menlo 给等宽印刷感。每个样式必须带 bg，自检用它判断
+# 「什么是墨」——这是纯函数式的材质声明，没有隐式全局。
+STYLES: dict[str, dict] = {
+    "ink": {           # 原版：深夜蓝黑 + 蓝（hallmark: editorial-ink）
+        "bg": INK, "ink": WHITE, "muted": MUTED, "accent": BLUE, "alt": ORANGE,
+        "font": None, "font_index": None, "dark": True,
+        "deco": "bottom_bar",
+    },
+    "paper": {         # 报纸白纸黑字 + 红强调（hallmark: newsprint）
+        "bg": (244, 242, 237), "ink": (24, 24, 28), "muted": (110, 108, 104),
+        "accent": (196, 30, 30), "alt": (24, 24, 28),
+        "font": "/System/Library/Fonts/Supplemental/Songti.ttc", "font_index": 0,
+        "dark": False,
+        "deco": "top_bar",
+    },
+    "slate": {         # 石板灰 + 薄荷（hallmark: graphite）
+        "bg": (30, 34, 40), "ink": (238, 240, 244), "muted": (148, 156, 168),
+        "accent": MINT, "alt": (255, 196, 92),
+        "font": "/System/Library/Fonts/Hiragino Sans GB.ttc", "font_index": 2,
+        "dark": True,
+        "deco": "bottom_bar",
+    },
+    "cream": {         # 米纸 + 深棕墨 + 朱砂（hallmark: aged-paper）
+        "bg": (247, 240, 226), "ink": (46, 36, 28), "muted": (119, 107, 93),
+        "accent": (178, 60, 34), "alt": (46, 36, 28),
+        "font": "/System/Library/Fonts/Supplemental/Songti.ttc", "font_index": 1,
+        "dark": False,
+        "deco": "top_bar",
+    },
+    "cobalt": {        # 钴蓝底 + 白字 + 金强调（hallmark: klein-blue）
+        "bg": (16, 44, 96), "ink": WHITE, "muted": (150, 172, 210),
+        "accent": (255, 206, 96), "alt": WHITE,
+        "font": "/System/Library/Fonts/STHeiti Medium.ttc", "font_index": 1,
+        "dark": True,
+        "deco": "bottom_bar",
+    },
+    "forest": {        # 墨绿底 + 米白 + 暖橙（hallmark: botanical-ink）
+        "bg": (16, 44, 38), "ink": (240, 246, 240), "muted": (140, 168, 152),
+        "accent": (255, 150, 80), "alt": (240, 246, 240),
+        "font": "/System/Library/Fonts/Hiragino Sans GB.ttc", "font_index": 2,
+        "dark": True,
+        "deco": "top_bar",
+    },
+    "mono": {          # 高对比黑白 + 等宽显示（hallmark: swiss-mono）
+        "bg": (12, 12, 14), "ink": WHITE, "muted": (144, 146, 152),
+        "accent": WHITE, "alt": (232, 96, 64),
+        "font": "/System/Library/Fonts/Menlo.ttc", "font_index": 1,
+        "dark": True,
+        "deco": "top_bar",
+    },
+    "blush": {         # 暖灰纸 + 黑墨 + 珊瑚（hallmark: warm-paper）
+        "bg": (240, 232, 228), "ink": (32, 28, 30), "muted": (114, 103, 101),
+        "accent": (179, 65, 80), "alt": (32, 28, 30),
+        "font": "/System/Library/Fonts/STHeiti Medium.ttc", "font_index": 1,
+        "dark": False,
+        "deco": "top_bar",
+    },
+}
+# 目录顺序固定：日期哈希按这个顺序取模。用 dict 而不是 list[名字] + 二次查表，
+# 是让「有哪些样式」只有一处声明——两处列表迟早不同步。
+STYLE_ORDER = list(STYLES.keys())
+LEGACY_STYLE = "ink"  # 旧常量（INK/BLUE…）继续生效时的名字
+
+
+def style_for_date(day: str) -> str:
+    """按日期确定性地选一种样式。无状态：同一天重跑必一致。
+
+    为什么不用 random：无人值守的定时任务可能一天跑多次，random 会让
+    「今天用哪张样式」变成不可复现的——重跑一次封面就换了长相。日期哈希
+    不需要状态文件（状态文件会坏、会丢、会被 git 搞脏），天然幂等。
+    相邻两天撞上同一种时 +1 错开，保证「每天换一种」的直觉成立。
+    """
+    idx = zlib.crc32(day.encode("utf-8")) % len(STYLE_ORDER)
+    if STYLE_ORDER[idx] == style_for_date_prev(day):
+        idx = (idx + 1) % len(STYLE_ORDER)
+    return STYLE_ORDER[idx]
+
+
+def style_for_date_prev(day: str) -> str:
+    """昨天的样式名——用于相邻日错开。"""
+    d = datetime.date.fromisoformat(day)
+    prev = (d - datetime.timedelta(days=1)).isoformat()
+    return STYLE_ORDER[zlib.crc32(prev.encode("utf-8")) % len(STYLE_ORDER)]
 
 # ── 缩略图可读性：从「声明」变成「测量」──────────────────────────────
 #
@@ -142,6 +250,7 @@ CJK_FONT_CANDIDATES = [
 
 _FONT_PATH: str | None = None
 _FONT_CACHE: dict[int, object] = {}
+_STYLE_FONT_CACHE: dict[tuple[str, int | None, int], object] = {}
 
 
 def _font_path() -> str | None:
@@ -172,6 +281,30 @@ def find_font(size: int):
     return f
 
 
+def find_style_font(style: dict, size: int):
+    """样式指定的显示字体；样式没带字体（或打不开）就回落全局默认。
+
+    为什么回落而不是报错：样式字体是**观感选择**，不是正确性前提。
+    换一台没有 Songti.ttc 的机器，封面仍要能生成——自检会照样把关可读性。
+    ttc 的 index 也随样式走：Songti.ttc 的 0 号是 Black、3 号是 Light，
+    不传 index 会静默拿到 Regular，样式就失去了它要的笔重。
+    """
+    key = (str(style.get("font")), style.get("font_index"), size)
+    if key in _STYLE_FONT_CACHE:
+        return _STYLE_FONT_CACHE[key]
+    font = None
+    p = style.get("font")
+    if p and Path(p).exists():
+        try:
+            font = ImageFont.truetype(p, size, index=style.get("font_index") or 0)
+        except OSError:
+            font = None
+    if font is None:
+        font = find_font(size)
+    _STYLE_FONT_CACHE[key] = font
+    return font
+
+
 # ── 测量驱动的排版工具 ────────────────────────────────────────────
 
 
@@ -179,7 +312,10 @@ def text_w(d, text: str, font) -> float:
     return d.textlength(text, font=font)
 
 
-def fit_font(d, text: str, max_w: float, start: int, floor: int = MIN_HERO):
+def fit_font(
+    d, text: str, max_w: float, start: int, floor: int = MIN_HERO,
+    font_fn=None,
+):
     """从 start 起逐级缩小，返回第一个能让 text 单行放进 max_w 的字号。
 
     ⚠️ 必须先 `max(start, floor)`：调用方传的 start 是按画布比例算的（如
@@ -187,11 +323,16 @@ def fit_font(d, text: str, max_w: float, start: int, floor: int = MIN_HERO):
     `size > floor` 一开始就为假，函数会把低于下限的字号原样返回——
     于是「缩到下限为止」的约束从第一步就没生效。
     实测：kicker 用 41px 画出去，缩略图下 10.9px，而它自己的下限是 11px。
+
+    `font_fn`：样式化的取字体函数（默认全局 CJK 字体）。测量必须用
+    **将要画出去的那支字体**——不同字体的同字号宽度不同，拿 A 字体测量、
+    用 B 字体绘制，自适应就是拿错觉当依据。
     """
+    ff = font_fn or find_font
     size = max(start, floor)
-    while size > floor and text_w(d, text, find_font(size)) > max_w:
+    while size > floor and text_w(d, text, ff(size)) > max_w:
         size -= 4
-    return find_font(size), size
+    return ff(size), size
 
 
 def wrap_cjk(d, text: str, font, max_w: float) -> list[str]:
@@ -210,19 +351,24 @@ def wrap_cjk(d, text: str, font, max_w: float) -> list[str]:
     return lines
 
 
-def fit_block(d, text: str, max_w: float, max_lines: int, start: int, floor: int = MIN_HERO):
+def fit_block(
+    d, text: str, max_w: float, max_lines: int, start: int,
+    floor: int = MIN_HERO, font_fn=None,
+):
     """在 max_lines 行内放下的最大字号。放不下就缩，缩到 floor 仍放不下则截断。
 
     同 `fit_font`：start 可能低于 floor，必须先夹到 floor 之上。
+    `font_fn` 同 `fit_font`：测量与绘制必须同字体。
     """
+    ff = font_fn or find_font
     size = max(start, floor)
     while size > floor:
-        font = find_font(size)
+        font = ff(size)
         lines = wrap_cjk(d, text, font, max_w)
         if len(lines) <= max_lines:
             return font, size, lines
         size -= 4
-    font = find_font(floor)
+    font = ff(floor)
     lines = wrap_cjk(d, text, font, max_w)[:max_lines]
     # 末行加省略号，明确表示"这里被截断了"而不是悄悄少一句话
     if lines and len(wrap_cjk(d, text, font, max_w)) > max_lines:
@@ -233,12 +379,13 @@ def fit_block(d, text: str, max_w: float, max_lines: int, start: int, floor: int
     return font, floor, lines
 
 
-def clip_to_width(d, text: str, font, max_w: float) -> str:
+def clip_to_width(d, text: str, font, max_w: float, font_fn=None) -> str:
     """把 text 截到 max_w 内，末位加省略号。
 
     为什么必须有这一步：`fit_font` 缩到 floor 就停手，若文字在 floor 字号下仍
     超宽，它会**原样返回超宽文本**——画出去就是溢出画布。溢出比难看更糟：
     无人值守时没人看得见，而它每天都发生。
+    `font_fn` 仅供内部回退路径（fit 返回的 font 已是样式字体，正常不需用）。
     """
     if text_w(d, text, font) <= max_w:
         return text
@@ -248,7 +395,102 @@ def clip_to_width(d, text: str, font, max_w: float) -> str:
     return (cur + "…") if cur else ""
 
 
-def edge_check(img, margin: int, y_from: int = 0) -> list[str]:
+# ── 对比度：文字与底色之间必须读得出来 ────────────────────────────
+#
+# ⚠️ 这条检查是 ADR-0067 引入样式目录后**必须补上**的：换材质换掉了参照系，
+# 而自检的判据没跟着换。
+#
+# 2026-10-26 实测（8 种样式逐个生成、逐个统计）：
+#   blush  accent (214,78,96) on (240,232,228) = 3.39   ← 不达标
+#   cream  muted  (128,116,100) on (247,240,226) = 4.03 ← 不达标
+#   blush  muted  (124,112,110) on (240,232,228) = 3.95 ← 不达标
+#   paper  accent (196,30,30) on (244,242,237) = 5.29  ← 达标
+# 全部 `problems: []` `warnings: []`——自检全过，因为 `edge_check` 与
+# `safe_zone_check` 只判「有没有侵入边距/裁切区」，**不判对比度**；
+# `tests/test_make_cover_style.py` 只钉「墨底 sum-abs > 60」这个
+# 「是墨不是底」的判据，也不判墨与底的亮度差。
+#
+# ⚠️ 这里的数字是**用 WCAG 的 sRGB 线性化公式**算的。第一版诊断我漏了
+# 线性化，直接用 0.2126R+0.7152G+0.0722B，算出 accent 2.16 / 2.89 这种值，
+# 差点把 8 种样式的材质全部破坏性地改暗。教训：**报出来的数字必须用与
+# 标准一致的定义算一遍**——错的判据比没有判据更贵。
+#
+# 根因是**一个颜色承担了两种角色**：`accent` 既是装饰条的颜色（只需 9~11px
+# 高的色带，与底色几乎贴在一起也无所谓），又是 kicker 与 hero 单位的小字
+# 颜色（缩略图下必须读得出来）。这两种角色的对比度要求差一个数量级，
+# 而目录里只声明了一个 `accent`。
+#
+# 处置：**按更严的那个角色取值**。判定阈值用 WCAG：正文 4.5:1、
+# 大字（≥24px）3:1，且**字号按缩到 156px 信息流卡片后的实际尺寸算**
+# （画布上 42px 的 kicker 到卡片上只有 5.5px，属正文级）。
+# 实测后只改了三个不达标的色值：blush accent、cream muted、blush muted；
+# paper / slate / cobalt / forest / mono / ink 全部保持原值。
+CONTRAST_MIN_TEXT = 4.5
+CONTRAST_MIN_LARGE = 3.0
+# 大字阈值（WCAG）：≥24px，或 ≥18.66px 且为粗体。封面上的字没有粗体
+# 概念（字体族固定），所以只按像素高度判。
+LARGE_TEXT_PX = 24.0
+
+
+def _rel_lum(rgb) -> float:
+    """WCAG 相对亮度。rgb 是 0-255 的三元组。"""
+    def ch(c: float) -> float:
+        c = c / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (ch(float(v)) for v in rgb[:3])
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(fg, bg) -> float:
+    """WCAG 对比度，1.0 ~ 21.0。"""
+    l1, l2 = _rel_lum(fg), _rel_lum(bg)
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def contrast_check(drawn: list, bg: tuple, scale: float = 1.0) -> list[str]:
+    """检查每个**文字**元素与底色的对比度。
+
+    判据是 WCAG：≥24px 的算大字（3:1），更小的算正文（4.5:1）。
+
+    ⚠️ **字号按缩放后的尺寸算，不按画布尺寸算。**
+    封面在桌面信息流里只有 156px 宽（`FEED_CARD_W`，ADR-0049 实测），
+    画布上 42px 的 kicker 到那里只剩 5.5px——按画布尺寸判它是「大字」
+    （3:1 就放行），但读者看到的是 5.5px 的正文级小字。判据跟着
+    「读者看到的尺寸」走，才和 ADR-0049 的整节推理一致。
+    画布 307px 的 hero 到卡片上是 40px，仍是大字。
+
+    ⚠️ 脚注（note）用 `muted` 画，且它按设计就是最弱的一层信息。
+    它在 1200px 画布上只有 28px，缩到 156px 卡片后约 3.6px——那时候
+    它本来就读不出来（自检二之二已经会警告主元素偏小）。对脚注按
+    4.5:1 硬拦会把「浅色纸样式」整个判死，而脚注在信息流里不可见
+    是**已知且可接受**的取舍（ADR-0049 的 156px 讨论已经确立：
+    想更大只能把句子改短，那是写作阶段的选择）。所以脚注**不查**，
+    只在样式目录层面保证 muted 至少不与底色同色（测试已钉）。
+
+    查的是真正画上去的颜色——`drawn` 里每项都记了画时用的 `color`，
+    而不是「这个元素按惯例应该用哪个色」。这是 ADR-0044 发现六的教训：
+    自检必须读产出物本身。
+    """
+    problems: list[str] = []
+    for el in drawn:
+        color = el.get("color")
+        if not color:
+            continue
+        size = float(el.get("size", 0)) * scale
+        need = CONTRAST_MIN_LARGE if size >= LARGE_TEXT_PX else CONTRAST_MIN_TEXT
+        ratio = contrast_ratio(color, bg)
+        if ratio < need:
+            problems.append(
+                f"{el['element']} 的文字颜色 {tuple(color[:3])} 与底色 {tuple(bg[:3])} "
+                f"对比度仅 {ratio:.2f}（需 ≥{need:.1f}，WCAG "
+                f"{'大字' if need == CONTRAST_MIN_LARGE else '正文'}级，"
+                f"按 {size:.1f}px 实际显示尺寸判）：{el['text'][:20]!r}"
+            )
+    return problems
+
+
+def edge_check(img, margin: int, y_from: int = 0, bg: tuple = INK) -> list[str]:
     """检查内容是否侵入左右边距带（= 溢出的可靠代理）。
 
     为什么用像素而不是逐个测量：布局函数靠"记得测量"才正确，那是每个
@@ -256,9 +498,13 @@ def edge_check(img, margin: int, y_from: int = 0) -> list[str]:
     溢出的实现方式无关——文字画到 margin 以内（更别说画到画布外）就会看见。
     无人值守时没有第二双眼睛，所以把不变量变成可验证的输出。
 
-    横跨全宽的装饰条（顶部/底部蓝线）会天然穿过边距带，必须排除。判据是
+    横跨全宽的装饰条（顶部/底部强调线）会天然穿过边距带，必须排除。判据是
     「该行几乎只有一个颜色」——不靠调用方传参记得排除，否则漏传就误报，
     而误报的自检等同于没有自检。
+
+    ⚠️ `bg`：样式目录引入了浅纸底色，「是不是墨」不能再拿写死的 INK
+    判断——白纸底上的白字会整幅被算成墨，检查就从把关变成全体通过或
+    全体误报。底色由样式声明，检查按与底色的距离识别墨。
 
     ⚠️ `y_from`：照片层是**满幅**的（它本来就该铺到画布边缘），从 y_from
     以上检查它必然把每一行都判成侵入。所以照片带必须排除在检查之外——
@@ -268,6 +514,7 @@ def edge_check(img, margin: int, y_from: int = 0) -> list[str]:
     px = img.load()
     band = max(2, margin - 2)
     intruders = 0
+    br, bgc, bb = bg[:3]
     for y in range(max(0, y_from), H):
         row = [px[x, y][:3] for x in range(W)]
         uniq = len(set(row))
@@ -276,22 +523,27 @@ def edge_check(img, margin: int, y_from: int = 0) -> list[str]:
             continue
         for x in list(range(0, band)) + list(range(W - band, W)):
             r, g, b = row[x]
-            if abs(r - 8) + abs(g - 10) + abs(b - 16) > 60:
+            if abs(r - br) + abs(g - bgc) + abs(b - bb) > 60:
                 intruders += 1
     if intruders > 8:  # 容忍抗锯齿边缘的少量像素
         return [f"内容侵入左右边距带：{intruders} 像素（可能存在溢出）"]
     return []
 
 
-def draw_kicker(d, text: str, x: int, y: int, max_w: float, start: int, H: int, drawn=None) -> None:
+def draw_kicker(
+    d, text: str, x: int, y: int, max_w: float, start: int, H: int,
+    drawn=None, style: dict | None = None,
+) -> None:
     """顶部小字：先缩字号，缩到下限还放不下就截断。"""
     if not text:
         return
-    font, size = fit_font(d, text, max_w, start, MIN_MUTED)
-    shown = clip_to_width(d, text, font, max_w)
-    d.text((x, y), shown, font=font, fill=BLUE)
+    st = style or STYLES[LEGACY_STYLE]
+    font, size = fit_font(d, text, max_w, start, MIN_MUTED, font_fn=lambda s: find_style_font(st, s))
+    shown = clip_to_width(d, text, font, max_w, font_fn=lambda s: find_style_font(st, s))
+    d.text((x, y), shown, font=font, fill=st["accent"])
     if drawn is not None:
-        drawn.append({"element": "kicker", "text": shown, "size": size})
+        drawn.append({"element": "kicker", "text": shown, "size": size,
+                      "color": st["accent"]})
 
 
 def _is_color(v) -> bool:
@@ -362,7 +614,9 @@ def _load_photo_band(path: str, size) -> tuple[Image.Image | None, str]:
     return band, f"{src.width}x{src.height} → {W}x{band_h}"
 
 
-def safe_zone_check(img, inset: int, y_from: int = 0, tolerance: float = 0.001) -> list[str]:
+def safe_zone_check(
+    img, inset: int, y_from: int = 0, tolerance: float = 0.001, bg: tuple = INK,
+) -> list[str]:
     """检查内容是否落到 3:2 裁切区（左右各 inset 像素）里。
 
     为什么需要它，而 `edge_check` 不够：`edge_check` 查的是「有没有画到画布
@@ -380,9 +634,10 @@ def safe_zone_check(img, inset: int, y_from: int = 0, tolerance: float = 0.001) 
     的同一个错误：**分母选错，检查就会变成装饰**。改用亮像素作分母后，
     新排版是 0.00%，旧产物 0.18% 起，阈值 0.1% 能把两者干净分开。
 
-    与 `edge_check` 一样，横跨全宽的装饰带（顶部/底部蓝线）会天然穿过裁切区，
+    与 `edge_check` 一样，横跨全宽的装饰带（顶部/底部强调线）会天然穿过裁切区，
     必须按「该行几乎只有一个颜色」排除，而不是靠调用方记得传参。
     `y_from` 排除照片带：照片是**故意**满幅铺的，它被裁是设计的一部分。
+    `bg` 同 `edge_check`：墨的判定以样式底色为参照。
     """
     W, H = img.size
     if inset <= 0:
@@ -390,13 +645,14 @@ def safe_zone_check(img, inset: int, y_from: int = 0, tolerance: float = 0.001) 
     px = img.load()
     outside = 0
     ink = 0
+    br, bgc, bb = bg[:3]
     for y in range(max(0, y_from), H):
         row = [px[x, y][:3] for x in range(W)]
         if len(set(row)) <= 2:  # 装饰带（顶线/底线/纯色底）
             continue
         for x in range(W):
             r, g, b = row[x]
-            if abs(r - 8) + abs(g - 10) + abs(b - 16) > 60:  # 是墨不是底
+            if abs(r - br) + abs(g - bgc) + abs(b - bb) > 60:  # 是墨不是底
                 ink += 1
                 if x < inset or x >= W - inset:
                     outside += 1
@@ -428,18 +684,23 @@ def text_bounds(W: int) -> tuple[int, float]:
 
 def layout_number(
     size, kicker: str, hero: str, unit: str, payoff: str, note: str,
-    drawn: list | None = None, top_pad: int = 0,
+    drawn: list | None = None, top_pad: int = 0, style: dict | None = None,
 ) -> Image.Image:
     """数字英雄：一个数字占满画面。缩略图下最抗缩放。
 
     分四个**垂直带**，先算下面的带再给上面剩下的空间：
     kicker / hero / payoff / note。所有字号都由测量得出，且 hero 同时受
     宽度和可用高度约束——只按宽度放大会让数字撞进论点区。
+
+    样式（材质）经 `style` 注入：底色、墨色、强调色、显示字体。本函数对
+    「今天用哪种材质」一无所知，也不该知道——布局与样式正交。
     """
+    st = style or STYLES[LEGACY_STYLE]
+    ffn = lambda s: find_style_font(st, s)  # noqa: E731
     W, H = size
-    img = Image.new("RGB", size, INK)
+    img = Image.new("RGB", size, st["bg"])
     d = ImageDraw.Draw(img)
-    d.rectangle([0, H - 11, W, H], fill=BLUE)
+    d.rectangle([0, H - 11, W, H], fill=st["accent"])
 
     margin, max_w = text_bounds(W)
 
@@ -452,7 +713,7 @@ def layout_number(
     pf = psize = None
     plines: list[str] = []
     if payoff:
-        pf, psize, plines = fit_block(d, payoff, max_w, 2, int(H * 0.115), MIN_HERO)
+        pf, psize, plines = fit_block(d, payoff, max_w, 2, int(H * 0.115), MIN_HERO, font_fn=ffn)
         line_h = int(psize * 1.22)
         block_h = line_h * len(plines)
         payoff_top = H - note_h - block_h - int(H * 0.04)
@@ -470,7 +731,7 @@ def layout_number(
         return max(MIN_MUTED, int(b * 0.36))
 
     def measure(b: int) -> tuple[float, object, object]:
-        hf, uf = find_font(b), find_font(unit_size(b))
+        hf, uf = ffn(b), ffn(unit_size(b))
         w = text_w(d, hero, hf) + (text_w(d, unit, uf) + 18 if unit else 0)
         return w, hf, uf
 
@@ -487,63 +748,68 @@ def layout_number(
     # hero 在其带内垂直居中
     hero_px_h = int(big_start * 0.86)  # 视觉上数字的实际高度
     y_hero = band_top + max(0, (band_h - hero_px_h) // 2)
-    d.text((x, y_hero), hero, font=hero_font, fill=WHITE)
+    d.text((x, y_hero), hero, font=hero_font, fill=st["ink"])
     if drawn is not None:
-        drawn.append({"element": "hero", "text": hero, "size": big_start})
+        drawn.append({"element": "hero", "text": hero, "size": big_start,
+                      "color": st["ink"]})
     if unit:
         d.text(
             (x + text_w(d, hero, hero_font) + 18, y_hero + int(big_start * 0.58)),
             unit,
             font=unit_font,
-            fill=BLUE,
+            fill=st["accent"],
         )
         if drawn is not None:
-            drawn.append({"element": "unit", "text": unit, "size": unit_size(big_start)})
+            drawn.append({"element": "unit", "text": unit, "size": unit_size(big_start),
+                          "color": st["accent"]})
 
     # ③ payoff 贴底
     if payoff and plines:
         line_h = int(psize * 1.22)
         block_h = line_h * len(plines)
         y = H - note_h - block_h - int(H * 0.04)
-        draw_lines_center(d, plines, pf, y, ORANGE, margin + max_w / 2, line_h)
+        draw_lines_center(d, plines, pf, y, st["alt"], margin + max_w / 2, line_h)
         if drawn is not None:
-            drawn.append({"element": "payoff", "text": " / ".join(plines), "size": psize})
+            drawn.append({"element": "payoff", "text": " / ".join(plines), "size": psize,
+                          "color": st["alt"]})
 
-    draw_kicker(d, kicker, margin, kicker_y, max_w, int(H * 0.068), H, drawn)
+    draw_kicker(d, kicker, margin, kicker_y, max_w, int(H * 0.068), H, drawn, style=st)
 
     if note:
-        nf = find_font(max(MIN_MUTED, int(H * 0.042)))
-        d.text((margin, H - int(H * 0.075)), note, font=nf, fill=MUTED)
+        nf = ffn(max(MIN_MUTED, int(H * 0.042)))
+        d.text((margin, H - int(H * 0.075)), note, font=nf, fill=st["muted"])
     return img
 
 
 def layout_contrast(
     size, kicker: str, line1: str, line2: str, note: str,
-    drawn: list | None = None, top_pad: int = 0,
+    drawn: list | None = None, top_pad: int = 0, style: dict | None = None,
 ) -> Image.Image:
-    """对比双行：两个短句撞在一起，第二句用暖色。"""
+    """对比双行：两个短句撞在一起，第二句用暖色（样式 alt）。"""
+    st = style or STYLES[LEGACY_STYLE]
+    ffn = lambda s: find_style_font(st, s)  # noqa: E731
     W, H = size
-    img = Image.new("RGB", size, INK)
+    img = Image.new("RGB", size, st["bg"])
     d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, W, 9], fill=BLUE)
+    d.rectangle([0, 0, W, 9], fill=st["accent"])
 
     margin, max_w = text_bounds(W)
 
-    draw_kicker(d, kicker, margin, int(H * 0.068), max_w, int(H * 0.062), H, drawn)
+    draw_kicker(d, kicker, margin, int(H * 0.068), max_w, int(H * 0.062), H, drawn, style=st)
 
     # 两句各自测量，取能放下的较大字号，且两句同号（视觉上成对）
     start = int(H * 0.30)
-    f1, s1 = fit_font(d, line1, max_w, start, MIN_HERO)
-    f2, s2 = fit_font(d, line2, max_w, start, MIN_HERO)
+    f1, s1 = fit_font(d, line1, max_w, start, MIN_HERO, font_fn=ffn)
+    f2, s2 = fit_font(d, line2, max_w, start, MIN_HERO, font_fn=ffn)
     fs = min(s1, s2)
-    font = find_font(fs)
+    font = ffn(fs)
 
     # 缩到 MIN_HERO 仍超宽时必须截断，否则文字会溢出画布两侧
     line1 = clip_to_width(d, line1, font, max_w)
     line2 = clip_to_width(d, line2, font, max_w)
     if drawn is not None:
-        drawn.append({"element": "line1", "text": line1, "size": fs})
-        drawn.append({"element": "line2", "text": line2, "size": fs})
+        drawn.append({"element": "line1", "text": line1, "size": fs, "color": st["ink"]})
+        drawn.append({"element": "line2", "text": line2, "size": fs, "color": st["alt"]})
 
     line_h = int(fs * 1.16)
     gap = int(H * 0.055)
@@ -555,43 +821,46 @@ def layout_contrast(
     # 居中必须在**安全区**内居中，不是画布居中：画布居中会把长句的两端推进
     # 3:2 裁切区（左右各 93px），信息流里看到的就是被切掉半截的字。
     cx = margin + max_w / 2
-    d.text((cx - text_w(d, line1, font) / 2, y), line1, font=font, fill=WHITE)
+    d.text((cx - text_w(d, line1, font) / 2, y), line1, font=font, fill=st["ink"])
     # 中间分隔短线
     bar_y = y + line_h + gap // 2 - 4
-    d.rectangle([cx - int(W * 0.055), bar_y, cx + int(W * 0.055), bar_y + 8], fill=ORANGE)
-    d.text((cx - text_w(d, line2, font) / 2, y + line_h + gap), line2, font=font, fill=ORANGE)
+    d.rectangle([cx - int(W * 0.055), bar_y, cx + int(W * 0.055), bar_y + 8], fill=st["accent"])
+    d.text((cx - text_w(d, line2, font) / 2, y + line_h + gap), line2, font=font, fill=st["alt"])
 
     if note:
-        nf = find_font(max(MIN_MUTED, int(H * 0.042)))
-        d.text((margin, H - int(H * 0.075)), note, font=nf, fill=MUTED)
+        nf = ffn(max(MIN_MUTED, int(H * 0.042)))
+        d.text((margin, H - int(H * 0.075)), note, font=nf, fill=st["muted"])
     return img
 
 
 def layout_statement(
     size, kicker: str, text: str, note: str,
-    drawn: list | None = None, top_pad: int = 0,
+    drawn: list | None = None, top_pad: int = 0, style: dict | None = None,
 ) -> Image.Image:
     """一句断言：单行（最多两行）占满画面。"""
+    st = style or STYLES[LEGACY_STYLE]
+    ffn = lambda s: find_style_font(st, s)  # noqa: E731
     W, H = size
-    img = Image.new("RGB", size, INK)
+    img = Image.new("RGB", size, st["bg"])
     d = ImageDraw.Draw(img)
-    d.rectangle([0, H - 11, W, H], fill=BLUE)
+    d.rectangle([0, H - 11, W, H], fill=st["accent"])
 
     margin, max_w = text_bounds(W)
 
-    draw_kicker(d, kicker, margin, int(H * 0.072), max_w, int(H * 0.064), H, drawn)
+    draw_kicker(d, kicker, margin, int(H * 0.072), max_w, int(H * 0.064), H, drawn, style=st)
 
-    font, fsize, lines = fit_block(d, text, max_w, 2, int(H * 0.30), MIN_HERO)
+    font, fsize, lines = fit_block(d, text, max_w, 2, int(H * 0.30), MIN_HERO, font_fn=ffn)
     line_h = int(fsize * 1.18)
     block_h = line_h * len(lines)
     y = max(top_pad, (H + top_pad - block_h) // 2 + int(H * 0.02))
-    draw_lines_center(d, lines, font, y, WHITE, margin + max_w / 2, line_h)
+    draw_lines_center(d, lines, font, y, st["ink"], margin + max_w / 2, line_h)
     if drawn is not None:
-        drawn.append({"element": "statement", "text": " / ".join(lines), "size": fsize})
+        drawn.append({"element": "statement", "text": " / ".join(lines), "size": fsize,
+                      "color": st["ink"]})
 
     if note:
-        nf = find_font(max(MIN_MUTED, int(H * 0.042)))
-        d.text((margin, H - int(H * 0.075)), note, font=nf, fill=MUTED)
+        nf = ffn(max(MIN_MUTED, int(H * 0.042)))
+        d.text((margin, H - int(H * 0.075)), note, font=nf, fill=st["muted"])
     return img
 
 
@@ -657,7 +926,23 @@ def make_cover(
     line2: str = "",
     statement: str = "",
     photo: str = "",
+    style: str = "",
+    day: str = "",
 ) -> dict:
+    # ── 样式解析：显式指定 > 日期哈希 ────────────────────────────────
+    # 未知名字必须硬错：静默回退会让「我明明指定了样式」变成一句
+    # 无人验证的假设（同 ADR-0044 对 --spec 的纪律）。
+    if style:
+        if style not in STYLES:
+            raise ValueError(
+                f"未知样式：{style!r}。可选：{'/'.join(STYLE_ORDER)}"
+            )
+        style_name = style
+    else:
+        style_name = style_for_date(day or datetime.date.today().isoformat())
+    st = STYLES[style_name]
+    ff = lambda s: find_style_font(st, s)  # noqa: E731
+
     # 显式参数优先；缺失的从标题推导
     derived = derive_parts(title) if layout == "auto" else {"layout": layout}
     lay = derived["layout"] if layout == "auto" else layout
@@ -727,7 +1012,7 @@ def make_cover(
             line2 = line2 or derived.get("line2", "")
         else:
             panel = layout_number(
-                panel_size, kicker, hero, hero_unit, payoff, footnote, drawn, top_pad
+                panel_size, kicker, hero, hero_unit, payoff, footnote, drawn, top_pad, st
             )
     if lay == "contrast":
         line1 = line1 or derived.get("line1", "")
@@ -737,7 +1022,7 @@ def make_cover(
             statement = statement or derived.get("text", "") or title
         else:
             panel = layout_contrast(
-                panel_size, kicker, line1, line2, footnote, drawn, top_pad
+                panel_size, kicker, line1, line2, footnote, drawn, top_pad, st
             )
     if lay == "statement":
         # 2026-10-20 实测缺陷：这里原先只写 `statement or title`，于是当 derive_parts()
@@ -746,15 +1031,15 @@ def make_cover(
         # 前半句逐字重复，正是 ADR-0044 判定「不增加信息」的那种封面。
         panel = layout_statement(
             panel_size, kicker, statement or derived.get("text", "") or title,
-            footnote, drawn, top_pad,
+            footnote, drawn, top_pad, st,
         )
 
     if photo_band is not None:
-        img = Image.new("RGB", size, INK)
+        img = Image.new("RGB", size, st["bg"])
         img.paste(photo_band, (0, 0))
         d = ImageDraw.Draw(img)
         y_div = photo_band.height
-        d.rectangle([0, y_div, W, y_div + PHOTO_DIVIDER - 1], fill=BLUE)
+        d.rectangle([0, y_div, W, y_div + PHOTO_DIVIDER - 1], fill=st["accent"])
         img.paste(panel, (0, y_div + PHOTO_DIVIDER))
     else:
         img = panel
@@ -767,14 +1052,24 @@ def make_cover(
     # ⚠️ 照片带满幅铺到画布边缘，从第 0 行开始查它必然每行都算侵入。
     # 所以只查文字区；照片带本身不承载文字，不需要这项检查。
     check_from = (photo_band.height + PHOTO_DIVIDER) if photo_band is not None else 0
-    problems = edge_check(img, margin, y_from=check_from)
+    problems = edge_check(img, margin, y_from=check_from, bg=st["bg"])
 
     # ── 自检一之二：3:2 裁切区（ADR-0049）────────────────────────────
     #
     # `edge_check` 只保证「没画出画布」，但 1200x675 进信息流会被居中裁成 3:2，
     # 左右各丢 93px（理论 93.75，向下取整）。5 张历史封面逐像素统计**全部**有内容落在这块区域里，
     # 最严重那张把「做钱」的「钱」字切掉一半——而它在画布上完全合法。
-    problems += safe_zone_check(img, SAFE_INSET, y_from=check_from)
+    problems += safe_zone_check(img, SAFE_INSET, y_from=check_from, bg=st["bg"])
+
+    # ── 自检一之三：文字与底色的对比度（ADR-0067 补）────────────────
+    #
+    # 这条检查是在换材质之后才发现缺的：`edge_check` 与 `safe_zone_check`
+    # 判的是「内容画在哪」，不判「内容看不看得见」。而 8 种浅色样式的
+    # accent/muted 在白纸上只有 3.4~4.0 的对比度——自检全过，字读不出来。
+    #
+    # 查的是 `drawn` 里记录的**实际画上去的颜色**，不是「按惯例该用哪个色」；
+    # 字号按 `card_scale` 缩到 156px 信息流卡片后再判（理由见 contrast_check）。
+    problems += contrast_check(drawn, st["bg"], scale=FEED_CARD_W / size[0])
 
     # ── 自检二：缩略图可读性（测量实际画上去的字号）──────────────────
     #
@@ -861,6 +1156,8 @@ def make_cover(
         "out": str(out_path),
         "size": list(size),
         "layout": lay,
+        "style": style_name,
+        "style_pinned": bool(style),
         "kicker": kicker,
         "title_chars": len(title),
         "bytes": out_path.stat().st_size,
@@ -909,9 +1206,14 @@ def main() -> int:
         help="背景照片路径（CC0/公有领域，来自 fetch_photo.py）。留空则纯模板封面（ADR-0048）",
     )
     ap.add_argument(
+        "--style",
+        default="",
+        help=f"钉死封面样式（{'/'.join(STYLE_ORDER)}）。留空则按日期从目录里确定性选一种",
+    )
+    ap.add_argument(
         "--spec",
         default="",
-        help="JSON 文件：显式指定封面论据（layout/kicker/hero/hero_unit/payoff/line1/line2/statement/photo）",
+        help="JSON 文件：显式指定封面论据（layout/kicker/hero/hero_unit/payoff/line1/line2/statement/photo/style）",
     )
     args = ap.parse_args()
 
@@ -951,6 +1253,14 @@ def main() -> int:
         return cli_val or str(spec.get(key, "") or "")
 
     layout = args.layout if args.layout != "auto" else str(spec.get("layout", "auto") or "auto")
+    style = args.style or str(spec.get("style", "") or "")
+    # 未知样式在进绘制前就拦下：显式指定错的样式必须硬错，绝不静默回退。
+    if style and style not in STYLES:
+        print(json.dumps(
+            {"ok": False, "message": f"未知样式：{style!r}（可选：{'/'.join(STYLE_ORDER)}）"},
+            ensure_ascii=False,
+        ))
+        return 1
     info = make_cover(
         title,
         out,
@@ -964,6 +1274,7 @@ def main() -> int:
         line2=pick(args.line2, "line2"),
         statement=pick(args.statement, "statement"),
         photo=pick(args.photo, "photo"),
+        style=style,
     )
     # ok 由自检决定（是否溢出）。溢出时退出码非 0，让编排器挡住发布——
     # 一张溢出画布的封面比没有封面更糟：它会被发出去，而没人看见。

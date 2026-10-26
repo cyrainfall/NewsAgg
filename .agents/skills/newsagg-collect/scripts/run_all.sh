@@ -154,6 +154,28 @@ git_no_proxy() {  # 透传参数给 git，但禁用配置里的代理（空串 =
   git -c http.proxy= -c https.proxy= "$@"
 }
 
+# ── 当前分支（ADR-0065）──────────────────────────────────────────
+# 直到 2026-10-25，编排器里写死了 `origin main` 与裸 `git pull --rebase`：
+# 前者假定「当前分支就是 main」，后者依赖 upstream 跟踪。两个假定在仓库只有
+# main 时永远成立，所以几个月没人发现。2026-10-26 仓库切到 feat/browserless-skills
+# （无 upstream、远端也没有这个分支），于是：
+#   ① 裸 `git pull --rebase` 报 `fatal: no upstream configured`——它既不在
+#      冲突正则里，也不在网络正则里 → 走 fail_soft → **当晚整轮死在第①步**；
+#   ② 就算活下来，收尾 `git push origin main` 推的是**本地 main**，今天的提交
+#      留在特性分支上，而脚本照样打印「已推送 origin/main」。
+# 所以：一律按**当前分支**取远端，并在起跑时把分支名说一遍。
+current_branch() {
+  local b
+  b="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -z "$b" || "$b" == "HEAD" ]]; then echo "main"; else echo "$b"; fi
+}
+
+BRANCH="$(current_branch)"
+if [[ "$BRANCH" != "main" ]]; then
+  echo "分支：${BRANCH}（不是 main）——本轮的所有提交都会落在这个分支上" >&2
+  echo "      这与 ADR-0065 有关：编排器不再假定你在 main 上。" >&2
+fi
+
 write_status() {  # $1 ok(1/0)  $2 stage  $3 reason  $4 detail  $5 degraded(可空)
   # degraded 是「跑完了但有让步」：与 ok=0 不同，它不该让看守告警，但必须让人看见。
   ST_OK="$1" ST_STAGE="$2" ST_REASON="$3" ST_DETAIL="${4:-}" ST_DEGRADED="${5:-}" \
@@ -206,16 +228,16 @@ sync_push() {  # $1 = 附加到提交信息的一行
     echo "[!] 跳过 push：本轮未能从远端同步（网络不可达），远端状态未知。改动已本地提交，交人工 push（ADR-0061）" >&2
     return 1
   fi
-  if git push origin main >/tmp/newsagg-push.out 2>&1; then
-    echo "已推送 origin/main"
+  if git push -u origin "$BRANCH" >/tmp/newsagg-push.out 2>&1; then
+    echo "已推送 origin/${BRANCH}"
     return 0
   fi
   # push 同样可能只是代理的 github 规则坏了：补一次直连。
   if grep -qiE "$NET_ERR_RE" /tmp/newsagg-push.out; then
     printf '[!] push 走代理失败，改用直连重试一次\n' >&2
-    if git_no_proxy push origin main >/tmp/newsagg-push.out 2>&1; then
+    if git_no_proxy push -u origin "$BRANCH" >/tmp/newsagg-push.out 2>&1; then
       PROXY_FALLBACK=1
-      echo "已推送 origin/main（直连；你的 git 代理对 github 不可用）"
+      echo "已推送 origin/${BRANCH}（直连；你的 git 代理对 github 不可用）"
       return 0
     fi
   fi
@@ -283,8 +305,20 @@ git_pull() {
   local err=/tmp/newsagg-pull.err
   local attempt=1 max=3 detail
 
+  # 显式点名远端分支，不用裸 `git pull`（它依赖 upstream 跟踪，而新分支没有）。
+  # 远端还没有这个分支是**正常状态**（本地刚建、还没推过），不是失败：
+  # 本轮照常跑，收尾 push 时用 -u 把分支建到远端，下一轮就能同步了。
+  if ! git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>"$err"; then
+    if grep -qiE "$NET_ERR_RE" "$err"; then
+      : # 连不上远端，交给下面的重试与降级逻辑处理
+    else
+      echo "远端还没有分支 ${BRANCH}（本地新建的分支）——本轮跳过同步，收尾 push 时建立"
+      return 0
+    fi
+  fi
+
   while true; do
-    if git pull --rebase >/tmp/newsagg-pull.out 2>"$err"; then
+    if git pull --rebase origin "$BRANCH" >/tmp/newsagg-pull.out 2>"$err"; then
       echo "已同步到 $(git rev-parse --short HEAD)"
       return 0
     fi
@@ -359,7 +393,7 @@ ADR-0018：人的改动优先，系统不得替人决定提交什么。"
   if grep -qiE "$NET_ERR_RE" "$err"; then
     # 先试一次禁用代理直连：代理对 github 的那一跳坏了、而直连通，是真实场景。
     printf '\n[!] ① 走代理失败（重试 %s 次），改用直连重试一次\n' "$((attempt - 1))" >&2
-    if git_no_proxy pull --rebase origin main >/dev/null 2>>"$err"; then
+    if git_no_proxy pull --rebase origin "$BRANCH" >/dev/null 2>>"$err"; then
       PROXY_FALLBACK=1
       DEGRADED_NOTE="① 你配置的 git 代理（$(git config --get http.proxy || echo '未配置')）对 github 不可用，本轮已改走直连完成同步（同步本身没问题）。建议修一下 Clash 的 github 规则，否则每轮都要多试一次才通。"
       printf '[✓] ① 直连成功——问题在代理的 github 规则，不在网络\n' >&2
@@ -727,7 +761,7 @@ write_status 1 "complete" "运行完成" "slug=${SLUG} mode=${MODE}" "$DEGRADED_
 brief_now
 if ! sync_push "发布 ${SLUG}（${MODE}）"; then
   if [[ "${PULL_DEGRADED:-0}" == "1" ]]; then
-    printf '\n> ⚠ 本轮**未 push**（设计如此）：未能从远端同步，远端状态未知。产出已本地提交，\n> 有网络后手动 `git push origin main` 一次即可。\n' >> "$BRIEF"
+    printf '\n> ⚠ 本轮**未 push**（设计如此）：未能从远端同步，远端状态未知。产出已本地提交，\n> 有网络后手动 \`git push origin ${BRANCH}\` 一次即可。\n' >> "$BRIEF"
   else
     printf '\n> ⚠ 本次运行结束时 push 失败：产出仍留在本地，未同步到远端。看守会因此告警。\n' >> "$BRIEF"
     sync_push "push 重试" || true

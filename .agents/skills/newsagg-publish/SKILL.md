@@ -440,7 +440,8 @@ api 后端只是把列表数据翻译成 node 的形状（`toutiao_api.as_verify
 
 ## 输出
 
-- `.newsagg/publish-ledger.jsonl`：每次发布的台账（追加）
+- `.newsagg/publish-ledger.jsonl`：每次发布的台账（追加，运行时状态，不入库）
+- `reports/publish-ledger.jsonl`：**入库的账本归档**（合并视图，ADR-0074）——由编排器在出简报之前自动同步；账本里的事实因此能跨环境（本地 ↔ 服务器）读到。归档入库前过凭证扫描，命中则跳过该条并计数。
 - stdout：结构化结果（`verdict` 字段是判定结论）
 
 ## 与其他阶段的接口

@@ -32,6 +32,14 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+# 账本的跨环境读取与归档（ADR-0074）。发布层是账本的**写者**，所以这里要
+# 能给它写的记录补 `record_id`。
+_LIB_DIR = Path(__file__).resolve().parents[4] / ".agents" / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+import publish_ledger as ledger_mod  # noqa: E402
+
 CST = timezone(timedelta(hours=8))
 
 # 两个后端的适用范围（2026-10-25 实测后定稿）：
@@ -39,11 +47,17 @@ CST = timezone(timedelta(hours=8))
 #   api     —— 登录预检、反查。都是只读，都已实测可用，不需要浏览器。
 #   browser —— 发布 / 存草稿。走 vendored 的 toutiao-ops（Playwright DOM）。
 #
-# 为什么写路径不给 api：发布页表单的**字段名**已经从真实 bundle 里逐个核对过
-# （见 toutiao_api.build_publish_form 的文档），但**嵌套字段的序列化形式**
-# （coverList / slaveItems 是 JSON 字符串还是展开成 coverList[0][uri]）无法从
-# 压缩产物里读出，只能靠一次真实写入确认——而真实发布不可逆。所以 api 写路径
-# 默认拒绝，要显式 --allow-unverified-write 才动，且账本会记下这一点。
+# 为什么写路径不给 api（ADR-0073 实测后定稿）：
+#
+# 早先这里写着「字段名已经从真实 bundle 里逐个核对过，只是嵌套字段的序列化形式
+# 读不出来」——**那句话是错的**。2026-10-27 抓包实测：真实 publish 请求 31 个
+# 字段，仓库的 build_publish_form 有 35 个键，**只有 9 个名字对得上**；另外
+# 写路径还有平台自己的签名与风控闸（_signature / msToken / a_bogus /
+# x-secsdk-csrf-token），纯 HTTP 客户端一个都不处理。
+#
+# 所以 api 写路径默认拒绝，要显式 --allow-unverified-write 才动，账本会记下
+# 这一点。详见 docs/adr/0073-pure-http-write-path-is-not-viable.md 与
+# docs/publish-request-shape.md（真实请求形状的事实记录）。
 BACKENDS = ("api", "browser")
 VERIFY_BACKENDS = ("auto", "api", "browser")
 
@@ -369,6 +383,15 @@ def snapshot_fingerprint(md_path: Path) -> dict:
 
 
 def append_ledger(path: Path, record: dict) -> None:
+    """追加一条发布记录到运行时账本。
+
+    ADR-0074：账本分两份——运行时（`.newsagg/`，不入库，当前环境的第一手
+    事实）与归档（`reports/`，入库，跨环境的合并视图）。这里只写运行时；
+    归档由 `sync_archive` 合并写入。
+
+    每条记录都带 `record_id`，跨环境合并靠它去重。
+    """
+    ledger_mod.make_record_id(record)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -376,18 +399,18 @@ def append_ledger(path: Path, record: dict) -> None:
 
 def read_ledger(path: Path) -> list[dict]:
     """读全部发布账本记录（容忍坏行）。"""
-    if not path.exists():
-        return []
-    out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
+    return ledger_mod.read_records(path)
+
+
+def repo_root_of(ledger_path: Path) -> Path:
+    """从账本路径反推仓库根。
+
+    账本路径固定是 `<root>/.newsagg/publish-ledger.jsonl`，所以上溯两级就是根。
+    之所以不直接用 `repo_root()`：这个函数是 publish.py 的既有风格（`root`
+    由 main() 传进来），从路径反推能保证「算的就是这个账本所在的那棵树的
+    归档」。
+    """
+    return Path(ledger_path).resolve().parent.parent.parent
 
 
 # ADR-0014 锁定的运行参数：每日发布上限 1 篇。
@@ -428,7 +451,7 @@ def count_published_today(ledger: Path, date: str) -> list[dict]:
     不符，而账本的意义正是成为唯一可信的本地记录。
     """
     today = []
-    for rec in read_ledger(ledger):
+    for rec in ledger_mod.read_merged(repo_root_of(ledger)):
         if not str(rec.get("at", "")).startswith(date):
             continue
         if rec.get("accidental"):
@@ -583,8 +606,9 @@ def _api_write(*, client, mode: str, title: str, body: str, cover_path: Path,
     info: dict = {}
     if not allow_unverified_write:
         raise mod.UnverifiedWrite(
-            "api 后端的写路径尚未验证：字段名可信，但 coverList/slaveItems 的序列化"
-            "形态、以及正文 HTML 的真实排版都未经线上确认。"
+            "api 后端的写路径尚未验证：2026-10-27 抓包实测发现字段名几乎全错"
+            "（35 键里只有 9 个对得上），且写路径有平台自己的签名与风控闸"
+            "（_signature / msToken / a_bogus / CSRF），纯 HTTP 客户端不处理。"
             "真发请用 --backend browser；确认要试 api 写，加 --allow-unverified-write。"
         )
     img = client.upload_image(str(cover_path), allow_unverified=True)
@@ -664,7 +688,9 @@ def main() -> int:
                          "browser：全部走 vendored toutiao-ops（Playwright）。默认 api")
     ap.add_argument("--allow-unverified-write", action="store_true",
                     help="允许 api 后端执行写操作（发布/存草稿/上传封面）。"
-                         "这些参数序列化从未经线上验证，只在人工强确认时使用")
+                         "⚠ 写路径的字段名与平台签名闸都未对齐（ADR-0073），"
+                         "且发布不可逆——只在人工强确认时使用，"
+                         "不得进入无人值守链路")
     # 反查后端单独可切，是为了不把 ADR-0047 的微头条泄漏检测弄丢：
     # api 的数据源只含图文，看不到微头条。默认 auto 跟随写入后端 ——
     # 写入走 browser（默认情况）时反查也走 browser，安全判据一点不减；
@@ -818,7 +844,8 @@ def main() -> int:
             # 事后能查清这一篇到底是哪条路发出去的。
             write_backend = "browser"
             write_fallback = (
-                "api 写路径的参数序列化未经线上验证，已回落 browser 后端执行写操作。"
+                "api 写路径未经验证（字段名与平台签名闸都不对齐，ADR-0073），"
+                "已回落 browser 后端执行写操作。"
                 "确需试 api 写：加 --allow-unverified-write"
             )
         if write_backend == "api":
@@ -914,6 +941,10 @@ def main() -> int:
             "write_backend": write_backend,
             "verify_backend": verify_backend,
         }
+        # ADR-0074：给记录一个稳定的唯一键，跨环境合并时靠它去重。
+        # 没有它时合并靠 `at|slug|mode` 派生——那在两台机器上一样，但
+        # 同一篇被误发补录过就会是两条不同的记录。
+        ledger_mod.make_record_id(record)
         if write_fallback:
             record["write_fallback_reason"] = write_fallback
         if api_info:

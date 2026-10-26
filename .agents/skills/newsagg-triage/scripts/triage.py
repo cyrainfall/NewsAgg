@@ -30,6 +30,15 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+# 发布账本的唯一读取入口（ADR-0074）：运行时账本 + 入库归档的合并视图。
+# 这里用账本做 slug → 观点卡的映射；服务器上没有运行时账本时这个映射会是空的。
+_LIB_DIR = repo_root() / ".agents" / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+from publish_ledger import read_merged  # noqa: E402
+
+
 def _load_cardfm():
     """加载同目录的 `cardfm`（观点卡 frontmatter 的唯一解析实现，ADR-0042）。
 
@@ -152,19 +161,11 @@ def performance_reference(perf_path: Path, runs_path: Path) -> dict:
             for md in sorted((runs_path.parent.parent / "outputs").glob(f"{date}-*.md")):
                 slug_to_card[md.stem] = card
 
-    ledger = runs_path.parent / "publish-ledger.jsonl"
-    if ledger.exists():
-        try:
-            for line in ledger.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                slug, card = rec.get("slug"), rec.get("card_file")
-                if slug and card:
-                    slug_to_card[str(slug)] = str(card)
-        except (json.JSONDecodeError, OSError):
-            pass
+    # 账本里的 slug → 观点卡映射（ADR-0074：读合并视图，服务器上也有）
+    for rec in read_merged(root):
+        slug, card = rec.get("slug"), rec.get("card_file")
+        if slug and card:
+            slug_to_card[str(slug)] = str(card)
 
     by_card: dict[str, list[dict]] = {}
     unlinked = 0

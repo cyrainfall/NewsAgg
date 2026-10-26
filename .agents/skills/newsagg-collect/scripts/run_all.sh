@@ -209,6 +209,33 @@ brief_now() {
     || echo "[X] 简报生成失败——看守会因此告警（ADR-0006：简报必须无条件每日存在）" >&2
 }
 
+# ADR-0074：把发布账本同步成入库归档（reports/publish-ledger.jsonl）。
+# 账本分两份：运行时（.newsagg/，不入库，当前环境的第一手事实）与归档
+# （reports/，入库，跨环境的合并视图）。没有归档，服务器上就没有账本，
+# 平台作品与本地成稿的关联会断（实测 11 篇只匹配 9 篇）。
+# 这一步幂等，且失败不阻塞——归档写不进去不该让发布失败。
+sync_ledger_archive() {
+  if [[ -n "$NO_GIT" ]]; then echo "（--no-git：跳过账本归档）"; return 0; fi
+  python3 - <<'PY'
+import sys
+sys.path.insert(0, ".agents/lib")
+try:
+    import publish_ledger as pl
+except Exception as exc:
+    print(f"[!] 账本归档跳过：模块加载失败（{exc}）")
+    raise SystemExit(0)
+try:
+    res = pl.sync_archive(pl.repo_root())
+except Exception as exc:
+    print(f"[!] 账本归档跳过：{exc}")
+    raise SystemExit(0)
+print(f"  账本归档：运行时 {res['runtime_records']} 条 + 归档 {res['archive_records_before']} 条 "
+      f"→ 合并 {res['merged']} 条，写入 {res['written']} 条"
+      + (f"（跳过 {res['skipped_for_credentials']} 条：含凭证）"
+         if res["skipped_for_credentials"] else ""))
+PY
+}
+
 sync_push() {  # $1 = 附加到提交信息的一行
   if [[ -n "$NO_GIT" ]]; then echo "（--no-git：跳过 commit/push）"; return 0; fi
   git add -A
@@ -763,6 +790,9 @@ else
 fi
 
 log "⑦⑧ 简报与同步"
+# ADR-0074：先同步账本归档，再出简报——简报要读的「今天发了什么」来自
+# 合并视图，归档必须在简报之前落好。归档在 reports/，会被同一次 commit 带走。
+sync_ledger_archive
 write_status 1 "complete" "运行完成" "slug=${SLUG} mode=${MODE}" "$DEGRADED_NOTE"
 brief_now
 if ! sync_push "发布 ${SLUG}（${MODE}）"; then

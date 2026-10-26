@@ -492,27 +492,52 @@ class Client:
         article_type: int = 0,
         content_source: int = 100000000402,
     ) -> dict:
-        """按发布页 bundle 的真实字段名拼表单（**只拼，不发**）。
+        """按发布页 bundle 的字段名拼表单（**只拼，不发**）。
 
-        字段全集来自 `publish.b8c90341ac.js` 模块 12306 的默认值对象，逐个抄的：
+        ## 这个函数的状态：写路径未经验证，且实测字段名与真实请求不符
 
-            externalLinkChecked / externalLink / claimOrigin / copyRightChecked /
-            addThirdTitle / hasSubTitle / subTitle / subCoverList / subCoverType /
-            praise / disablePraise / title / titleId / errPattern / textCount /
-            position / coverList / coverType / articleAdType / isFansArticle /
-            timingStatus / timingTime / slaveItems / infoSource / ...
+        2026-10-27 做过一次只读抓包调查（真实 publish body 在 route 层
+        abort，零写入到达平台）。结论：下面这个函数**不能改成能用的状态**，
+        理由有三条，任何一条都足以否掉纯 HTTP 写路径：
 
-        其中 `save` 与 `entrance` 由 `timing` builder 给（PUBLISH→1、"main"；
-        DRAFT/PREVIEW→0、""）；`article_type`/`pgc_id`/`source`/`extra` 由
-        `common` builder 给（`source` 固定 29，
-        `extra = JSON.stringify({...formExtra, content_source})`）。
+        1. **字段名大部分是错的。** 真实 publish body（save=1）解码后 31 个
+           字段，这里 35 个键只有 9 个名字对得上（`source / title / content /
+           save / entrance / timer_status / timer_time / praise /
+           disable_praise`）。真实请求里有而这里没有的最要紧的是 `extra`
+           （装 content_source / content_word_cnt / gd_ext / info_source /
+           is_multi_title / sub_titles / manual_selected_city），还有
+           `title_id` / `draft_form_data` / `pgc_feed_covers` /
+           `search_creation_info` / `mp_editor_stat`。
+        2. **平台在写路径上有闸。** 真实请求带 `_signature` / `msToken` /
+           `a_bogus` 与 `x-secsdk-csrf-token`，由 `byted_acrawler` 对 publish
+           端点单独加固（`enablePathList:["/mp/agw/article/publish"]`）——
+           读路径没有这层。本模块对这几个参数一个都不处理。
+        3. **正文不是平台原生形态。** 平台要的是 ProseMirror 序列化后的 HTML
+           （段落带 `data-track`、H1 带 `class="pgc-h-forward-slash"`）；
+           这里的 `content_html` 来自 `publish.py:_markdown_to_html`，
+           没有 `data-track`、标题层级用 h2/h3。
 
-        ## 这里唯一「不诚实」的地方，已经标出来
+        曾经这里写着「字段名可信，嵌套序列化不可信」——**那句话是错的**，
+        实测字段名也不可信。
 
-        `coverList` 与 `slaveItems` 在 JS 里是数组/对象。真实提交时必有某层做了
-        stringify，但那层在压缩产物里看不出来。这里选择序列化成 JSON 字符串
-        （头条系接口最常见的形态），**但没有线上证据**。这就是写操作默认被
-        `UnverifiedWrite` 挡住的原因：字段名可信，嵌套序列化不可信。
+        写清楚「错在哪」而不是把字段改对，是有意的：改对也还是不能开。
+        没有一次可撤回的验证之前，把写路径改成「看起来对」比保持「明确
+        写着没验证过」更危险——后者每次都会撞 `UnverifiedWrite`，前者会
+        开始在风控阈值上试运气。完整证据见
+        `docs/adr/0073-pure-http-write-path-is-not-viable.md`。
+
+        字段全集的历史来源：`publish.b8c90341ac.js` 模块 12306 的默认值对象。
+        那个对象是**客户端表单状态默认值**，不是请求字段表——发布请求是
+        若干 builder（timing / common / title format / editor）拼出来的，
+        照抄状态默认值等于把「界面上的当前值」当成「请求里要发的东西」。
+
+        曾经把 `coverList` / `slaveItems` 当成真实字段名。真身分别是
+        `pgc_feed_covers`（JSON 字符串，元素键集与下面的 `cover_list`
+        元素完全一致——那是这个函数唯一抄对的部分）与 `draft_form_data`；
+        `slaveItems` 则是**服务端返回字段**，从来不是请求字段。
+        `position` / `infoSource` / `subCoverList` 的真身分别在
+        `extra.manual_selected_city` / `extra.info_source` /
+        `extra.is_multi_title` + `extra.sub_titles`。
         """
         cover_list = []
         if cover_uri or cover_url:

@@ -24,6 +24,16 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+# 发布账本的唯一读取入口（ADR-0074）：运行时账本 + 入库归档的合并视图。
+# 简报要报的「误发待处理」「微头条泄漏」都来自账本；服务器上没有运行时
+# 账本时这些事项会静默消失——那正是「记录了但没有消费者」的另一种形态。
+_LIB_DIR = repo_root() / ".agents" / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+from publish_ledger import read_merged  # noqa: E402
+
+
 def read_json(path: Path):
     if not path.exists():
         return None
@@ -34,6 +44,13 @@ def read_json(path: Path):
 
 
 def read_ledger(path: Path, date_prefix: str) -> list[dict]:
+    """读**某一天**的账本记录。
+
+    ⚠️ ADR-0074：这里刻意**不**读合并视图的调用方自己传路径——合并视图由
+    `read_merged(root)` 提供，调用方给的是运行时账本路径。保留这个函数的
+    签名是因为 `section_actions` 收到的是 `ledger_path`，而它要的是「全部
+    记录」（见 `read_ledger_all`）。
+    """
     if not path.exists():
         return []
     out = []
@@ -553,7 +570,7 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -
     return out
 
 
-def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None, photo_line: str = "", date: str = "", root: Path | None = None) -> list[str]:
+def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None, photo_line: str = "", date: str = "", root: Path | None = None, all_recs: list[dict] | None = None) -> list[str]:
     out = ["## ⑤ 需你介入的事项", ""]
     any_item = False
     root = root or repo_root()
@@ -600,7 +617,13 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
     #   `leak_accepted_at`  = 人决定保留（2026-10-22 用户明确表示「保留即可」）
     # 早先只有前者，于是「决定保留」只能被记成「已删除」——账本会说谎，
     # 而账本是复盘时唯一的事实来源。所以宁可多一个字段。
-    all_recs = read_ledger_all(ledger_path) if ledger_path else []
+    # ADR-0074：账本读**合并视图**（运行时 + 入库归档）。服务器上没有运行时
+    # 账本，如果这里只读 `ledger_path` 指向的运行时文件，「同发了微头条」
+    # 「误发待删除」这些**没有过期日期**的事项会在服务器上静默消失。
+    # 调用方可以直接传 `all_recs`（已经算好的合并结果）；没传时才回落到
+    # 只读 ledger_path —— 那是测试与旧调用方的兼容路径。
+    if all_recs is None:
+        all_recs = read_ledger_all(ledger_path) if ledger_path else []
     leaks = [r for r in all_recs
              if r.get("weitoutiao_leak")
              and not r.get("leak_resolved_at")
@@ -794,7 +817,11 @@ def main() -> int:
     # 决策文件里只有模型写下的 ranking_note，看不出「这一轮到底有没有 trend 可用」——
     # 而简报的职责正是让人一眼看出信号是否退化。
     triage_input = read_json(root / ".newsagg" / "triage" / f"{date}-input.json")
-    publish_recs = read_ledger(root / ".newsagg" / "publish-ledger.jsonl", date)
+    # ADR-0074：读合并视图（运行时账本 + 入库归档）。服务器上没有运行时
+    # 账本，只读它会漏掉另一个环境发过的文章——「今天发了什么」会空着。
+    merged_ledger = read_merged(root)
+    publish_recs = [r for r in merged_ledger
+                    if str(r.get("at", "")).startswith(date)]
 
     # 找当日成稿与封面
     slug = None
@@ -819,6 +846,7 @@ def main() -> int:
     cover_report = read_json(root / ".newsagg" / "covers" / f"{date}.report.json")
     lines += section_actions(publish_recs, cand, decision, cover, slug, perf, run_status,
                              ledger_path=root / ".newsagg" / "publish-ledger.jsonl",
+                             all_recs=merged_ledger,
                              cover_report=cover_report,
                              photo_line=_photo_attribution(
                                  root, (cover_report or {}).get("photo_path") or ""),

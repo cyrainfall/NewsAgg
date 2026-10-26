@@ -28,6 +28,16 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+# 发布账本的唯一读取入口（ADR-0074）：运行时账本 + 入库归档的合并视图。
+# 服务器上没有 `.newsagg/publish-ledger.jsonl`（它不入库），只读运行时账本
+# 会让风格学习拿不到发布快照 → 基线错位（ADR-0036 那类故障的跨环境版本）。
+_LIB_DIR = repo_root() / ".agents" / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+from publish_ledger import read_merged, read_records as _read_records  # noqa: E402
+
+
 def git(*args: str, cwd: Path, check: bool = True) -> str:
     proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
     if check and proc.returncode != 0:
@@ -41,18 +51,7 @@ def sha256_text(t: str) -> str:
 
 def read_ledger(ledger: Path) -> list[dict]:
     """读发布账本（每行一条记录）。"""
-    if not ledger.exists():
-        return []
-    out = []
-    for line in ledger.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
+    return _read_records(ledger)
 
 
 def find_publish_snapshot(root: Path, rel_path: str, slug: str) -> tuple[str, str] | None:
@@ -66,7 +65,7 @@ def find_publish_snapshot(root: Path, rel_path: str, slug: str) -> tuple[str, st
     1. 发布账本里记录的 `snapshot.git_blob`（发布时写入，权威）
     2. 回退：账本记录的发布时间之前的最后一次提交（兼容 ADR-0036 之前的旧记录）
     """
-    recs = [r for r in read_ledger(root / ".newsagg" / "publish-ledger.jsonl")
+    recs = [r for r in read_merged(root)
             if r.get("slug") == slug and r.get("mode") == "publish"]
     if not recs:
         return None

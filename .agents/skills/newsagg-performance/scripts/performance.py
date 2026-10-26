@@ -66,6 +66,16 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+# 发布账本的唯一读取入口（ADR-0074）。运行时账本 + 入库归档的合并视图。
+# 以前这里直接读 `.newsagg/publish-ledger.jsonl`，服务器上没有那个文件 →
+# 11 篇只匹配 9 篇。改读合并视图后两台机器的结果一致。
+_LIB_DIR = repo_root() / ".agents" / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+from publish_ledger import read_merged  # noqa: E402
+
+
 def _load_sibling_script(rel: str):
     """按路径加载兄弟技能里的脚本。
 
@@ -339,7 +349,7 @@ def local_title_index(root: Path) -> tuple[dict[str, str], dict[str, str], dict[
     from_outputs: dict[str, str] = {}
     by_gid: dict[str, str] = {}
 
-    for rec in read_jsonl(root / ".newsagg" / "publish-ledger.jsonl"):
+    for rec in read_merged(root):
         slug = rec.get("slug")
         if not slug:
             continue

@@ -102,17 +102,63 @@ mkdir -p .newsagg/covers .newsagg/briefs
 export WEWRITE_HOME="$REPO/.wewrite"
 export PATH="$REPO/.uv-bin:$PATH"
 
+# ── python 解释器（ADR-0076）────────────────────────────────────────
+# **全部** NewsAgg 脚本都要求 Python ≥ 3.9（用了 `from __future__ import
+# annotations` 与 `list[dict]` 这类 3.9+ 语法；wewrite 本身要求 ≥ 3.11）。
+# 而系统 PATH 里的 `python3` **不保证**是这个版本：
+#   - macOS 本机：3.9（恰好能用）
+#   - 服务器 ECS：3.6.8（Alibaba Cloud Linux 3 的系统 python）→ 每一句
+#     `from __future__ import annotations` 都报
+#     `SyntaxError: future feature annotations is not defined`，
+#     于是分拣、简报、表现读回**全部**在第一步就崩。
+# 这跟 ADR-0039（封面用错解释器）和 ADR-0052（node 不在 PATH）是同一族：
+# **定时任务不经过交互式 shell，没有「记得换个解释器」的机会**。
+# 所以这里显式找，找不到就在最前面硬失败，而不是让每一段各自炸。
+find_python() {
+  local c
+  for c in \
+    "$REPO/.uv-tools/wewrite/bin/python" \
+    "$REPO/.uv-bin/python" \
+    /usr/bin/python3.11 /usr/bin/python3.12 /usr/bin/python3.10 /usr/bin/python3.9 \
+    "$HOME/.local/share/uv/python/cpython-3.12/bin/python3" \
+    "$HOME/.local/share/uv/python/cpython-3.11/bin/python3"
+  do
+    if [[ -x "$c" ]]; then
+      # 版本必须 ≥ 3.9，否则下一个 `from __future__ import annotations` 就炸
+      if "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' 2>/dev/null; then
+        echo "$c"; return 0
+      fi
+    fi
+  done
+  # 兜底：系统 PATH 里的 python3（若版本够新）
+  local sys
+  sys="$(command -v python3 2>/dev/null || true)"
+  if [[ -n "$sys" ]] && "$sys" -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' 2>/dev/null; then
+    echo "$sys"; return 0
+  fi
+  return 1
+}
+
+if ! PY="$(find_python)"; then
+  echo "[X] 找不到 Python ≥ 3.9" >&2
+  echo "    系统 PATH 里的 python3 是：$("$(command -v python3 2>/dev/null || echo '（无）')" -V 2>&1)" >&2
+  echo "    修法（服务器）：dnf install -y python3.11 && ln -sf /usr/bin/python3.11 /usr/local/bin/python3" >&2
+  echo "    或：bash scripts/bootstrap-server.sh" >&2
+  exit 1
+fi
+echo "python：$PY（$("$PY" -V 2>&1)）"
+
 # ── 封面用解释器（ADR-0039）──────────────────────────────────────────
 # make_cover.py 依赖 Pillow，而 Pillow 只装在 wewrite 的 venv 里；用系统
-# python3 跑它会以「未安装 Pillow」失败，且这个失败发生在第 3 段——那时
+# python 跑它会以「未安装 Pillow」失败，且这个失败发生在第 3 段——那时
 # 稿子已经写好、简报还没出，等于每天白跑一次。定时任务不经过交互式 shell，
 # 没有"记得换个 python"的机会，所以这里把解释器钉死。
-# 退化路径：venv 不存在时回落到 python3，让错误在封面这一步显式暴露，
+# 退化路径：venv 不存在时回落到 $PY，让错误在封面这一步显式暴露，
 # 而不是静默跳过封面（无封面会被发布门 1 拦下）。
 if [[ -x "$REPO/.uv-tools/wewrite/bin/python" ]]; then
   COVER_PY="$REPO/.uv-tools/wewrite/bin/python"
 else
-  COVER_PY="python3"
+  COVER_PY="$PY"
 fi
 
 # ── node 解释器（ADR-0052）──────────────────────────────────────────
@@ -180,7 +226,7 @@ write_status() {  # $1 ok(1/0)  $2 stage  $3 reason  $4 detail  $5 degraded(可�
   # degraded 是「跑完了但有让步」：与 ok=0 不同，它不该让看守告警，但必须让人看见。
   ST_OK="$1" ST_STAGE="$2" ST_REASON="$3" ST_DETAIL="${4:-}" ST_DEGRADED="${5:-}" \
   ST_DATE="$DATE" ST_MODE="$MODE" \
-  python3 - <<'PY'
+  "$PY" - <<'PY'
 import json, os
 from datetime import datetime, timedelta, timezone
 CST = timezone(timedelta(hours=8))
@@ -205,7 +251,7 @@ PY
 }
 
 brief_now() {
-  python3 .agents/skills/newsagg-brief/scripts/brief.py --date "$DATE" \
+  "$PY" .agents/skills/newsagg-brief/scripts/brief.py --date "$DATE" \
     || echo "[X] 简报生成失败——看守会因此告警（ADR-0006：简报必须无条件每日存在）" >&2
 }
 
@@ -216,7 +262,7 @@ brief_now() {
 # 这一步幂等，且失败不阻塞——归档写不进去不该让发布失败。
 sync_ledger_archive() {
   if [[ -n "$NO_GIT" ]]; then echo "（--no-git：跳过账本归档）"; return 0; fi
-  python3 - <<'PY'
+  "$PY" - <<'PY'
 import sys
 sys.path.insert(0, ".agents/lib")
 try:
@@ -287,7 +333,7 @@ fail_soft() {  # $1 stage  $2 reason  $3 detail  $4 allow_push(1/0)
 }
 
 dec_field() {  # $1 = 键路径；$2 = 列表分隔符（默认换行）。先在 decision 对象里找，再回退到顶层（abstain_reason 等）
-  DEC="$DEC" FIELD="$1" FIELD_SEP="${2-$'\n'}" python3 - <<'PY'
+  DEC="$DEC" FIELD="$1" FIELD_SEP="${2-$'\n'}" "$PY" - <<'PY'
 import json, os
 
 raw = json.load(open(os.environ["DEC"], encoding="utf-8"))
@@ -355,7 +401,7 @@ git_pull() {
     # 冲突不是瞬时错误：重试只会三次撞在同一处，而且每次都动工作区。
     # 冲突即熔断、不自行合并——自动解决可能静默丢弃你在风格或合规规则上的修改。
     if grep -qiE 'CONFLICT|Automatic merge failed|could not apply' "$err"; then
-      python3 - <<'PY' || true
+      "$PY" - <<'PY' || true
 import importlib.util
 from pathlib import Path
 spec = importlib.util.spec_from_file_location(
@@ -440,8 +486,8 @@ ADR-0018：人的改动优先，系统不得替人决定提交什么。"
 # ── ② 风格学习（ADR-0026：必须早于写作）──────────────────────────
 style_learn() {
   log "② 风格学习（若你改过教学副本）"
-  python3 .agents/skills/newsagg-triage/scripts/style_learn.py > /tmp/newsagg-style.json 2>&1 || true
-  python3 - <<'PY'
+  "$PY" .agents/skills/newsagg-triage/scripts/style_learn.py > /tmp/newsagg-style.json 2>&1 || true
+  "$PY" - <<'PY'
 import json
 try:
     d = json.load(open("/tmp/newsagg-style.json", encoding="utf-8"))
@@ -468,9 +514,9 @@ PY
 PERF_BACKEND="${NEWSAGG_PERF_BACKEND:-api}"
 performance() {
   log "②b 表现数据（循环 C：读回 + 自身基准 + 降频判定，后端 ${PERF_BACKEND}）"
-  python3 .agents/skills/newsagg-performance/scripts/performance.py \
+  "$PY" .agents/skills/newsagg-performance/scripts/performance.py \
     --backend "${PERF_BACKEND}" > /tmp/newsagg-perf.json 2>&1 || true
-  python3 - <<'PY'
+  "$PY" - <<'PY'
 import json
 try:
     d = json.load(open("/tmp/newsagg-perf.json", encoding="utf-8"))
@@ -509,7 +555,7 @@ PY
 # ── ②c 降频跳过日（ADR-0010：自动降频，恢复需人工确认）────────────
 skip_day_gate() {
   local skip
-  skip="$(python3 .agents/skills/newsagg-performance/scripts/performance.py --check-skip 2>/dev/null \
+  skip="$("$PY" .agents/skills/newsagg-performance/scripts/performance.py --check-skip 2>/dev/null \
     | python3 -c 'import json,sys
 try: print("1" if json.load(sys.stdin).get("skip") else "0")
 except Exception: print("0")' 2>/dev/null || echo 0)"
@@ -527,7 +573,7 @@ except Exception: print("0")' 2>/dev/null || echo 0)"
 # ── ③ 采集 ──────────────────────────────────────────────────────
 collect_now() {
   log "③ 采集（同日多次采集会累积合并，保留事件发酵过程）"
-  if ! python3 .agents/skills/newsagg-collect/scripts/collect.py --base "$HOT_BASE"; then
+  if ! "$PY" .agents/skills/newsagg-collect/scripts/collect.py --base "$HOT_BASE"; then
     fail_soft "collect" "采集失败（全部源不可达）" "热榜服务 $HOT_BASE" 1
   fi
 }
@@ -536,7 +582,7 @@ collect_now() {
 triage_input() {
   log "③b 分拣：组装输入包"
   [[ -f "$CAND" ]] || fail_soft "triage_input" "找不到候选文件" "$CAND" 1
-  python3 .agents/skills/newsagg-triage/scripts/triage.py || \
+  "$PY" .agents/skills/newsagg-triage/scripts/triage.py || \
     fail_soft "triage_input" "组装分拣输入包失败" "$CAND" 1
 }
 
@@ -591,7 +637,7 @@ if [[ -z "$AFTER_TRIAGE" && -z "$AFTER_WRITE" ]]; then
        修订史 / 可接住的事件类型 / 边界与反方），并把文件名填进
        decision.card_file
   3. 跑校验：
-     python3 .agents/skills/newsagg-triage/scripts/triage.py \\
+     "$PY" .agents/skills/newsagg-triage/scripts/triage.py \\
        --validate ${DEC}
 
 校验通过后，继续执行：
@@ -607,7 +653,7 @@ if [[ -n "$AFTER_TRIAGE" && -z "$AFTER_WRITE" ]]; then
   [[ -f "$DEC" ]] || fail_soft "write" "缺决策文件（分拣判断未完成）" "$DEC" 1
   # 显式 --out 到 ${DATE}：build_brief 默认按"今天"命名，跨零点续跑或重放历史
   # 决策时会让 handoff 指引指向一个不存在的文件。三段必须共享同一日期。
-  python3 .agents/skills/newsagg-triage/scripts/build_brief.py --decision "$DEC" \
+  "$PY" .agents/skills/newsagg-triage/scripts/build_brief.py --decision "$DEC" \
     --out ".newsagg/briefs/${DATE}.md" \
     || fail_soft "write" "生成选题包失败" "$DEC" 1
 
@@ -680,7 +726,7 @@ fi
 # 讲 Codex 迁移的文章」算不算图文无关。没有 query 就说明没人做过这个判断，
 # 此时加一张来路不明的照片，只是把「图文无关」变成系统自动决定的。
 if [[ -f "$COVER_SPEC" ]]; then
-  PHOTO_QUERY="$(python3 - "$COVER_SPEC" <<'PY' || true
+  PHOTO_QUERY="$("$PY" - "$COVER_SPEC" <<'PY' || true
 import json, sys
 try:
     print(json.load(open(sys.argv[1])).get("photo_query") or "")
@@ -694,7 +740,7 @@ PY
     "$COVER_PY" .agents/skills/newsagg-publish/scripts/fetch_photo.py \
       --query "$PHOTO_QUERY" > "$PHOTO_JSON" 2>/dev/null
     set -e
-    PHOTO_PATH="$(python3 - "$PHOTO_JSON" <<'PY' || true
+    PHOTO_PATH="$("$PY" - "$PHOTO_JSON" <<'PY' || true
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -728,7 +774,7 @@ set -e
 # 把封面的自检结果打出来。ADR-0044 发现六：封面质量问题的旧形态是**静默**——
 # 自检只回报常量、警告没人读。既然无人值守时没有第二双眼睛，
 # 这些警告就必须落到运行输出与简报里，否则等于没检查。
-python3 - "$COVER_JSON" <<'PY' || true
+"$PY" - "$COVER_JSON" <<'PY' || true
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -760,7 +806,7 @@ if [[ "$MODE" == "publish" ]]; then PUB_FLAG="--mode publish"; else PUB_FLAG="";
 # slug 不会，卡名只能在这一刻从决策文件里取到。dry-run 也记，便于验证。
 CARD="$(dec_field card_file)"
 set +e
-python3 .agents/skills/newsagg-publish/scripts/publish.py \
+"$PY" .agents/skills/newsagg-publish/scripts/publish.py \
   --slug "$SLUG" --cover "outputs/covers/${SLUG}.png" \
   ${CARD:+--card-file "$CARD"} $PUB_FLAG
 PUB_RC=$?
@@ -776,7 +822,7 @@ if [[ "$MODE" == "publish" ]]; then
     WB_ARGS=(--card "$CARD" --event "$(dec_field event.summary)" --article "$SLUG" --date "$DATE")
     [[ -n "$(dec_field whats_new)" ]] && WB_ARGS+=(--judgment "$(dec_field whats_new)")
     [[ -n "$(dec_field event.key_evidence)" ]] && WB_ARGS+=(--evidence "$(dec_field event.key_evidence)")
-    if python3 .agents/skills/newsagg-triage/scripts/writeback.py "${WB_ARGS[@]}"; then
+    if "$PY" .agents/skills/newsagg-triage/scripts/writeback.py "${WB_ARGS[@]}"; then
       echo "写回完成（带未复核标记，你可推翻）"
     else
       echo "[X] 写回失败——认知资产本轮未生长（不阻塞发布，但须人工补）" >&2

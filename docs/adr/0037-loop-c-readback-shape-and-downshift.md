@@ -46,6 +46,16 @@ items[0].data[j].assembleCell.itemCell.{articleBase, itemCounter, richContentInf
 
 第二条**推翻了 ADR-0024 能力表里 `analytics works` / `content-detail` 标 ✅ 已实现的状态**——至少 `content-detail` 名不副实。ADR-0024 该表据此修正。
 
+> **⚠️ 勘误（2026-10-26，ADR-0068）**：上表第二行的**结论是错的**——错在参数，不在接口。
+> `--content-type 2` 是 `Video`，而**图文文章是 1**（平台自己的枚举：`{All:0,PgcArticle:1,Video:2,Weitoutiao:3,Wenda:4,ShortVideo:5,Audio:6,PgcGallery:7,Invalid:8}`）。
+> 用 `type=1` 调同一个接口返回 `code:0` 与完整数据。CLI 的默认值当时是 2，于是每一篇文章都拿到 1003——
+> **而 1003 与「这个作品没有数据」的响应完全相同**，因此被读成了「接口坏了」。
+> 本 ADR 的**决策一**（循环 C 的唯一数据源是 `content list`）**仍然成立**、未被推翻：
+> `content list` 一次拿到全部篇的展现与阅读，确实比逐篇调 `content-detail` 便宜。
+> 被推翻的是「`content-detail` 不可用」这个事实判断，以及据此关掉的那条能力路
+> （「读不到完读率 / 停留时长 / 同类百分位」这三个指标其实读得到）。
+> 详见 `docs/adr/0068-content-detail-type-param-was-wrong.md`。
+
 `analytics works` 返回的聚合展现量（13）与 `content list` 的每篇展现量（234）口径不同，不能互相印证，也不可混用。
 
 ### 三、ADR-0013 的信用分门没有任何实现路径

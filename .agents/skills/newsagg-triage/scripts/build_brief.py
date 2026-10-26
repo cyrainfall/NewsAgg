@@ -44,6 +44,20 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     return fm, body
 
 
+def _load_title_rules():
+    """加载发布层的 `title_rules`（标题规则的唯一实现，ADR-0069）。
+
+    规则本体在 `platforms/title-rules.md`（归本人，ADR-0018），判定逻辑在发布层。
+    这里不复制一份——ADR-0042 的教训：契约的两份实现会漂移，且漂移是静默的。
+    """
+    import importlib.util
+    path = repo_root() / ".agents" / "skills" / "newsagg-publish" / "scripts" / "title_rules.py"
+    spec = importlib.util.spec_from_file_location("title_rules_shared", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def load_card(path: Path) -> dict:
     fm, body = parse_frontmatter(path.read_text(encoding="utf-8"))
     return {
@@ -177,6 +191,49 @@ def build_brief(decision: dict, card: dict | None, style: dict, target_words: st
     lines.append("   - 直白优于悬念。本账号发布在**推荐流**，读者无前置上下文，")
     lines.append("     标题是唯一的筛选器；悬念式标题在冷启动分发中会被跳过。")
     lines.append("")
+
+    # ── 标题规则（`platforms/title-rules.md`，ADR-0069）──
+    # 这里渲染的是**同一份**规则文件，发布门也用它判。不各抄一份。
+    tr = _load_title_rules()
+    rules = tr.load_rules(repo_root())
+    if not rules.get("loaded"):
+        lines.append("> ⚠️ 标题规则文件读不上（发布门会按平台硬长度限制放行）："
+                     f"{rules.get('error')}")
+        lines.append("")
+    else:
+        hard = rules["hard"]
+        observe = rules.get("observe") or {}
+        lines.append("### 标题规则（`platforms/title-rules.md`，发布门会按同一条拒发）")
+        lines.append("")
+        lines.append("**硬下限（不满足会被拒发，平台审核会把夸张标题退回、")
+        lines.append("而退回的文章再改也不会被推荐）**：")
+        if hard.get("forbid_words"):
+            lines.append(f"- 不得出现这些词：{'、'.join(hard['forbid_words'])}")
+        if hard.get("forbid_ending_chars"):
+            lines.append(f"- 不得以这些字符结尾：{' '.join(hard['forbid_ending_chars'])}")
+        lines.append(f"- 长度 {hard.get('min_len')}~{hard.get('max_len')} 字")
+        lines.append("")
+        if observe:
+            lines.append("**观察项（不拦发，但下次要拿它们检验）：**")
+            landing = observe.get("reader_side_landing") or {}
+            if landing:
+                lines.append(f"- {landing.get('desc','')}")
+                if landing.get("role_markers"):
+                    lines.append(f"  角色词示例：{'、'.join(landing['role_markers'][:8])}…")
+                if landing.get("anti_markers"):
+                    lines.append(f"  这些是**反面**信号（我们的 0 阅读文章都收在它们上）："
+                                 f"{'、'.join(landing['anti_markers'])}")
+            contrast = observe.get("contrast_shape") or {}
+            if contrast:
+                lines.append(f"- {contrast.get('desc','')}")
+            number = observe.get("concrete_number") or {}
+            if number:
+                lines.append(f"- {number.get('desc','')}")
+            lines.append("")
+            lines.append("> 这些是**待检验的假设**（样本 n=10，展现量与账号权重共线），")
+            lines.append("> 所以它们只打标签、不拦发。但写标题时请尽量命中——")
+            lines.append("> 下一次我们靠它们判断「哪一条值得升为硬规则」。")
+            lines.append("")
     lines.append("### 结构（读者视角，非作者视角）")
     lines.append("6. **开头第一段就给读者利益或核心判断**，不要用元叙事铺垫")
     lines.append("   （「按惯例，这类发布有两种读法」「过去我倾向于」）。")

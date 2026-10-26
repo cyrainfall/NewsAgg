@@ -69,10 +69,117 @@ export async function getIncomeAnalytics(opts) {
 }
 
 /**
+ * 批量获取多篇作品的详细数据（一个浏览器会话取全部）。
+ *
+ * 为什么要有这个：`getContentDetail` 每篇都要 launchBrowser + 登录 + 导航一次，
+ * 而后台「查看数据」弹层读到的三个指标（完读率、平均时长、超过 N% 同类）
+ * 都在同一个接口里。逐篇调用意味着 10 篇文章 = 10 次浏览器冷启动。
+ * 批量版只启一次浏览器，在页面内并发拉全部 gid。
+ *
+ * 返回形状：
+ *   {success, category:'content_detail_batch', count, items:[{contentId, success, ...}], errors:[]}
+ * 单篇失败不影响其余篇（ADR-0006：表现数据读不回来不阻断本轮）。
+ */
+export async function getContentDetailBatch(opts) {
+  const { context, page } = await launchBrowser(opts);
+  try {
+    await ensureLoggedIn(page);
+
+    await page.goto('https://mp.toutiao.com/profile_v4/manage/content/all', {
+      waitUntil: 'domcontentloaded', timeout: 30000,
+    });
+    await waitForStable(page);
+    await sleep(1500, 2500);
+
+    // commander 的变长选项（`<id...>`）把数组挂在 camelCase 名 `contentId` 上，
+    // 不是 `contentIds`——写错这个名字会静默拿到 undefined，于是报「未提供 --content-id」。
+    const rawIds = opts.contentId;
+    const ids = (Array.isArray(rawIds) ? rawIds : [rawIds])
+      .filter(Boolean).map(String).filter(Boolean);
+    if (!ids.length) {
+      return { success: false, category: 'content_detail_batch', error: '未提供 --content-id（可重复）' };
+    }
+    const contentType = opts.contentType || '1';
+
+    const raw = await page.evaluate(async ({ ids, type }) => {
+      const out = [];
+      // 逐个 await 而不是 Promise.all：这是同一个会话里的低频读，
+      // 并发打太多容易被平台的接口频控挡掉，而错判成「无数据」比慢更糟。
+      for (const id of ids) {
+        try {
+          const url = `https://mp.toutiao.com/mp/agw/statistic/v2/item/info?item_id=${id}&type=${type}&app_id=1231`;
+          const res = await fetch(url, { credentials: 'include' });
+          const data = await res.json();
+          out.push({ id, data });
+        } catch (err) {
+          out.push({ id, error: String(err && err.message ? err.message : err) });
+        }
+      }
+      return out;
+    }, { ids, type: contentType });
+
+    const KNOWN_TYPES = [0, 1, 2, 3, 4, 5, 6, 7];
+    const typeNum = Number(contentType);
+    const items = [];
+    const errors = [];
+
+    for (const entry of raw) {
+      if (entry.error) {
+        errors.push({ contentId: entry.id, error: entry.error });
+        items.push({ contentId: entry.id, success: false, error: entry.error });
+        continue;
+      }
+      const data = entry.data;
+      if (data && data.code === 1003) {
+        if (!KNOWN_TYPES.includes(typeNum)) {
+          items.push({
+            contentId: entry.id, success: false, contentType,
+            error: `content-type 编号 ${contentType} 不在平台枚举 ${KNOWN_TYPES.join('/')} 内，接口因此返回 1003（不是「没有数据」）`,
+          });
+        } else {
+          items.push({
+            contentId: entry.id, success: true, contentType, noData: true,
+            note: '平台返回 1003：type 合法，但该作品暂无数据（通常是发布次日 14:00 前数据未就绪）',
+          });
+        }
+        continue;
+      }
+      if (!data || data.code !== 0) {
+        items.push({
+          contentId: entry.id, success: false, contentType,
+          error: `接口返回 code=${data ? data.code : 'null'}：${data ? (data.message || '') : '无信封'}`,
+        });
+        continue;
+      }
+      items.push({ contentId: entry.id, success: true, contentType, data });
+    }
+
+    return {
+      success: true,
+      category: 'content_detail_batch',
+      contentType,
+      count: items.length,
+      items,
+      errors,
+    };
+  } finally {
+    await closeBrowser(context);
+  }
+}
+
+/**
  * 获取单个作品的详细数据。
  * 直接调用头条数据统计 API：/mp/agw/statistic/v2/item/info
  * --content-id  作品 ID（item_id / gidStr）
- * --content-type 内容类型编号（默认 2）: 2=图文/微头条, 3=视频 等
+ * --content-type 内容类型编号（默认 1）: 1=图文文章, 2=视频, 3=微头条, 4=问答, 5=小视频, 6=音频, 7=图集
+ *
+ * 类型编号取自头条号后台自己的枚举（`@mp/analysis` 前端包里
+ * `{All:0,PgcArticle:1,Video:2,Weitoutiao:3,Wenda:4,ShortVideo:5,Audio:6,PgcGallery:7,Invalid:8}`）。
+ * 传错编号不会报参数错误，只会返回 `{"code":1003,"item_data":{},
+ * "message":"数据开小差啦~请稍后再试"}` —— 与「这个作品没有数据」长得一模一样。
+ * 2026-10-26 核实：本仓库原来默认 2，于是所有文章都取到 1003，
+ * ADR-0037 据此判定「该接口返回空数据，不可用」。那个结论是错的，
+ * 错在参数而不是接口。详见 docs/adr/0068-content-detail-type-param-was-wrong.md。
  */
 export async function getContentDetail(opts) {
   const { context, page } = await launchBrowser(opts);
@@ -87,7 +194,7 @@ export async function getContentDetail(opts) {
     await sleep(1500, 2500);
 
     const itemId = opts.contentId;
-    const contentType = opts.contentType || '2';
+    const contentType = opts.contentType || '1';
 
     if (!itemId) {
       // 未指定 ID，从列表中取第一个作品的 ID
@@ -113,6 +220,38 @@ export async function getContentDetail(opts) {
       const res = await fetch(url, { credentials: 'include' });
       return res.json();
     }, { id: opts.contentId, type: contentType });
+
+    // 1003 有两种完全不同的含义，调用方无法区分：
+    //   a) type 传错（编号不在平台枚举里）—— 换个 type 就好；
+    //   b) 这个作品确实没有数据（刚发布、数据未就绪）。
+    // 分不清的时候，调用方只能靠猜，而猜错的代价是「接口不可用」
+    // 这种会被写进 ADR 并据此关掉一条能力路的结论（ADR-0037 就这么错的）。
+    // 所以这里显式区分：known type 却 1003 → 报「无数据」；未知 type → 报「参数错」。
+    const KNOWN_TYPES = [0, 1, 2, 3, 4, 5, 6, 7];
+    const typeNum = Number(contentType);
+    if (data && data.code === 1003) {
+      if (!KNOWN_TYPES.includes(typeNum)) {
+        return {
+          success: false,
+          category: 'content_detail',
+          contentId: opts.contentId,
+          contentType,
+          source: 'api_fetch',
+          error: `content-type 编号 ${contentType} 不在平台枚举 ${KNOWN_TYPES.join('/')} 内，接口因此返回 1003（不是「没有数据」）`,
+          data,
+        };
+      }
+      return {
+        success: true,
+        category: 'content_detail',
+        contentId: opts.contentId,
+        contentType,
+        source: 'api_fetch',
+        noData: true,
+        note: '平台返回 1003：type 合法，但该作品暂无数据（通常是发布次日 14:00 前数据未就绪）',
+        data,
+      };
+    }
 
     return {
       success: true,

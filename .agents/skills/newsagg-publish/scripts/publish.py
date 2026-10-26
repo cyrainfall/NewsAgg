@@ -47,6 +47,20 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+def _load_title_rules():
+    """加载同目录的 `title_rules`（标题规则的唯一实现）。
+
+    与 `cardfm.py` 同一套做法：规则本身在 `platforms/title-rules.md`（归本人，ADR-0018），
+    判定逻辑在这里（一份实现，`build_brief.py` 也从这里读——ADR-0042 的教训：
+    契约的两份实现会漂移，且漂移是静默的）。
+    """
+    here = Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import title_rules
+    return title_rules
+
+
 class Breaker:
     """熔断状态（ADR-0025：存仓内文件，便于人工解除、guard 可同步读）。"""
 
@@ -478,12 +492,29 @@ def main() -> int:
         print(json.dumps({"ok": False, "stage": "input",
                           "message": "成稿缺少一级标题（# 标题）"}, ensure_ascii=False, indent=2))
         return 1
-    # 头条标题硬限制 2~30 字（ADR-0024）
-    if not (2 <= len(title) <= 30):
-        print(json.dumps({"ok": False, "stage": "input",
-                          "message": f"标题长度 {len(title)} 不在 2~30 字内：{title}"},
+
+    # ── 标题硬下限（`platforms/title-rules.md`，规则唯一副本）──
+    # 为什么在这里拦而不是让写作阶段自觉：头条的审核把「标题夸张」与敏感词同列为退回项，
+    # 而**退回的文章再改也不会被推荐**——下行风险是「这一篇归零」而不是「少一点点击」。
+    # 对一个月发 1 篇的账号，保守是划算的（ADR-0069）。
+    tr = _load_title_rules()
+    rules = tr.load_rules(root)
+    if not rules.get("loaded"):
+        # 规则读不上 ≠ 可以随便发。但也不能因此让整轮停摆——
+        # 记下来，让简报告诉人（ADR-0062 的判据：谁会读它，读不到会怎样）。
+        print(json.dumps({"ok": True, "stage": "title_rules", "warning": rules.get("error"),
+                          "message": "标题规则文件读不上，本次只按平台硬长度限制放行"},
                          ensure_ascii=False, indent=2))
-        return 1
+    else:
+        problems = tr.check_title(title, rules)
+        if problems:
+            print(json.dumps({
+                "ok": False, "stage": "title_rules",
+                "message": "标题不满足 `platforms/title-rules.md` 的硬下限",
+                "problems": problems,
+                "source": rules.get("source"),
+            }, ensure_ascii=False, indent=2))
+            return 1
     if not Path(args.cover).exists():
         print(json.dumps({"ok": False, "stage": "input",
                           "message": f"封面不存在：{args.cover}（头条必填，ADR-0013）"},
@@ -587,6 +618,12 @@ def main() -> int:
             "card_file": args.card_file or None,
             # ADR-0036：发布快照指纹，供风格回路做 diff 基线
             "snapshot": snapshot_fingerprint(root / "outputs" / f"{args.slug}.md"),
+            # ADR-0069：把标题的观察项标签记进账本。
+            # 观察项**不拦发**（n=10，展现量与账号权重共线，样本不支持升为硬规则），
+            # 但每次发布都留一份标签，样本攒够了才能判断哪一条值得升为硬下限。
+            # 写 null 而不是省略：省略与"没打标签"在消费端不可区分。
+            "title_tags": (tr.tag_title(title, rules)
+                           if rules.get("loaded") else None),
         }
 
         # ── 门 5：反查验证（ADR-0024，仅真发时）──

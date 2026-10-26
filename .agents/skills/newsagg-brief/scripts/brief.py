@@ -219,6 +219,32 @@ def fmt_metrics(metrics: dict | None) -> str:
     return " / ".join(parts) if parts else "无"
 
 
+def fmt_detail(detail: dict | None) -> str:
+    """单篇详细指标（ADR-0068）。这三个是 `content list` 不给的、后台弹层里有的。
+
+    口径（ADR-0068 核实）：
+      - `-1` = 数据未就绪（作品发布**次日 14:00 后**才可查）→ 显示「未就绪」
+      - `0`  = 已就绪但为 0 → 显示 0，不当成缺失
+    `click_rate_rank` 的值**就是**后台文案「超过 N% 同类作品」的 N。
+    """
+    d = detail or {}
+    parts: list[str] = []
+    for key, label in (("read_complete_rate", "完读率"), ("read_duration", "时长")):
+        if key not in d:
+            continue
+        v = d[key]
+        if v == -1:
+            parts.append(f"{label}未就绪")
+        elif key == "read_duration":
+            parts.append(f"{label} {int(v)}s")
+        else:
+            parts.append(f"{label} {v:.0f}%")
+    rank = d.get("click_rate_rank")
+    if isinstance(rank, (int, float)) and not isinstance(rank, bool) and rank != -1:
+        parts.append(f"超过 {int(rank)}% 同类")
+    return " / ".join(parts)
+
+
 def clip(text: str, limit: int) -> str:
     """按句截断，而不是按字符硬切。
 
@@ -450,6 +476,12 @@ def section_article(decision, publish_recs, body_dir: Path, perf: dict | None = 
         for r in rows:
             perf_block += [f"- {r.get('title','')}：阅读率 {fmt_rate(r.get('read_rate'))}"
                            f"（{fmt_metrics(r.get('metrics'))}）"]
+            # ADR-0068：完读率、时长、「超过 N% 同类」是 `content list` 不给的。
+            # 它们是唯一能回答「内容留得住人但标题拉不来人吗」的指标——
+            # 10-20 那篇完读率超过 96% 同类而点击率只超过 2% 同类，就是靠这个读出来的。
+            det = fmt_detail(r.get("detail"))
+            if det:
+                perf_block += [f"  - {det}"]
 
     if not d or d.get("action") == "abstain":
         out += ["本日无文章。"]

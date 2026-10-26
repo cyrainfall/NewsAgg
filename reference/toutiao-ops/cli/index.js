@@ -7,7 +7,7 @@ import { publishVideo } from './src/publish-video.js';
 import { publishWeitoutiao } from './src/publish-weitoutiao.js';
 import { listContent } from './src/content-manage.js';
 import { listComments, replyComment, likeComment } from './src/comment-manage.js';
-import { getWorksAnalytics, getFansAnalytics, getIncomeAnalytics, getContentDetail } from './src/analytics.js';
+import { getWorksAnalytics, getFansAnalytics, getIncomeAnalytics, getContentDetail, getContentDetailBatch } from './src/analytics.js';
 import { listInspiration } from './src/inspiration.js';
 import { checkForUpdates } from './src/update-check.js';
 
@@ -188,10 +188,20 @@ analytics
   .command('content-detail')
   .description('查看单个作品的详细数据')
   .option('--content-id <id>', '作品 ID（item_id / gidStr）')
-  .option('--content-type <type>', '内容类型编号: 2=图文/微头条, 3=视频', '2')
+  .option('--content-type <type>', '内容类型编号: 1=图文文章, 2=视频, 3=微头条, 4=问答, 5=小视频, 6=音频, 7=图集', '1')
   .option('--headless', '无头模式运行')
   .action(async (opts) => {
     await run(getContentDetail, opts);
+  });
+
+analytics
+  .command('content-detail-batch')
+  .description('批量查看多篇作品的详细数据（一个浏览器会话取全部，只读）')
+  .option('--content-id <id...>', '作品 ID（item_id / gidStr），可给多个')
+  .option('--content-type <type>', '内容类型编号: 1=图文文章, 2=视频, 3=微头条, 4=问答, 5=小视频, 6=音频, 7=图集', '1')
+  .option('--headless', '无头模式运行')
+  .action(async (opts) => {
+    await run(getContentDetailBatch, opts);
   });
 
 // ── inspiration ──

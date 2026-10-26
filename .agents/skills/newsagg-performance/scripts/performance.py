@@ -261,6 +261,135 @@ def local_title_index(root: Path) -> tuple[dict[str, str], dict[str, str], dict[
                            "by_gid": len(by_gid)}
 
 
+# ────────────────────────── 单篇详细指标（ADR-0068）──────────────────────────
+
+# 平台枚举：`{All:0,PgcArticle:1,Video:2,Weitoutiao:3,Wenda:4,ShortVideo:5,Audio:6,PgcGallery:7}`
+# 文章是 1。传错编号不会报参数错，只返回 1003「数据开小差啦」——与「无数据」一模一样。
+CONTENT_TYPE_ARTICLE = 1
+
+
+def extract_detail_metrics(payload: dict) -> dict:
+    """从 `content-detail` 的单篇信封里抽出三个 `content list` 没有的指标。
+
+    这三个指标是后台「查看数据」弹层里显示、但 `content list` 不给的：
+      - `read_complete_rate`  平均阅读完成率（百分数，如 84.0）
+      - `read_duration`       平均阅读时长（秒）
+      - `click_rate_rank`     「超过 N% 同类作品」的 N（后台文案里的那个 N）
+
+    口径（ADR-0068 核实）：
+      - `-1` = 数据未就绪（作品发布**次日 14:00 后**才可查）→ 保留 -1，不当 0
+      - `0`  = 已就绪但为 0（0 阅读的文章完读率就是 0，不是缺失）
+
+    ⚠️ 为什么不直接用 `consume_data.impression_count` 覆盖 `showCount`：
+    实测两者口径一致（`content list` 的 showCount 1290 == item/info 的 impression_count 1290），
+    但 `content list` 是列表级读数、`item/info` 是单篇读数，覆盖会让同一天两轮运行
+    之间出现无谓的差异。就地更新时只更新这三项，展示量仍以 `content list` 为准。
+    """
+    out: dict = {}
+    if not isinstance(payload, dict):
+        return out
+    item = payload.get("item_data")
+    if not isinstance(item, dict):
+        return out
+    stat = item.get("item_stat")
+    if not isinstance(stat, dict):
+        return out
+
+    detail = stat.get("consume_detail")
+    if isinstance(detail, dict):
+        for src, dst in (("read_complete_rate", "read_complete_rate"),
+                         ("read_duration", "read_duration")):
+            v = detail.get(src)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[dst] = v
+
+    ranking = stat.get("ranking_data")
+    if isinstance(ranking, dict):
+        for k in ("click_rate_rank", "interaction_rate_rank", "read_complete_rate_rank"):
+            v = ranking.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[k] = v
+    return out
+
+
+def fetch_content_details(pub, root: Path, account: str, gids: list[str]) -> tuple[dict, dict]:
+    """批量读单篇详细指标。返回 (gid → 指标字典, 观测元数据)。
+
+    为什么要批量：`getContentDetail` 每篇都要冷启一次浏览器 + 登录 + 导航，
+    10 篇就是 10 次。`content-detail-batch` 只启一次浏览器（ADR-0068）。
+
+    失败不致命：表现数据读不回来不阻断本轮（ADR-0006）。
+    """
+    meta: dict = {"requested": len(gids), "source": "content-detail-batch"}
+    if not gids:
+        meta["skipped"] = "没有 gid"
+        return {}, meta
+
+    env = {
+        "TT_CLI_DIR": root / "reference" / "toutiao-ops" / "cli",
+        "ENVIRON": {
+            **os.environ,
+            "HOME": str(root / ".home"),  # ADR-0028
+            "PATH": f"{root / '.uv-bin'}:{os.environ.get('PATH', '')}",
+        },
+    }
+
+    lock = pub.FileLock(root / ".newsagg" / "browser.lock", timeout=300.0)
+    try:
+        with lock:
+            code, out, err = pub.run_toutiao(
+                ["analytics", "content-detail-batch",
+                 "--content-id", *gids,
+                 "--content-type", str(CONTENT_TYPE_ARTICLE),
+                 "--account", account],
+                env, timeout=300,
+            )
+    except TimeoutError as exc:
+        meta["error"] = f"锁等待超时：{exc}"
+        return {}, meta
+
+    if code != 0:
+        meta["error"] = f"content-detail-batch 失败（code={code}）"
+        meta["stderr_tail"] = (err or out)[-400:]
+        return {}, meta
+
+    try:
+        raw = json.loads(out)
+    except json.JSONDecodeError as exc:
+        meta["error"] = f"JSON 解析失败：{exc}"
+        return {}, meta
+
+    if not raw.get("success"):
+        meta["error"] = raw.get("error") or "接口返回 success=false"
+        return {}, meta
+
+    out_map: dict[str, dict] = {}
+    no_data: list[str] = []
+    failed: list[dict] = []
+    for item in raw.get("items") or []:
+        gid = str(item.get("contentId") or "")
+        if not gid:
+            continue
+        if not item.get("success"):
+            failed.append({"gid": gid, "error": item.get("error")})
+            continue
+        if item.get("noData"):
+            no_data.append(gid)
+            continue
+        m = extract_detail_metrics(item.get("data") or {})
+        if m:
+            out_map[gid] = m
+
+    meta["got"] = len(out_map)
+    meta["no_data"] = no_data
+    meta["failed"] = failed
+    if no_data:
+        # 1003 合法但无数据 = 作品发布次日 14:00 前。这是**正常状态**，不是故障。
+        meta["note"] = (f"{len(no_data)} 篇暂无数据（作品发布次日 14:00 前才可查，"
+                        f"ADR-0068 口径）")
+    return out_map, meta
+
+
 # ────────────────────────── 基准与降频 ──────────────────────────
 
 def record_kind(rec: dict) -> str:
@@ -536,6 +665,22 @@ def main() -> int:
     weitoutiao = [a for a in articles if a.get("matched") and a.get("kind") != "article"]
     unmatched = [a for a in articles if not a.get("matched")]
 
+    # ── 单篇详细指标（ADR-0068）──
+    # `content list` 只给展现与阅读；完读率、平均时长、「超过 N% 同类作品」要逐篇问
+    # `item/info`。这四个指标是唯一能把「标题结构」变成可测量对象的东西
+    # （ADR-0069 的观察项要靠它们才可能升为硬规则）。
+    # 只取**我们的**文章：别人的文章跟标题无关，取了只是浪费接口配额。
+    detail_metrics: dict[str, dict] = {}
+    detail_meta: dict = {"skipped": "离线模式（--from-file）"}
+    if not args.from_file:
+        our_gids = [str(a.get("gid")) for a in ours if a.get("gid")]
+        detail_metrics, detail_meta = fetch_content_details(
+            pub, root, args.account, our_gids)
+        for a in ours:
+            m = detail_metrics.get(str(a.get("gid")))
+            if m:
+                a["detail"] = m
+
     # ── 落库（每篇每天只留一行；同一天重跑则**就地更新**）──
     # 为什么不追加：一天跑两次不该让同一篇文章在基准里算两遍。
     # 为什么不冻结首行：若冻结，当天第二次运行会拿到凌晨的旧数字，
@@ -553,9 +698,16 @@ def main() -> int:
             by_key[k] = len(records)
             records.append(a)
             new_records.append(a)
-        elif records[i] != a:
-            records[i] = a
-            updated_records.append(a)
+        else:
+            # 保留上一轮的 `detail`：离线复算（--from-file）或平台暂时 1003 时
+            # 本轮取不到这三个指标，直接整条覆盖会把已经拿到的完读率/时长擦掉。
+            # 「就地更新」更新的是**数字**，不是「把没读到的当 0」（ADR-0043 的教训同型）。
+            old = records[i]
+            if not a.get("detail") and old.get("detail"):
+                a["detail"] = old["detail"]
+            if old != a:
+                records[i] = a
+                updated_records.append(a)
 
     verdict = evaluate(records, window=args.window, coldstart=args.coldstart,
                        low_ratio=args.low_ratio, low_streak=args.low_streak)
@@ -592,6 +744,7 @@ def main() -> int:
             "updated_records": len(updated_records),
             "store": str(store_path.relative_to(root)),
             "fetch": fetch_meta,
+            "detail": detail_meta,
         })
 
     skip, skip_why = is_skip_day(freq, today)
@@ -614,7 +767,7 @@ def main() -> int:
         "articles": [{"slug": a.get("slug"), "title": a.get("title"), "ours": a["ours"],
                       "kind": a.get("kind"),
                       "published_at": a.get("published_at"), "read_rate": a.get("read_rate"),
-                      "metrics": a.get("metrics")} for a in articles],
+                      "metrics": a.get("metrics"), "detail": a.get("detail")} for a in articles],
     }, ensure_ascii=False, indent=2))
     return 0
 

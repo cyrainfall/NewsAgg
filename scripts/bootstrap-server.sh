@@ -144,7 +144,31 @@ else
   fi
 fi
 
-# ── 6. 汇总结论 ──────────────────────────────────────────────────────
+# ── 6. git 身份（编排器要提交产出）──────────────────────────────────
+# 服务器上 clone 出来的仓库**没有 user.name/user.email**，于是收尾的
+# `git add -A && git commit` 报：
+#   Author identity unknown
+#   *** Please tell me who you are.
+#   fatal: unable to auto-detect email address (got 'root@iZwz93frlza7g5nz9ft5dcZ.(none)')
+# 这会让整轮跑完、产出也生成了，却**留不下来**（ADR-0006：产出不丢）。
+# 身份用仓库自己的，不改全局配置（ADR-0018：不替人决定提交什么）。
+if [[ $CHECK_ONLY -eq 1 ]]; then
+  if [[ -n "$(git -C "$REPO" config user.name 2>/dev/null)" ]]; then
+    echo "[检查] git 身份：已配（$(git -C "$REPO" config user.name)）"
+  else
+    echo "[检查] git 身份：**缺失**（收尾的 commit 会失败）"
+  fi
+else
+  if [[ -z "$(git -C "$REPO" config user.name 2>/dev/null)" ]]; then
+    echo "[装] 设置仓库级 git 身份"
+    git -C "$REPO" config user.name "${GIT_USER_NAME:-newsagg-bot}"
+    git -C "$REPO" config user.email "${GIT_USER_EMAIL:-newsagg-bot@localhost}"
+  else
+    echo "[工具] git 身份已配：$(git -C "$REPO" config user.name)"
+  fi
+fi
+
+# ── 7. 汇总结论 ──────────────────────────────────────────────────────
 echo
 echo "=== 结论 ==="
 MISSING=0
@@ -154,6 +178,7 @@ done
 [[ -x "$REPO/.uv-tools/wewrite/bin/python" ]] || { echo "  缺：wewrite venv"; MISSING=1; }
 [[ -d "$CLI_DIR/node_modules/playwright" ]] || { echo "  缺：toutiao-ops 依赖"; MISSING=1; }
 [[ -d "$REPO/.home/.cache/ms-playwright" ]] || { echo "  缺：Playwright 浏览器缓存"; MISSING=1; }
+[[ -n "$(git -C "$REPO" config user.name 2>/dev/null)" ]] || { echo "  缺：git 身份"; MISSING=1; }
 if [[ $MISSING -eq 0 ]]; then
   echo "  环境齐了。下一步：起 Xvfb，注入 cookie，然后 dry-run。"
 else

@@ -110,7 +110,7 @@ def load_candidates(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def performance_reference(perf_path: Path, runs_path: Path) -> dict:
+def performance_reference(perf_path: Path, runs_path: Path, root: Path) -> dict:
     """汇总历史表现，供分拣做**排序参考**（ADR-0010）。
 
     ⚠️ 这是软信号，不是硬规则：ADR-0010 明确不据此自动降权或退役卡片。
@@ -636,6 +636,7 @@ def main() -> int:
         performance=performance_reference(
             root / "reports" / "performance.jsonl",
             root / ".newsagg" / "triage",
+            root,
         ),
     )
     pkg["limits"] = limits

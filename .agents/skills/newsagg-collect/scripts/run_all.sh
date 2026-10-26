@@ -378,6 +378,32 @@ git_pull() {
   local err=/tmp/newsagg-pull.err
   local attempt=1 max=3 detail
 
+  # ★ 上一轮失败留下的脏工作区会让这一轮**永远**拉不下来（2026-10-27 服务器实测）。
+  # 失败的运行会写一份简报（ADR-0006：简报必须无条件每日存在），而收尾的
+  # `sync_push` 先 `git add -A` 再 `git commit`；commit 失败（比如服务器上
+  # 没有 git 身份）时**索引就留在半暂存状态**。下一轮 ① git pull 撞上它：
+  #   error: cannot pull with rebase: You have unstaged changes.
+  #   error: additionally, your index contains uncommitted changes.
+  # → 又失败 → 又 `git add -A` → **死锁，一轮都跑不动**。第一次失败是偶发，
+  # 之后每一轮都必然失败，而原因藏在两轮之前。
+  #
+  # 处置：**只处理系统自己每天写的路径**（`reports/`），不碰任何可能是
+  # 你改的文件（outputs/、knowledge/、platforms/、style/…）。判据是
+  # 「这个路径是本系统每天写的」，不是「这个文件我看着像垃圾」——
+  # 前者可判定，后者是猜测（ADR-0018：不替人决定什么该丢）。
+  # 处置方式是**提交而不是丢弃**：reports/ 按 ADR-0012 本来就该入库
+  # （简报是历史档案），它不是垃圾，是当天该留下的东西。
+  if [[ -n "$(git status --porcelain -- reports/ 2>/dev/null)" ]]; then
+    echo "[!] 工作区有上一轮运行留下的痕迹（reports/），先单独提交再同步：" >&2
+    git status --porcelain -- reports/ | head -10 | sed 's/^/    /' >&2
+    if git add -A -- reports/ 2>/dev/null && \
+       git commit -q -m "NewsAgg 运行痕迹归档（${DATE}）" 2>/dev/null; then
+      echo "[✓] 已把 reports/ 单独提交（内容是简报与表现数据）" >&2
+    else
+      echo "[!] reports/ 无法单独提交（可能与其它改动冲突），继续尝试拉取" >&2
+    fi
+  fi
+
   # 显式点名远端分支，不用裸 `git pull`（它依赖 upstream 跟踪，而新分支没有）。
   # 远端还没有这个分支是**正常状态**（本地刚建、还没推过），不是失败：
   # 本轮照常跑，收尾 push 时用 -u 把分支建到远端，下一轮就能同步了。

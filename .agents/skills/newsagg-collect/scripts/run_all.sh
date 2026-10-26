@@ -191,6 +191,27 @@ if ! command -v node >/dev/null 2>&1; then
   fi
 fi
 
+# ── 头条 cookie 文件（ADR-0071/0072）────────────────────────────────
+# 表现数据回路默认走纯 HTTP api 后端（不需要 Chrome），而 api 后端要凭据：
+# 本机可以直读本机 Chrome 的 cookie 库，**服务器上没装 Chrome**，只能注入。
+# 注入文件放在 <repo>/.newsagg/toutiao-cookies.json（ADR-0071 的 .gitignore
+# 放行规则保证它不入库），由 `scripts/export-cookies.py` 导出后 scp 过去。
+#
+# 2026-10-27 服务器实测踩到：不设这个环境变量时，performance.py 回落到
+# from_browser() → 「找不到浏览器 chrome 的 profile」→ 表现读回失败，
+# 而它被 `|| true` 兜住 → **排序参考与降频判据悄悄沿用旧值**。
+# 所以这里：文件存在就自动指过去；不存在就说清楚。
+if [[ -z "${NEWSAGG_COOKIE_FILE:-}" && -f "$REPO/.newsagg/toutiao-cookies.json" ]]; then
+  export NEWSAGG_COOKIE_FILE="$REPO/.newsagg/toutiao-cookies.json"
+fi
+if [[ -n "${NEWSAGG_COOKIE_FILE:-}" ]]; then
+  if [[ -r "$NEWSAGG_COOKIE_FILE" ]]; then
+    echo "cookie：$NEWSAGG_COOKIE_FILE"
+  else
+    echo "警告：NEWSAGG_COOKIE_FILE 指向 $NEWSAGG_COOKIE_FILE，但读不到——表现读回会失败" >&2
+  fi
+fi
+
 log() { printf '\n=== %s ===\n' "$*"; }
 
 # ── 运行状态（简报 ⑤ 段与看守的输入）──────────────────────────────

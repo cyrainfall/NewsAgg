@@ -37,4 +37,10 @@ wewrite = "wewrite.cli:main"
 include = ["wewrite*"]
 
 [tool.setuptools.package-data]
-wewrite = ["data/*"]
+# `toolkit/themes/*.yaml` 必须在这里：`theme.py` 的 `_default_themes_dir()` 指向
+# `<包>/toolkit/themes`，而 setuptools 默认不打包非 .py 文件。漏掉的后果不是报错
+# 而是**静默缺目录**，直到 `load_theme()` 才抛 `FileNotFoundError`——而那时
+# preview/publish 已经走到加载主题这一步，看起来像「wewrite 坏了」。
+# 上游 wheel 是把这个目录打进去的（RECORD 里有 18 个 yaml），这里是对齐上游，
+# 不是本项目的行为修改（ADR-0060：这份 pyproject 只负责「能从源码装出来」）。
+wewrite = ["data/*", "toolkit/themes/*.yaml"]

@@ -78,6 +78,26 @@ try:
     print(f"✓ Pillow {md.version('Pillow')}（make_cover.py 依赖）")
 except Exception as e:
     print(f"✗ Pillow 缺失：{e}"); sys.exit(1)
+
+# 非 .py 的资源文件必须逐个点名检查。`import wewrite.cli` 成功不代表它们装上了——
+# 漏掉 package-data 时的表现是 import 一切正常、`--version` 正常、`diagnose` 正常，
+# 直到 load_theme() 才抛 FileNotFoundError（ADR-0064）。所以这里按「源里有什么、
+# 装出来的里面也该有什么」直接比对目录。
+tk = loc / "toolkit"
+theme_dir = tk / "themes"
+if not theme_dir.is_dir():
+    print(f"✗ 缺目录：{theme_dir}（package-data 漏了 toolkit/themes/*.yaml）"); sys.exit(1)
+n_themes = len(list(theme_dir.glob("*.yaml")))
+if n_themes == 0:
+    print(f"✗ {theme_dir} 存在但没有 .yaml 主题"); sys.exit(1)
+print(f"✓ 内置主题 {n_themes} 个（toolkit/themes/*.yaml）")
+try:
+    from wewrite.toolkit.theme import load_theme
+    names = sorted(p.stem for p in theme_dir.glob("*.yaml"))
+    load_theme(names[0])
+    print(f"✓ load_theme({names[0]!r}) 可加载")
+except Exception as e:
+    print(f"✗ load_theme 失败：{type(e).__name__}: {e}"); sys.exit(1)
 PY
   [[ -x "$VENV/bin/wewrite" ]] || die "console script 缺失：$VENV/bin/wewrite"
   [[ -L "$REPO/.uv-bin/wewrite" ]] || say "! .uv-bin/wewrite 不是软链，检查是否需要重建"

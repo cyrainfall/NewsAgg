@@ -308,6 +308,32 @@ python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py draft-count
 
 这四个都是**只读**，已实测可用（2026-10-25）。
 
+### 服务器上没有 Chrome 时：用注入的 cookie（ADR-0071）
+
+服务器上 `from_browser()` 直接失败（`CookieError: 找不到浏览器 chrome 的 profile`），
+而 toutiao-ops 的 Playwright profile **解不开**（它的 `Local State` 里 `os_crypt`
+是空 dict）——browserless 与 toutiao-ops 是**两套独立的登录态**。
+→ 服务器上必须**注入**：
+
+```bash
+# 本机导出（写出即 0600，不打印任何 cookie 值）
+python3 scripts/export-cookies.py --browser chrome --out .newsagg/toutiao-cookies.json
+
+# 传到服务器并收紧权限（这是账号凭证，用 scp，不要进 git）
+scp .newsagg/toutiao-cookies.json root@<ip>:/root/.newsagg/toutiao-cookies.json
+ssh root@<ip> 'chmod 600 /root/.newsagg/toutiao-cookies.json'
+
+# 服务器上使用
+python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py \
+  --cookie-file /root/.newsagg/toutiao-cookies.json login
+```
+
+`Session.from_cookie_file` 会**拒绝**组/其他可读的文件（`mode & 0o077 != 0`），
+并说清 `chmod 600` 怎么改。这不是泛泛的建议——它防的是一次 `chmod 644` 手滑。
+
+cookie 主体约 23 天有效（实测 2026-10-27 导出，主体到 2026-11-19）→
+**每月要重新导出一次**。今天没有任何东西会提醒这件事（见 DESIGN 残余风险 69）。
+
 ## 安全门（按执行顺序）
 
 | 门 | 内容 | 不过时 |

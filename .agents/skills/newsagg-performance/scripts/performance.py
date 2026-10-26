@@ -54,6 +54,13 @@ HOW_TO_CLEAR = (
     "（ADR-0010：恢复同样需要人工确认，系统不自动恢复）"
 )
 
+# 读回后端。**默认 api**：纯 HTTP 路径不需要 Chrome，而 Chrome 恰恰是 2GB
+# 内存机器上最可能崩的东西（ADR-0023 记录过它把表现数据读回来搞挂的次数）。
+# browser 后端保留，是因为**只有它能看见微头条**（ADR-0047 的泄漏判据要数
+# 同标题出现几次）——所以发布反查仍走浏览器（publish.py 的 --verify-backend
+# 默认 auto，跟随写入后端）。
+READ_BACKENDS = ("api", "browser")
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
@@ -72,6 +79,46 @@ def _load_sibling_script(rel: str):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_api_module():
+    """懒加载 toutiao_api（纯 HTTP 客户端）。失败不致命——回落浏览器后端。
+
+    为什么是懒加载而不是顶层 import：浏览器后端跑得好好的时候，
+    不该因为纯 HTTP 客户端的 import 失败而崩（与 publish.py 的 `_load_api_module`
+    同一个理由）。
+    """
+    path = repo_root() / ".agents/skills/newsagg-publish/scripts/toutiao_api.py"
+    spec = importlib.util.spec_from_file_location("toutiao_api_shared", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _api_client(account: str):
+    """建一个纯 HTTP 客户端。返回 (module, client) 或抛异常。
+
+    `--account` 在 api 后端没有意义（它用的是**当前登录的那个号**，不是某个
+    profile）。与 publish.py 一致：不是 default 就打一条警告，不假装支持。
+
+    ## 服务器上为什么能用注入的 cookie
+
+    `from_browser()` 依赖本机 Chrome 的 cookie 库，而服务器上没装 Chrome
+    （ADR-0071 实测：`CookieError: 找不到浏览器 chrome 的 profile`）。
+    所以 `NEWSAGG_COOKIE_FILE` 指向一个注入的 cookie 文件时走
+    `from_cookie_file()`——那条路在本机已实测走通（`login_status` 正常、
+    作品列表 16 条）。
+
+    优先级：环境变量 `NEWSAGG_COOKIE_FILE` > 本机 Chrome。
+    """
+    mod = _load_api_module()
+    cookie_file = os.environ.get("NEWSAGG_COOKIE_FILE", "").strip()
+    if cookie_file:
+        return mod, mod.Client.from_cookie_file(cookie_file)
+    if account and account != "default":
+        print(f"⚠️ api 后端不支持 --account={account}：它用的是浏览器里当前登录的账号。",
+              file=sys.stderr)
+    return mod, mod.Client.from_browser()
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -527,6 +574,224 @@ def is_skip_day(freq: dict | None, date: str) -> tuple[bool, str]:
 
 # ────────────────────────── 读取 ──────────────────────────
 
+# 平台作品列表接口（纯 HTTP 可取，见 ADR-0071）。
+# `impression_count` / `go_detail_count_v2` 与浏览器侧 `content list` 的
+# `showCount` / `readCount` **逐篇一致**（实测 10/10 篇全等），所以 api 后端
+# 不是「降级的近似」，而是同一组数字的另一种取法。
+API_ITEM_INFO_URL = (
+    "https://mp.toutiao.com/mp/agw/statistic/v2/item/info?item_id={gid}&type={type}&app_id=1231"
+)
+
+# 平台的内容类型枚举。**图文文章是 1，不是 2**（ADR-0068 从发布页 bundle 里
+# 抄下来的原文）。传错编号不会报参数错误，只会返回 1003「数据开小差啦」，
+# 与「这篇没有数据」长得一模一样——这正是 ADR-0037 误判接口不可用的原因。
+CONTENT_TYPE_PGC_ARTICLE = 1
+CONTENT_TYPE_KNOWN = (0, 1, 2, 3, 4, 5, 6, 7)
+
+
+def classify_kind_api(item: dict, gid: str, url: str, is_draft: bool) -> str:
+    """纯 HTTP 路径的作品类型判定。
+
+    与浏览器路径的 `classify_kind`（三条判据多数票）不同，这里只有两条可用的：
+    - 草稿：浏览器路径的 `content` 字段在纯 HTTP 里没有，但 `is_draft` 更直接；
+    - gid 位数：文章 19 位、微头条 ≤17 位（ADR-0047 实测）。
+
+    ⚠️ 边界：草稿**一律**算 `article`（草稿没有微头条这种形态），
+    且草稿不参与表现评估。
+    """
+    if is_draft:
+        return "article"
+    if gid and len(gid) <= 17:
+        return "weitoutiao"
+    if "/a" in url and "/item/" not in url:
+        return "weitoutiao"
+    return "article"
+
+
+def fetch_content_list_api(account: str, limit: int) -> tuple[list[dict], dict]:
+    """纯 HTTP 取作品列表。返回 (归一化后的作品, 观测元数据)。
+
+    ## 为什么不复用 `content list` 的解析器
+
+    两条路返回的是**不同的结构**：浏览器后端是 `items[].data[].assembleCell
+    .itemCell.{articleBase,itemCounter}` 的深层嵌套，纯 HTTP 是 `data.articles[]`
+    的扁平对象。强行统一成一个形状，等于在解析层塞一个「兼容两种源」的分支——
+    而分支的判据只能靠「某个键在不在」来猜。这里选择**各自解析、同一出口**：
+    两条路都产出同一组 `{"gid","title","metrics","kind",...}` 字段，
+    后续的匹配、落库、评估完全共用。
+
+    ## 口径核实（2026-10-27 实测 10/10 篇）
+
+    | 字段 | 纯 HTTP | 浏览器 `content list` |
+    |---|---|---|
+    | 展现 | `impression_count` | `itemCounter.showCount` |
+    | 阅读 | `go_detail_count_v2` | `itemCounter.readCount` |
+
+    10 篇逐篇比对**全部相等**（98/1、170/0、421/1、597/4、668/0、18/2、
+    1084/10、1214/2、1201/0、1303/0）。所以这不是近似值，换后端不改变读数。
+
+    ## 微头条为什么取不到
+
+    纯 HTTP 的作品列表只返回**图文文章**（实测 16 条里 `article_type` 全是 0，
+    微头条根本不在这个列表里）。浏览器后端能取到微头条是因为它拦截的是
+    另一个接口。
+
+    → **api 后端在微头条上瞎**。这意味着 ADR-0047 的泄漏判据（数同标题出现
+    几次）在 api 后端下会漏掉微头条。所以：**api 后端只用于表现数据读取
+    （我们的文章都是文章），发布反查仍然走浏览器后端**。
+    """
+    meta: dict = {"backend": "api"}
+    try:
+        mod, client = _api_client(account)
+    except Exception as exc:  # noqa: BLE001
+        meta["error"] = f"api 客户端不可用：{exc}"
+        return [], meta
+
+    try:
+        raws = client.session.get_json(
+            f"{mod.ARTICLE_LIST_URL}?status=all&limit={int(limit)}&offset=0"
+        )
+    except Exception as exc:  # noqa: BLE001
+        meta["error"] = f"作品列表请求失败：{exc}"
+        return [], meta
+
+    data = (raws or {}).get("data") or {}
+    articles_raw = data.get("articles")
+    if not isinstance(articles_raw, list):
+        meta["error"] = ("作品列表结构变了：data.articles 期望 list，"
+                         f"实得 {type(articles_raw).__name__}")
+        return [], meta
+
+    out: list[dict] = []
+    drafts: list[str] = []
+    for item in articles_raw:
+        if not isinstance(item, dict):
+            continue
+        gid = str(item.get("group_id") or item.get("pgc_id") or item.get("id") or "")
+        if not gid:
+            continue
+        is_draft = bool(item.get("is_draft"))
+        if is_draft:
+            # 草稿不进表现序列。理由：草稿的展现恒为 0（实测 5 条草稿全是 0），
+            # 混进去会把「没被展现」当成「被展现了但没人点」。
+            # 浏览器后端压根不返回草稿（它走的是已发布列表），所以这里
+            # **必须**过滤，否则两条路的样本集不一样，基准会不可比。
+            drafts.append(gid)
+            continue
+        metrics: dict[str, int] = {}
+        for src, dst in (("impression_count", "showCount"),
+                         ("go_detail_count_v2", "readCount"),
+                         ("digg_count", "diggCount"),
+                         ("comment_count", "commentCount")):
+            v = item.get(src)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                metrics[dst] = int(v)
+
+        show = metrics.get("showCount")
+        read = metrics.get("readCount")
+        # 展现为 0 时阅读率无定义——记 None 而不是 0（与浏览器路径同口径）。
+        rate = (read / show) if (show and read is not None) else None
+
+        url = str(item.get("article_url") or "")
+        out.append({
+            "gid": gid,
+            "title": (str(item.get("title") or "")).strip() or None,
+            "published_at": epoch_to_iso(item.get("create_time")),
+            "item_status": item.get("status"),
+            "url": url,
+            # 纯 HTTP 列表里只有图文文章。微头条不在这个接口里（见 docstring），
+            # 所以这里恒为 "article"；但仍然走同一个判定函数而不是写死——
+            # 万一平台把微头条也塞进这个接口，判定会自己跟上。
+            "kind": classify_kind_api(item, gid, url, is_draft),
+            "metrics": metrics,
+            "read_rate": round(rate, 6) if rate is not None else None,
+            "is_draft": is_draft,
+            "status_desc": str(item.get("status_desc") or ""),
+        })
+
+    meta["count"] = len(out)
+    meta["source"] = "api_article_list"
+    if drafts:
+        meta["drafts_skipped"] = len(drafts)
+    return out, meta
+
+
+def fetch_content_details_api(account: str, gids: list[str]) -> tuple[dict, dict]:
+    """纯 HTTP 逐篇取详细指标。返回 (gid → 指标字典, 观测元数据)。
+
+    ## 为什么逐篇串行而不是并发
+
+    浏览器版本在页面内也是**逐个 await**（`reference/toutiao-ops/cli/src/
+    analytics.js:112`），注释写明「并发打太多容易被平台的接口频控挡掉，
+    而错判成「无数据」比慢更糟」。纯 HTTP 版的频控阈值未知，所以沿用同样的
+    保守做法：16 篇约 9.3 秒，慢但不会把频控误判成「这篇没数据」。
+
+    ## 口径（ADR-0068）
+    - `code=1003` + type 合法 → 这篇暂无数据（发布次日 14:00 前），**不是故障**；
+    - `code=1003` + type 非法 → 参数错，要报错；
+    - `code=0` → 有数据。
+    """
+    meta: dict = {"requested": len(gids), "backend": "api",
+                  "source": "api_item_info"}
+    if not gids:
+        meta["skipped"] = "没有 gid"
+        return {}, meta
+
+    try:
+        mod, client = _api_client(account)
+    except Exception as exc:  # noqa: BLE001
+        meta["error"] = f"api 客户端不可用：{exc}"
+        return {}, meta
+
+    out_map: dict[str, dict] = {}
+    no_data: list[str] = []
+    failed: list[dict] = []
+    for gid in gids:
+        url = API_ITEM_INFO_URL.format(gid=gid, type=CONTENT_TYPE_PGC_ARTICLE)
+        try:
+            payload = client.session.get_json(url)
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"gid": gid, "error": str(exc)})
+            continue
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if code == 1003:
+            if CONTENT_TYPE_PGC_ARTICLE not in CONTENT_TYPE_KNOWN:
+                failed.append({"gid": gid, "error": "content-type 编号不在平台枚举内"})
+            else:
+                no_data.append(gid)
+            continue
+        if code != 0:
+            failed.append({"gid": gid,
+                           "error": f"接口返回 code={code}：{payload.get('message') or ''}"})
+            continue
+        m = extract_detail_metrics(payload)
+        if m:
+            out_map[gid] = m
+
+    meta["got"] = len(out_map)
+    meta["no_data"] = no_data
+    meta["failed"] = failed
+    if no_data:
+        meta["note"] = (f"{len(no_data)} 篇暂无数据（作品发布次日 14:00 前才可查，"
+                        f"ADR-0068 口径）")
+    return out_map, meta
+
+
+def _fetch_via_browser(pub, root: Path, account: str, limit: int) -> tuple[list[dict], dict]:
+    """浏览器后端取作品列表。返回 (归一化后的作品, 观测元数据)。
+
+    这是 `fetch_content_list` 的薄包装——浏览器路径要解析 `content list` 的
+    深层嵌套信封（`items[].data[].assembleCell.itemCell`），把它收敛成与
+    纯 HTTP 路径**同一组字段**，两条路才能共用后面的匹配、落库、评估。
+    """
+    raw, meta = fetch_content_list(pub, root, account, limit)
+    if not raw:
+        return [], meta
+    articles, parse_meta = extract_articles(raw)
+    meta = {**meta, **parse_meta}
+    return articles, meta
+
+
 def fetch_content_list(pub, root: Path, account: str, limit: int) -> tuple[dict, dict]:
     """在串行锁内跑 `content list`。返回 (原始信封, 观测元数据)。
 
@@ -580,6 +845,8 @@ def main() -> int:
     ap.add_argument("--from-file", default=None,
                     help="解析已保存的 content list JSON，不启动浏览器（测试/复算用）")
     ap.add_argument("--account", default="default")
+    ap.add_argument("--backend", choices=list(READ_BACKENDS), default="api",
+                    help="读回后端：api=纯 HTTP（不需要 Chrome），browser=Playwright")
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--window", type=int, default=DEFAULTS["window"])
     ap.add_argument("--coldstart", type=int, default=DEFAULTS["coldstart"])
@@ -622,6 +889,25 @@ def main() -> int:
     if args.from_file:
         raw = json.loads(Path(args.from_file).read_text(encoding="utf-8"))
         fetch_meta = {"source_file": args.from_file, "attempts": [], "offline": True}
+        articles, parse_meta = extract_articles(raw)
+    elif args.backend == "api":
+        # 纯 HTTP 路径：**不启 Chrome，也不需要串行锁**。
+        # 锁是给浏览器命令用的（ADR-0030：整个账号的浏览器命令共用一把），
+        # 纯 HTTP 请求不经过浏览器，不该去抢那把锁。
+        articles, fetch_meta = fetch_content_list_api(args.account, args.limit)
+        parse_meta = fetch_meta
+        if not articles:
+            # api 失败**不直接判死**——回落浏览器后端再试一次。
+            # 理由：api 依赖本机浏览器 cookie（服务器上要注入），注入坏了
+            # 是运维问题，不是数据问题；而浏览器后端是更老、更可靠的那条路。
+            fb_articles, fb_meta = _fetch_via_browser(pub, root, args.account, args.limit)
+            if fb_articles:
+                fetch_meta = {"backend": "api", "api_error": fetch_meta.get("error"),
+                              "fallback": "browser", "fallback_detail": fb_meta}
+                articles, parse_meta = fb_articles, fb_meta
+            else:
+                fetch_meta = {"backend": "api", "error": fetch_meta.get("error"),
+                              "fallback": "browser", "fallback_detail": fb_meta}
     else:
         ok, why = pub.memory_check(args.min_free_mb)
         if not ok:
@@ -632,9 +918,10 @@ def main() -> int:
                 write_json(status_path, {**result, "at": now.isoformat()})
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0  # 本脚本永不致命
-        raw, fetch_meta = fetch_content_list(pub, root, args.account, args.limit)
+        articles, fetch_meta = _fetch_via_browser(pub, root, args.account, args.limit)
+        parse_meta = fetch_meta
 
-    if not raw:
+    if not articles:
         result = {"ok": False, "stage": "fetch",
                   "reason": fetch_meta.get("error", "未取到数据"),
                   "detail": fetch_meta,
@@ -644,7 +931,6 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    articles, parse_meta = extract_articles(raw)
     title_index, gid_index, index_meta = local_title_index(root)
 
     for a in articles:
@@ -665,6 +951,42 @@ def main() -> int:
     weitoutiao = [a for a in articles if a.get("matched") and a.get("kind") != "article"]
     unmatched = [a for a in articles if not a.get("matched")]
 
+    # ── 身份核对：api 与浏览器读的是**两个不同的 Chrome profile** ──
+    # api 读**本机真实 Chrome** 的 cookie 库；浏览器后端读 `.home/.toutiao-ops/
+    # accounts/default/browser-data`（Playwright 自己的 profile）。实测这两个
+    # profile 的 cookie **互相解不开**（Playwright profile 的 Local State 里
+    # `os_crypt` 是空 dict），所以它们是两个独立的登录态，可能是两个账号。
+    #
+    # 判据：如果 api 读回来一堆文章，却**一篇都不是我们的**，那多半不是
+    # 「我们没发文章」，而是「登录的是另一个号」。这时用浏览器后端再取一次
+    # ——浏览器那条路的账号是确定的（它就是发布时用的那个）。
+    if args.backend == "api" and not args.from_file and articles and not ours:
+        fb_articles, fb_meta = _fetch_via_browser(pub, root, args.account, args.limit)
+        fb_ours = [a for a in fb_articles
+                   if (gid_index.get(str(a.get("gid") or "").strip())
+                       or title_index.get(a.get("title") or ""))
+                   and a.get("kind") == "article"]
+        if fb_ours:
+            # 浏览器那边认得出我们的文章 → 确认是账号不对，不是我们没发。
+            fetch_meta = {**fetch_meta,
+                          "api_identity_mismatch": True,
+                          "fallback": "browser", "fallback_detail": fb_meta}
+            articles = fb_articles
+            parse_meta = fb_meta
+            for a in articles:
+                slug = gid_index.get(str(a.get("gid") or "").strip()) \
+                    or title_index.get(a.get("title") or "")
+                a["slug"] = slug
+                a["matched"] = bool(slug)
+                a["ours"] = bool(slug) and a.get("kind") == "article"
+                a["date"] = today
+                a["collected_at"] = now.isoformat()
+                a["source"] = parse_meta.get("source")
+            ours = [a for a in articles if a["ours"]]
+            weitoutiao = [a for a in articles
+                          if a.get("matched") and a.get("kind") != "article"]
+            unmatched = [a for a in articles if not a.get("matched")]
+
     # ── 单篇详细指标（ADR-0068）──
     # `content list` 只给展现与阅读；完读率、平均时长、「超过 N% 同类作品」要逐篇问
     # `item/info`。这四个指标是唯一能把「标题结构」变成可测量对象的东西
@@ -674,8 +996,21 @@ def main() -> int:
     detail_meta: dict = {"skipped": "离线模式（--from-file）"}
     if not args.from_file:
         our_gids = [str(a.get("gid")) for a in ours if a.get("gid")]
-        detail_metrics, detail_meta = fetch_content_details(
-            pub, root, args.account, our_gids)
+        if args.backend == "api":
+            detail_metrics, detail_meta = fetch_content_details_api(args.account, our_gids)
+            if detail_meta.get("error") and not detail_metrics:
+                # api 失败 → 回落浏览器后端（与列表同一条降级路径）
+                dm, dmeta = fetch_content_details(pub, root, args.account, our_gids)
+                if dm:
+                    detail_meta = {"backend": "api", "api_error": detail_meta.get("error"),
+                                   "fallback": "browser", "fallback_detail": dmeta}
+                    detail_metrics = dm
+                else:
+                    detail_meta = {"backend": "api", "error": detail_meta.get("error"),
+                                   "fallback": "browser", "fallback_detail": dmeta}
+        else:
+            detail_metrics, detail_meta = fetch_content_details(
+                pub, root, args.account, our_gids)
         for a in ours:
             m = detail_metrics.get(str(a.get("gid")))
             if m:

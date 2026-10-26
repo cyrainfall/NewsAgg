@@ -46,3 +46,9 @@ outputs/**/*.jpg
 # .newsagg 是每日运行的中间产物（候选、分拣输入、锁、熔断、发布台账）。
 # 冻结成结论的产物应写入 reports/ 与 knowledge/（那两者入库）。
 .newsagg/
+
+# ── 账号凭证：任何 cookie 文件都不入库（ADR-0071）────────────────
+# 注入用的 cookie 文件是账号凭证。用 scp 传，不要进 git。
+# 即使有人把输出目录指到仓库内，也不该被误提交。
+*cookie*.json
+toutiao-cookies.json

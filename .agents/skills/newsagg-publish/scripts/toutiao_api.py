@@ -192,6 +192,37 @@ class Client:
             raise ToutiaoError(f"读不到 {browser} 的 toutiao.com cookie：{exc}") from exc
         return cls(session)
 
+    @classmethod
+    def from_cookie_file(cls, path: str | Path) -> "Client":
+        """从**注入的 cookie 文件**建会话。服务器上唯一可用的入口。
+
+        ## 为什么需要这个入口
+
+        `from_browser()` 依赖本机 Chrome 的 cookie 库。服务器上没装 Chrome
+        （实测 `HOME=/tmp/fakehome-empty` 下 `chromium.load("chrome", ...)`
+        直接抛 `CookieError: 找不到浏览器 chrome 的 profile`），所以服务器上
+        走不了这条路。
+
+        而 Playwright 自己的 profile（`.home/.toutiao-ops/accounts/default/
+        browser-data`）**解不开**——实测它的 `Local State` 里 `os_crypt` 是
+        空 dict，48 条 toutiao cookie 的 `encrypted_value` 用任何口令都解出
+        非 ASCII 垃圾。browserless 与 toutiao-ops 是两套独立的登录态。
+
+        → 服务器上必须**注入**。本机导出 → 服务器加载。
+
+        ## 文件格式
+
+        JSON：`{"cookies": [{"domain","name","value","path","secure","http_only"}]}`
+        （`Cookie.to_dict()` 的形状）。生成方法见 `scripts/export-cookies.py`。
+
+        ## 权限
+
+        文件里是**账号凭证**。`load_cookie_file` 会检查权限位：组/其他可读
+        就拒绝加载。理由是这条链路的产物会被人 `scp` 上服务器，
+        而一个 0644 的 cookie 文件等于把账号交出去。
+        """
+        session = Session.from_cookie_file(path, referer=REFERER, origin=MP)
+        return cls(session)
     # ── 内部请求 ────────────────────────────────────────────────────
 
     def _get_json(self, url: str, *, what: str) -> dict:
@@ -691,6 +722,8 @@ def _main(argv: list[str] | None = None) -> int:
         description="头条创作中心纯 HTTP 客户端（只读命令；写命令默认拒绝）"
     )
     ap.add_argument("--browser", default="chrome", help="从哪个浏览器读 cookie（默认 chrome）")
+    ap.add_argument("--cookie-file", default=None,
+                    help="从注入的 cookie 文件读会话（服务器上用；与 --browser 二选一）")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="登录预检（浏览器关闭下可用）")
     p_list = sub.add_parser("list", help="作品列表（浏览器关闭下可用）")
@@ -700,7 +733,15 @@ def _main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        client = Client.from_browser(args.browser)
+        if args.cookie_file:
+            try:
+                client = Client.from_cookie_file(args.cookie_file)
+            except CookieError as exc:
+                print(json.dumps({"ok": False, "error": str(exc)},
+                                 ensure_ascii=False, indent=2))
+                return 1
+        else:
+            client = Client.from_browser(args.browser)
         if args.cmd == "login":
             st = client.login_status()
             # 只报布尔，绝不输出任何 cookie / session 字段

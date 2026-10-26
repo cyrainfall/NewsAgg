@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 
 from .chromium import CookieJar
@@ -131,6 +132,75 @@ class Session:
 
         jar = chromium.load(browser, domains=domains)
         return cls(jar, **kwargs)
+
+    @classmethod
+    def from_cookie_file(cls, path: str | Path, **kwargs: Any) -> "Session":
+        """从**注入的 cookie 文件**建会话。没有浏览器的环境（服务器）用它。
+
+        文件格式：JSON `{"cookies": [{"domain","name","value","path","secure",
+        "http_only"}]}`（`browserless.chromium.Cookie.to_dict()` 的形状）。
+
+        ## 权限检查为什么在这一层
+
+        这个文件是**账号凭证**。它的产生方式注定它会被人 `scp` 上服务器、
+        或者塞进 gitignored 的配置目录。组或其他用户可读 = 账号被交出去。
+
+        所以这里硬性要求：文件模式不能有组可读/组可写/其他任何权限
+        （即 `mode & 0o077` 必须为 0），否则拒绝加载并说清怎么改。
+        这不是「安全最佳实践」的泛泛建议——它防的是一次 `chmod 644` 手滑。
+
+        ## 为什么不提供「从环境变量读」
+
+        环境变量会进 `ps e`、进 shell history、进 systemd unit 文件。
+        文件 + 0600 权限 + gitignore 是更可控的一条路。
+        """
+        from .chromium import Cookie, CookieJar, CookieError
+
+        p = Path(path)
+        try:
+            st = p.stat()
+        except OSError as exc:
+            raise CookieError(f"读不到 cookie 文件 {p}：{exc}") from exc
+
+        if st.st_mode & 0o077:
+            raise CookieError(
+                f"cookie 文件 {p} 权限太宽（mode={oct(st.st_mode & 0o777)}）："
+                f"组/其他用户可读就等于把账号交出去。"
+                f"改成 `chmod 600 {p}` 再试。"
+            )
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CookieError(f"cookie 文件 {p} 读不出来：{exc}") from exc
+
+        raw = payload.get("cookies") if isinstance(payload, dict) else None
+        if not isinstance(raw, list):
+            raise CookieError(
+                f"cookie 文件 {p} 格式不对：期望 "
+                f'{{"cookies": [{{"domain","name","value",...}}]}}，实得 {type(raw).__name__}'
+            )
+        if not raw:
+            raise CookieError(f"cookie 文件 {p} 里没有一条可用的 cookie")
+
+        cookies: list[Cookie] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            value = str(item.get("value") or "")
+            if not name or not value:
+                continue
+            cookies.append(Cookie(
+                domain=str(item.get("domain") or ""),
+                name=name,
+                value=value,
+                path=str(item.get("path") or "/"),
+                secure=bool(item.get("secure")),
+                http_only=bool(item.get("http_only")),
+            ))
+        if not cookies:
+            raise CookieError(f"cookie 文件 {p} 里没有一条可用的 cookie")
+        return cls(CookieJar(cookies=cookies), **kwargs)
 
     # ── 请求 ────────────────────────────────────────────────────────
 

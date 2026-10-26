@@ -14,30 +14,58 @@ description: |
 ## 执行
 
 ```bash
-# 读回 + 落库 + 算基准 + 判降频（会启动 Chrome，需登录态）
+# 读回 + 落库 + 算基准 + 判降频（默认 api 后端：纯 HTTP，不需要 Chrome）
 python3 .agents/skills/newsagg-performance/scripts/performance.py
 
 # 只算不写（复算、调试）
 python3 .agents/skills/newsagg-performance/scripts/performance.py --dry-run
 
-# 解析已保存的 content list JSON，完全不启动浏览器
+# 强制走浏览器后端（能看见微头条，但单次读回吃 1GB+ 内存）
+python3 .agents/skills/newsagg-performance/scripts/performance.py --backend browser
+
+# 解析已保存的 content list JSON，完全不联网
 python3 .agents/skills/newsagg-performance/scripts/performance.py --from-file /tmp/list.json
 
 # 只回答「今天是不是降频跳过日」（run_all.sh 用）
 python3 .agents/skills/newsagg-performance/scripts/performance.py --check-skip
 ```
 
+## 后端：默认 api（纯 HTTP）
+
+`--backend api`（默认）| `browser`。ADR-0071 决定默认 api，因为**服务器只有 2GB 内存**，
+而浏览器后端单次读回就吃 1GB+（Playwright 三进程 403+231+207MB + Chrome 宿主 215MB）。
+
+两条路的读数**逐篇相等**（10/10 篇展现与阅读都相等），性能 2.0s vs 20.14s。
+
+**browser 后端保留的理由**：只有它能看见微头条——纯 HTTP 的
+`/mp/agw/article/list` 里 `article_type` 全是 0，微头条根本不在这个数据源里，
+ADR-0047 的泄漏判据在 api 路径下会失效。
+
+**服务器上用注入的 cookie**：`NEWSAGG_COOKIE_FILE=/path/to/cookies.json`
+（优先级：环境变量 > 本机 Chrome）。文件权限必须 0600，否则拒绝加载。
+导出：`python3 scripts/export-cookies.py --browser chrome --out <path>`。
+cookie 主体约 23 天有效，**每月要重新导出一次**。
+
+api 后端失败会**自动回落浏览器后端**并记 `fallback: "browser"`。
+
+
 ## 数据从哪来
 
-**只用 `content list`**，不用 `analytics`，也不用 `content-detail`。这是实测结论：
+**默认用 api 后端**（纯 HTTP 作品列表 + 逐篇 `item/info`），`--backend browser` 时用
+`content list`，不用 `analytics works`。这是实测结论：
 
 | 命令 | 结论 |
 | --- | --- |
-| `content list` | ✅ **每篇**都有 `itemCounter`（展现/阅读/点赞/评论/转发）——这正是循环 C 需要的 |
+| 纯 HTTP `/mp/agw/article/list` | ✅ 逐篇有展现/阅读/点赞/评论，**不需要浏览器**（ADR-0071） |
+| 纯 HTTP `/mp/agw/statistic/v2/item/info?type=1` | ✅ 额外给出完读率、平均时长、「超过 N% 同类作品」 |
+| `content list`（浏览器） | ✅ 逐篇 `itemCounter`，但**只有它能看见微头条** |
 | `analytics works` | ❌ 只有**账号级聚合**，且 `source: dom_scrape`，`metrics` 里混着省份名与频道来源百分比 |
-| `analytics content-detail` | ❌ 上游返回 `{code: 1003, message: "数据开小差啦~请稍后再试"}`，空数据 |
+| `analytics content-detail` | ✅ **可用**，但**默认 `--content-type` 曾传错**（2=视频，文章是 1）→ 传错时接口返回 1003，与「没有数据」长得一模一样，ADR-0037 因此误判它不可用（ADR-0068 勘误） |
 
-即**发布反查与表现读取是同一条命令**，不需要额外能力。原始信封形状见 [ADR-0030](../../../docs/adr/0030-toutiao-ops-login-and-readback-findings.md)（三个形状）与 [ADR-0037](../../../docs/adr/0037-loop-c-readback-shape-and-downshift.md)：作品在 `items[0].data[j].assembleCell.itemCell`，顶层 `count` 是包装元素数而**不是作品数**。
+原始信封形状见 [ADR-0030](../../../docs/adr/0030-toutiao-ops-login-and-readback-findings.md)（三个形状）与 [ADR-0037](../../../docs/adr/0037-loop-c-readback-shape-and-downshift.md)：作品在 `items[0].data[j].assembleCell.itemCell`，顶层 `count` 是包装元素数而**不是作品数**。
+
+⚠️ 纯 HTTP 列表**含草稿**（实测 16 条里 5 条），而浏览器那条不含——api 后端显式过滤草稿并在 `meta.drafts_skipped` 里记数，否则两条路的样本集不同、**基准不可比**。
+
 
 ## 指标与判据
 

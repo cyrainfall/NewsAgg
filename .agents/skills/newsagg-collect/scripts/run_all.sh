@@ -434,9 +434,15 @@ PY
 # ── ②b 表现数据（ADR-0010 循环 C）────────────────────────────────
 # 必须在分拣之前：分拣把它当排序参考。**必须永不致命**——表现数据读不回来
 # 不能拖垮整轮运行，否则看守无法区分「系统没跑」与「数据读不到」（ADR-0006）。
+#
+# 后端：默认 `api`（纯 HTTP，不需要 Chrome）。理由是内存——浏览器路径单次读回
+# 要 1GB+ 内存（ADR-0071 实测），而服务器只有 2GB。浏览器后端保留为兜底，
+# api 失败时脚本内部自动回落。
+PERF_BACKEND="${NEWSAGG_PERF_BACKEND:-api}"
 performance() {
-  log "②b 表现数据（循环 C：读回 + 自身基准 + 降频判定）"
-  python3 .agents/skills/newsagg-performance/scripts/performance.py > /tmp/newsagg-perf.json 2>&1 || true
+  log "②b 表现数据（循环 C：读回 + 自身基准 + 降频判定，后端 ${PERF_BACKEND}）"
+  python3 .agents/skills/newsagg-performance/scripts/performance.py \
+    --backend "${PERF_BACKEND}" > /tmp/newsagg-perf.json 2>&1 || true
   python3 - <<'PY'
 import json
 try:

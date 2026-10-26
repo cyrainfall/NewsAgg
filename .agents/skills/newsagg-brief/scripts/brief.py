@@ -377,6 +377,14 @@ def section_overview(candidates, decision, trend_summary=None) -> list[str]:
         failed = [f.get("source") for f in (candidates.get("failures") or [])]
         if failed:
             out += [f"- **失效源**：{', '.join(map(str, failed))}"]
+        # 同一轮里已兜底成功的源不算失败，但值得一行——它说明聚合接口在抖
+        # （ADR-0066）。不印出来，`recoveries` 就是个死字段（ADR-0062 的判据）。
+        recovered = [f for f in (candidates.get("recoveries") or [])]
+        if recovered:
+            out += ["- **源兜底成功**（聚合接口出错、已改用原始接口，数据是齐的）："
+                    + "、".join(
+                        f"{f.get('source')}（{str(f.get('error',''))[:60]} → {f.get('recovered_by')}）"
+                        for f in recovered)]
     else:
         out += ["- （无采集记录）"]
 

@@ -272,6 +272,23 @@ def collect(sources: list[str], base: str, timeout: int) -> tuple[list[dict], li
     return all_items, meta, failures
 
 
+def split_failures(raw_failures: list[dict]) -> tuple[list[dict], list[dict]]:
+    """把同一轮的失败拆成（真失败, 已兜底成功）。
+
+    判据是 `recovered_by` 字段：它由 `collect()` 在原始接口兜底成功时写入。
+    已兜底的源不该算失败——数据是齐的、条目已经进池，把它留在 failures 里会让
+    简报同时印出「源：7 成功 / 1 失败」与「失效源：toutiao」，7 个源算出 8 个
+    结果，而那个"失效"的源其实供了 10 条（2026-10-26 18:00 实测）。
+
+    ADR-0047 修的是**跨轮**恢复（上一轮失败、本轮成功要从 failures 里消失），
+    这里补的是**同轮**恢复。兜底本身有信息量（聚合接口在抖），所以不丢弃，
+    另存 recoveries，由简报②段印一行（ADR-0066）。
+    """
+    recoveries = [f for f in raw_failures if f.get("recovered_by")]
+    failures = [f for f in raw_failures if not f.get("recovered_by")]
+    return failures, recoveries
+
+
 def source_age_minutes(meta: dict, now: datetime) -> float | None:
     """由 updateTime 计算数据新鲜度（分钟）。
 
@@ -450,6 +467,10 @@ def merge_candidates(existing: dict, fresh: dict) -> dict:
         "source_meta": list(meta_by_source.values()),
         "stale_sources": fresh.get("stale_sources", []),
         "failures": failures,
+        # 同轮兜底成功（不参与失败计数，但要让人看见聚合接口在抖；ADR-0066）
+        "recoveries": [f for f in fresh.get("recoveries", [])]
+                      + [r for r in existing.get("recoveries", [])
+                         if r.get("source") not in {f.get("source") for f in fresh.get("recoveries", [])}],
         "items": items,
         "dropped": dropped,
         "counts": {
@@ -482,7 +503,16 @@ def main() -> int:
 
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
     now = datetime.now(CST)
-    all_items, meta, failures = collect(sources, args.base, args.timeout)
+    all_items, meta, raw_failures = collect(sources, args.base, args.timeout)
+
+    # ⚠️ 同一轮里已经兜底成功的源，不算失败（ADR-0066）。
+    # 头条的日榜聚合接口偶尔 500，此时用原始接口取回来（recovered_by），
+    # 数据是齐的、条目进池了，但原来的 failures 仍留着这条记录，于是简报会同时印
+    # 「源：7 成功 / 1 失败」与「失效源：toutiao」——7 个源算出 8 个结果，
+    # 而那个「失效」的源其实供了 10 条。ADR-0047 修的是**跨轮**恢复
+    # （上一轮失败、本轮成功要从 failures 里消失），这里补的是**同轮**恢复。
+    # 兜底本身是有信息量的（说明聚合接口在抖），所以不丢弃，另存 recoveries。
+    failures, recoveries = split_failures(raw_failures)
 
     # 为每个源计算新鲜度（ADR-0029 第四条：updateTime 是真正的陈旧信号）
     #
@@ -529,6 +559,7 @@ def main() -> int:
         "source_meta": meta,
         "stale_sources": stale_sources,
         "failures": failures,
+        "recoveries": recoveries,
         "niche_keyword_count": len(keywords),
         "items": kept,
         "dropped": dropped,

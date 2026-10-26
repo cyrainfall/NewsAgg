@@ -194,6 +194,10 @@
 
 77. **服务器上的登录态没有任何东西记录它是什么时候注入的（ADR-0075）。** ADR-0072 给纯 HTTP 那份做了过期提醒（表现层每次读数据检查、简报第⑤段在不足 7 天时打印命令），但**浏览器那份没有**——`import-pw-cookies.mjs` 注入完就结束，服务器上没有任何文件记录「这份 profile 的 cookie 是什么时候来的」。后果是：Playwright 那份 cookie 过期后，发布路径会突然开始失败（表现为 `auth check` 报未登录），而系统不会像对纯 HTTP 那份那样提前说一声。**今天没做**，因为服务器上的发布链路还没启用（阶段 2 第 11 步）。
 
+ 78. **「脚本假定环境是本机的」是一类缺陷，本轮一次撞出四个（ADR-0076）。** 第一次在服务器上跑，四个失败全在这一类：系统 `python3` 是 3.6.8（全部脚本 `from __future__ import annotations` 崩）、仓库没有 git 身份（收尾 commit 失败）、上一次失败的 `git add -A` 留下半暂存索引（之后每轮 pull 都失败）、cookie 文件在服务器上但编排器没告诉 performance.py 去哪找（表现读回静默回落旧值）。这四个在本机**都测不出来**（本机 python3 是 3.9、仓库有身份、cookie 找得到）。更麻烦的是它们在无人值守时的表现：**跑完了、退出码 0、但什么都没发生**——②b 读回失败后是「排序参考沿用旧值」，一句提示都没有。已修四处（`find_python` 验证版本、bootstrap 配 git 身份、pull 前单独提交 `reports/`、自动设 `NEWSAGG_COOKIE_FILE`），但**这类缺陷没有穷尽**：`npm`/`ts`/`curl`/`rpm` 都还是裸名字调用，且**定时任务环境与交互式 shell 的差异只会一次暴露一类**。
+ 79. **服务器上的定时任务还没有着落（ADR-0076 勘察）。** 服务器 DSH 的 `schedule` 域**只在 web-app bundle 里**，headless/base bundle 不含 `dsh-schedule` → 服务器上用 `dsh headless` **建不了定时任务**。可行路径有两条：在服务器上用 web profile 建任务（GUI 在 `100.64.0.1:3080`），或用 systemd/cron 调 `dsh headless '<prompt>'`（已实测 `dsh headless` 可用、能跑通模型调用）。**没定。** 阶段 2 的模型部分（分拣判断 → 写作 → 封面 → dry-run 发布）依赖它。
+ 80. **服务器上没有代理，Jina Reader 会带着绿色状态失效（ADR-0076 勘察）。** 实测 `r.jina.ai` 直连不通、`www.google.com` 不通、`api.exa.ai` 404 → ADR-0021 tier-0 的 `web` 渠道在服务器上是**坏的**。而信源体检只看「命令跑没跑通」，不看「这渠道今天有没有真的取到东西」→ 它会显示绿色。两条修法：装 mihomo 照搬订阅分流（ADR-0022，本机用的是 Clash Verge / `verge-mihomo`），或把 Jina 降级并在简报里说明不可用。**没定。**
+
 
 
 

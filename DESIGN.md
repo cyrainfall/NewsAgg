@@ -188,7 +188,12 @@
 
 74. **账本合并规则没覆盖「两个环境同时修订同一条记录」（ADR-0074）。** 同一 id 的两份记录比新鲜度，**平手时运行时胜**。如果本地标了 `deleted_at`、服务器标了 `leak_accepted_at`，两边的 `at` 相同就会丢掉一边。现实里不会发生（同一账号只有一个人操作），但如果哪天有了，它会以「某个提醒不再出现」的形式表现——而那正是「记录了但没说」的那族缺陷。
 
-75. **跨环境能不能真的同步，取决于 git 推送凭证——服务器目前没有。** ADR-0074 把账本做成入库产物，但服务器上 `git push --dry-run origin main` 报 `could not read Username for 'https://github.com'`。**推不上去，跨环境就还是断的**：归档在服务器本地生成了，却到不了另一台机器。这条不在 ADR-0074 的范围内（它管的是「账本该放哪」），但它是「归档」这个决定能否兑现的前提。
+75. **跨环境能不能真的同步，取决于 git 推送凭证——服务器目前没有。** ADR-0074 把账本做成入库产物，但服务器上 `git push --dry-run origin main` 报 `could not read Username for 'https://github.com'`。**推不上去，跨环境就还是断的**：归档在服务器本地生成了，却到不了另一台机器。这条不在 ADR-0074 的范围内（它管的是「账本该放哪」），但它是「归档」这个决定能否兑现的前提。**已于 2026-10-27 解决**：服务器上生成 ed25519 部署密钥，登记为仓库 deploy key（`newsagg-ecs-deploy`，写权限），remote 改 `git@github.com:cyrainfall/NewsAgg.git` + `core.sshCommand` 指定该密钥 → `git ls-remote` 与 `git push --dry-run` 均通过。**但这把钥匙的私钥在服务器上**，它现在能写这个仓库的任何分支——权限比它需要的宽（只需要 main），收窄没做。
+
+76. **「账号登录态有两份」这件事比 ADR-0071 记的更绕（ADR-0075）。** 现在有**两份 cookie 文件**指向同一个账号：本机真实 Chrome 的那份（`scripts/export-cookies.py` 解密得到，供纯 HTTP 读回用）与 toutiao-ops 的 Playwright profile 那份（`scripts/export-pw-cookies.mjs` 读明文，供浏览器写路径用）。两份**不能互换**——用错会表现为「登录态莫名其妙失效」，而排查方向很容易跑偏到「平台改了规则」。ADR-0071 说的「两套独立的登录态」现在精确成：**两套独立的存储，指向同一个账号**。同时，Playwright profile 里的 cookie 有效期与 Chrome 那份**不一样**（实测 Playwright 的 `sessionid` 到 2026-12-13，Chrome 那份到 2026-11-19），所以**两份文件的续期节奏不同**，`earliest_auth_expiry` 要分别看。
+
+77. **服务器上的登录态没有任何东西记录它是什么时候注入的（ADR-0075）。** ADR-0072 给纯 HTTP 那份做了过期提醒（表现层每次读数据检查、简报第⑤段在不足 7 天时打印命令），但**浏览器那份没有**——`import-pw-cookies.mjs` 注入完就结束，服务器上没有任何文件记录「这份 profile 的 cookie 是什么时候来的」。后果是：Playwright 那份 cookie 过期后，发布路径会突然开始失败（表现为 `auth check` 报未登录），而系统不会像对纯 HTTP 那份那样提前说一声。**今天没做**，因为服务器上的发布链路还没启用（阶段 2 第 11 步）。
+
 
 
 
@@ -216,15 +221,21 @@
 7f. **服务器环境装好 + 纯 HTTP 写路径判定不可用 + 账本跨环境打通**（2026-10-27）：
 - **服务器已能跑**：git 2.43.7 + python3.11 已装，仓库克隆到 `/opt/newsagg/repo`，`bootstrap-wewrite.sh` 跑通（**撞出可移植性缺陷：树摘要用 macOS 的 `shasum`，Linux 没有，且 `sha256sum` 的输出格式不同 → 同一份树两个平台两个摘要**；已改用标准库 Python 复刻，两平台实测一致），DailyHotApi 已装并在 6688 端口跑起来（**关键坑：不设 `NODE_ENV=development` 服务根本不起**），采集 282 条 / 7 源全成、测试 136 例全过、封面生成自检全绿、cookie 注入后登录态正常。
 - **纯 HTTP 写路径判定为不可用**（ADR-0073）：抓包实测真实 publish 请求 31 字段，仓库 35 键**只有 9 个名字对得上**；写路径还有平台自己的签名与风控闸（`_signature`/`msToken`/`a_bogus`/CSRF），纯 HTTP 客户端一个都不处理。**服务器发布仍需 Chrome + Xvfb**，但表现读回已不依赖它 → 内存压力从「全天占用」降为「发布时占用」。
-- **账本跨环境打通**（ADR-0074）：账本分运行时（`.newsagg/`，不入库）与入库归档（`reports/publish-ledger.jsonl`），四个读者统一读合并视图。修掉了只有跨环境才暴露的断链：服务器上 `from_ledger: 0` → 11 篇只匹配 9 篇（改稿后标题漂移 + 输入框吞字，两条都只有账本里有答案）；修复后模拟服务器 11 篇全部匹配。
+- **账本跨环境打通**（ADR-0074）：账本分运行时（`.newsagg/`，不入库）与入库归档（`reports/publish-ledger.jsonl`），四个读者统一读合并视图。修掉了只有跨环境才暴露的断链：服务器上 `from_ledger: 0` → 11 篇只匹配 9 篇（改稿后标题漂移 + 输入框吞字，两条都只有账本里有答案）；修复后模拟服务器 11 篇全部匹配，**真机上也是 11/11**。
+- **服务器环境装齐且可复现**（`scripts/bootstrap-server.sh`，2026-10-27）：git 2.43.7 + python3.11 + Xvfb + Chromium 已装，wewrite venv 从 vendor 装好，DailyHotApi 在 6688 跑着，toutiao-ops 依赖 + Playwright 浏览器就位。**撞出 ADR-0028 HOME 重定向的一个真实后果**：publish.py 把 HOME 指向 `<repo>/.home`，Playwright 就去找 `<repo>/.home/.cache/ms-playwright`，而 npm 装时浏览器下到 `/root/.cache` —— 两处对不上，报 `Executable doesn't exist at .../.home/.cache/ms-playwright/...`。修法：装完把缓存复制到仓库 HOME 下。Xvfb `:99` + 无头 Playwright 实测打开 `https://www.toutiao.com/` → `title: 今日头条`；跑完 `available 910MB`（起浏览器前 891MB）→ **Chrome 用完就退**。
+- **服务器 git 推送凭证已解决**（2026-10-27）：服务器生成 ed25519 部署密钥，登记为仓库 deploy key（`newsagg-ecs-deploy`），remote 改 SSH + `core.sshCommand` 指定该密钥 → `ls-remote` 与 `push --dry-run` 均通过。→ **ADR-0074 的账本归档现在真的能跨环境同步了**。
+- **服务器的浏览器登录态不用人工扫码**（ADR-0075）：新写 `scripts/export-pw-cookies.mjs` / `scripts/import-pw-cookies.mjs`，从 toutiao-ops 的 Playwright profile 读**明文** cookie（绕过 SQLite 密文那道坎）→ 传到服务器注入 → 服务器 `auth check` → `logged_in: true`、`username: 淆雨学学`；`content list` 返回真实文章列表。**这修正了 ADR-0071 的一半说法**：「读不到 Playwright profile」指的是**那份 SQLite 的密文**，读得到的是**浏览器进程里的明文**。→ **阶段 1 剩下的唯一人工项是「停本地自动发布」。**
+- **服务器上还缺 mihomo（代理）**：实测 `r.jina.ai` 直连不通（curl 无响应）、`www.google.com` 不通、`api.exa.ai` 404（域名在但无代理）。采集层走 DailyHotApi 的国内源不依赖代理，**但 ADR-0021 的 tier-0 里有 `web`（Jina Reader）**——它在服务器上会**带着绿色状态失效**（本机有 Clash 时报 `web: ok`，直连 20s 超时，ADR-0059 残余风险 53）。**还没决定**：装 mihomo 并把订阅里的头条域名族分流照搬（ADR-0022），还是把 Jina 从 tier-0 里降级并在简报里说明它不可用。
+
 
 
 
 
 **阶段 1：切换（人工，一次）**
 
-8. **停本地自动发布** ← **不可自动化，漏做会导致重复发文**（平台明令禁止）
-9. 服务器部署：mihomo 内核 + Xvfb + 按需 Chrome。**另需解决 git 推送凭证**——服务器实测 `git push` 报 `could not read Username for 'https://github.com'`；不解决则 ADR-0074 的账本归档推不到另一台机器，跨环境仍然是断的。
+8. **停本地自动发布** ← **不可自动化，漏做会导致重复发文**（平台明令禁止）。**这是阶段 1 剩下的唯一人工项。**
+9. 服务器部署：~~mihomo 内核 + Xvfb + 按需 Chrome~~ ✅ **已完成**（2026-10-27，见上面「阶段 0 第 7f 条」）——`scripts/bootstrap-server.sh` 一条命令可复现；git 推送凭证 ✅ 已解决（deploy key）；浏览器登录态 ✅ 已解决（ADR-0075 拷 cookie，不必扫码）。**唯一没定的是 mihomo/代理**（Jina Reader 在服务器上直连不通）。
+
 
 **阶段 2：服务器验证**
 

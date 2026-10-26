@@ -311,25 +311,38 @@ python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py draft-count
 ### 服务器上没有 Chrome 时：用注入的 cookie（ADR-0071）
 
 服务器上 `from_browser()` 直接失败（`CookieError: 找不到浏览器 chrome 的 profile`），
-而 toutiao-ops 的 Playwright profile **解不开**（它的 `Local State` 里 `os_crypt`
-是空 dict）——browserless 与 toutiao-ops 是**两套独立的登录态**。
-→ 服务器上必须**注入**：
+而 toutiao-ops 的 Playwright profile **用 SQLite 直读解不开**（它的 `Local State` 里
+`os_crypt` 是空 dict）——但 **Playwright 自己启动 Chromium 后能拿到明文 cookie**
+（ADR-0075 勘误 ADR-0071）。所以服务器上要**注入两份**：
+
+| 用途 | 源（在本机上） | 传到服务器的产物 | 消费方 |
+|---|---|---|---|
+| 纯 HTTP 读回（表现数据） | 本机真实 Chrome | `.newsagg/toutiao-cookies.json` | `toutiao_api.py --cookie-file` / `NEWSAGG_COOKIE_FILE` |
+| 浏览器写路径（发布） | toutiao-ops 的 Playwright profile | 同一目录下的另一份文件 | `import-pw-cookies.mjs` 注入 profile |
 
 ```bash
-# 本机导出（写出即 0600，不打印任何 cookie 值）
+# ── 纯 HTTP 那份（本机 Chrome，密钥在 Keychain）──
 python3 scripts/export-cookies.py --browser chrome --out .newsagg/toutiao-cookies.json
 
-# 传到服务器并收紧权限（这是账号凭证，用 scp，不要进 git）
-scp .newsagg/toutiao-cookies.json root@<ip>:/root/.newsagg/toutiao-cookies.json
-ssh root@<ip> 'chmod 600 /root/.newsagg/toutiao-cookies.json'
+# ── 浏览器那份（Playwright profile 的明文，ADR-0075）──
+HOME=$PWD/.home node scripts/export-pw-cookies.mjs --out .newsagg/pw-cookies.json
 
-# 服务器上使用
-python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py \
-  --cookie-file /root/.newsagg/toutiao-cookies.json login
+# 传到服务器并收紧权限（这是账号凭证，用 scp，不要进 git）
+scp .newsagg/pw-cookies.json root@<ip>:/opt/newsagg/repo/.newsagg/pw-cookies.json
+ssh root@<ip> 'chmod 600 /opt/newsagg/repo/.newsagg/pw-cookies.json'
+
+# 服务器上注入到它自己的 Playwright profile
+cd /opt/newsagg/repo
+HOME=$PWD/.home node scripts/import-pw-cookies.mjs --from .newsagg/pw-cookies.json
+# 验证（这一步才是真的验证，不是「写入成功」的假象）
+HOME=$PWD/.home node reference/toutiao-ops/cli/index.js auth check
 ```
 
 `Session.from_cookie_file` 会**拒绝**组/其他可读的文件（`mode & 0o077 != 0`），
 并说清 `chmod 600` 怎么改。这不是泛泛的建议——它防的是一次 `chmod 644` 手滑。
+
+**到期日看 `earliest_auth_expiry`，不要看 `earliest_expiry`**：后者会被 `gd_random`
+这类一次性 cookie 拉偏（实测差 46 天），照它续期会做一次不必要的重新扫码。
 
 cookie 主体约 23 天有效（实测 2026-10-27 导出，主体到 2026-11-19）→
 **每月要重新导出一次**。

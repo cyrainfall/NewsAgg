@@ -110,14 +110,23 @@ CookieError: 找不到浏览器 chrome 的 profile（未安装或未使用过）
 
 （`HOME=/tmp/fakehome-empty` 实测。）
 
-而 toutiao-ops 的 Playwright profile **解不开**：`.home/.toutiao-ops/accounts/
+而 toutiao-ops 的 Playwright profile **用 SQLite 直读解不开**：`.home/.toutiao-ops/accounts/
 default/browser-data/Default/Cookies` 里 48 条 toutiao cookie 全部
 `encrypted_value` 有值、`value` 为空；该 profile 的 `Local State` 里
 `os_crypt` 是**空 dict**（没有 `encrypted_key`）。用 `peanuts/saltysalt/1`、
 `peanuts/saltysalt/1003`、Chrome Keychain 口令、`""`/`playwright`/`chrome`
 口令逐一试 → 全部解出非 ASCII 垃圾。
 
-→ **browserless 与 toutiao-ops 是两套独立的登录态**，服务器上必须**注入**。
+> **勘误（ADR-0075，2026-10-27）**：上面这句话只对「直接开那份 SQLite」成立。
+> **Playwright 自己启动 Chromium 后拿到的是明文 cookie** —— 那份密文是给
+> 「绕过浏览器直接读库」的人看的障碍。实测 `ctx.cookies()` 在本机读出
+> 47 条 toutiao cookie（含 `sessionid`/`uid_tt`/`sid_ucp_v1` 等登录态所需
+> 的那一整套）。所以「browserless 与 toutiao-ops 是两套独立的登录态」
+> 这句话要精确化成：**两份 cookie 文件，指向同一个账号**——本机 Chrome 的
+> 那份用 `scripts/export-cookies.py` 解（纯 HTTP 用），Playwright profile
+> 的那份用 `scripts/export-pw-cookies.mjs` 读明文（浏览器写路径用）。
+
+→ **browserless 与 toutiao-ops 需要分别注入**，服务器上必须**注入**。
 新增三层：
 
 | 层 | 位置 | 作用 |

@@ -25,7 +25,27 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# 同目录的姊妹模块（toutiao_api.py）要能被 import。用显式 sys.path 注入而不是
+# 依赖「当前工作目录」，因为这个脚本既可能被 run_all.sh 从仓根调用，也可能被
+# performance.py 用 importlib 从任意 cwd 加载。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
 CST = timezone(timedelta(hours=8))
+
+# 两个后端的适用范围（2026-10-25 实测后定稿）：
+#
+#   api     —— 登录预检、反查。都是只读，都已实测可用，不需要浏览器。
+#   browser —— 发布 / 存草稿。走 vendored 的 toutiao-ops（Playwright DOM）。
+#
+# 为什么写路径不给 api：发布页表单的**字段名**已经从真实 bundle 里逐个核对过
+# （见 toutiao_api.build_publish_form 的文档），但**嵌套字段的序列化形式**
+# （coverList / slaveItems 是 JSON 字符串还是展开成 coverList[0][uri]）无法从
+# 压缩产物里读出，只能靠一次真实写入确认——而真实发布不可逆。所以 api 写路径
+# 默认拒绝，要显式 --allow-unverified-write 才动，且账本会记下这一点。
+BACKENDS = ("api", "browser")
+VERIFY_BACKENDS = ("auto", "api", "browser")
 
 # ADR-0030：并发冲突的识别特征（瞬时竞态，可重试，不算失败）
 CONCURRENCY_MARKERS = [
@@ -419,6 +439,199 @@ def count_published_today(ledger: Path, date: str) -> list[dict]:
     return today
 
 
+# ── 后端适配 ────────────────────────────────────────────────────────────
+# 2026-10-25 起，登录预检与反查可以走纯 HTTP（api 后端），不再需要浏览器。
+# 门序、verdict 取值、账本字段都保持原样 —— 这里只做「同一个动作换实现」。
+
+
+def _load_api_module():
+    """懒加载 toutiao_api。browser 后端跑得好好的时候不该因为 import 失败而崩。"""
+    try:
+        import toutiao_api  # noqa: F401  （同目录，_SCRIPT_DIR 已在 sys.path 里）
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"api 后端不可用：导入 toutiao_api 失败（{exc}）") from exc
+    return toutiao_api
+
+
+def _api_client(account: str):
+    """建一个 api 客户端。
+
+    ## 关于 `--account`
+
+    浏览器后端（toutiao-ops）用 `--account` 在 `.home` 下选一个 profile；api 后端
+    没有这个概念 —— 它用的是从本机浏览器里读出来的那一份 cookie，也就是**当前
+    登录的那个号**。两者不一致时不该装作一致，所以：`--account` 不是 default 时
+    打一条警告，让「我以为在发小号」这种事不可能悄悄发生。
+    """
+    if account and account != "default":
+        print(
+            f"⚠️ api 后端不支持 --account={account}：它用的是浏览器里当前登录的账号。"
+            f"要按 profile 发请用 --backend browser。",
+            file=sys.stderr,
+        )
+    mod = _load_api_module()
+    return mod, mod.Client.from_browser()
+
+
+def _login_probe(backend: str, account: str, env: dict) -> tuple[bool, str, int]:
+    """一次登录预检。返回 `(ok, kind, code)`，`kind` 复用 classify_failure 的词。"""
+    if backend == "browser":
+        code, out, err = run_toutiao(["auth", "check", "--account", account],
+                                     env, timeout=180)
+        # 注意：这个子串判据是 toutiao-ops 的输出格式，不能改（ADR-0030）
+        return (code == 0 and '"logged_in": true' in out,
+                classify_failure(out + err), code)
+
+    # 这里不直接 import browserless：CookieError 的类型由 toutiao_api 那一侧
+    # 定义（它自己负责把 .agents/lib 注入 sys.path）。从它的模块对象上取类型，
+    # publish.py 就不必重复做一次 sys.path 拼装，也不会出现「两处 Inject 顺序
+    # 不同、拿到两个不同的 CookieError 类导致 isinstance 失效」的坑。
+    try:
+        mod, client = _api_client(account)
+        st = client.login_status()
+    except Exception as exc:  # noqa: BLE001
+        cookie_error = getattr(_load_api_module(), "CookieError", ())
+        if cookie_error and isinstance(exc, cookie_error):
+            # 读不到 cookie = 没登录过 / cookie 库锁着。处置与「登录失效」相同：
+            # 去浏览器扫码，不是重试。
+            return False, "login_lost", 1
+        # 网络抖动 → 归 unknown 让上层重试；平台直接说没登录 → login_lost。
+        return False, classify_failure(str(exc)), 1
+    if st.get("logged_in"):
+        return True, "", 0
+    return False, "login_lost", 1
+
+
+def _markdown_to_html(text: str) -> str:
+    """把成稿 markdown 粗转成头条编辑器吃的 HTML。
+
+    ## 这是 api 写路径的第三块未验证拼图
+
+    浏览器后端是把 markdown **粘贴进编辑器**，由编辑器自己转 HTML、自己加内联
+    样式。api 后端没有编辑器，必须自己产 HTML —— 而头条正文的真实 HTML 形态
+    （段落 class、图片 img 的 data 属性、行内样式白名单）我**没有线上样本**，
+    所以这里只做最保守的结构转换：标题/段落/引用/列表/粗体/链接。
+
+    换句话说：这段代码产出的 HTML **能拼出合法请求，但不能保证排版与浏览器
+    后端一致**。这也是 api 写路径默认被挡住的原因之一。
+    """
+    out: list[str] = []
+    in_list = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            continue
+        if line.startswith("### "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<h3>{_inline(line[4:].strip())}</h3>")
+        elif line.startswith("## "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<h2>{_inline(line[3:].strip())}</h2>")
+        elif line.startswith("# "):
+            # 一级标题是文章标题，已经在 title 字段里，正文里不该重复出现
+            continue
+        elif line.startswith("> "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<blockquote>{_inline(line[2:].strip())}</blockquote>")
+        elif line.lstrip().startswith(("- ", "* ")):
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append(f"<li>{_inline(line.lstrip()[2:].strip())}</li>")
+        else:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<p>{_inline(line.strip())}</p>")
+    if in_list:
+        out.append("</ul>")
+    return "".join(out)
+
+
+def _inline(s: str) -> str:
+    """行内格式：`**粗**` → `<strong>`，`[文字](url)` → `<a>`。"""
+    s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', s)
+    return s
+
+
+def _api_write(*, client, mode: str, title: str, body: str, cover_path: Path,
+               declaration: str, allow_unverified_write: bool) -> tuple[int, dict]:
+    """用 api 后端执行发布/存草稿。返回 `(code, info)`。
+
+    ## 两道闸
+
+    `save_draft()` / `publish_article()` 自己会抛 `UnverifiedWrite`；这里再要求
+    命令行显式给 `--allow-unverified-write`。一个人为疏忽不该能把没核对过的稿子
+    发到线上 —— 发布不可逆，平台还禁止重复内容（ADR-0047）。
+
+    ## 为什么上传封面也算「不可逆」
+
+    上传会在账号的图片库里**新增一张图**（我无权删）。所以它同样归在
+    `allow_unverified_write` 之内，不单独放行。
+    """
+    mod = _load_api_module()
+    info: dict = {}
+    if not allow_unverified_write:
+        raise mod.UnverifiedWrite(
+            "api 后端的写路径尚未验证：字段名可信，但 coverList/slaveItems 的序列化"
+            "形态、以及正文 HTML 的真实排版都未经线上确认。"
+            "真发请用 --backend browser；确认要试 api 写，加 --allow-unverified-write。"
+        )
+    img = client.upload_image(str(cover_path), allow_unverified=True)
+    info["cover_uri"] = img.get("uri", "")
+    info["cover_url"] = img.get("cover_url", "")
+    form_kwargs = {
+        "title": title,
+        "content_html": _markdown_to_html(body),
+        "cover_uri": img.get("uri", ""),
+        "cover_url": img.get("cover_url", ""),
+        "declaration": declaration,
+    }
+    if mode == "dry-run":
+        res = client.save_draft(allow_unverified=True, **form_kwargs)
+    else:
+        res = client.publish_article(allow_unverified=True, **form_kwargs)
+    info["pgc_id"] = res.get("pgc_id", "")
+    return 0, info
+
+
+def _api_verify(account: str, limit: int) -> tuple[int, list[dict], str]:
+    """api 后端反查：拉作品列表。返回 `(rc, articles, err)`。
+
+    ## 为什么这里也套一层 (rc, ...) 而不是直接抛
+
+    调用点要和 browser 后端共用同一段判据代码（`if rc == 0: ...` 那一坨）。
+    把「取数」与「判据」分开，才能保证两条路径喂进去的是同一个判据函数，
+    而不是各写一份 —— 各写一份就是 ADR-0047/0051/0053 那三个坑重演的地方。
+
+    ## 失败不抛、返回 rc != 0
+
+    与 `run_toutiao` 的契约一致：调用方已经写好 `rc != 0` 的处理
+    （`verify_result = title_not_found`）。但注意 api 后端下 `rc != 0` 时
+    `verify_kinds` 不会被写入 —— 账本会缺这个字段。这是有意的：宁可缺字段，
+    也不要写一个「0 条微头条」的假事实（api 数据源本来就看不清微头条）。
+    """
+    try:
+        mod, client = _api_client(account)
+        articles = client.list_articles(limit=limit)
+        # 防御：结构变了要当失败，不能当「查不到」——后者会诱使人重发（ADR-0011）
+        if not isinstance(articles, list):
+            return 1, [], f"作品列表返回值不是 list：{type(articles).__name__}"
+        return 0, articles, ""
+    except Exception as exc:  # noqa: BLE001
+        return 1, [], f"{type(exc).__name__}: {exc}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="NewsAgg 发布包装层")
     ap.add_argument("--slug", required=True, help="成稿 slug（对应 outputs/<slug>.md）")
@@ -442,6 +655,23 @@ def main() -> int:
                          "调用方必须同时提供 --daily-override-reason 说明为什么")
     ap.add_argument("--daily-override-reason", default="",
                     help="越过每日上限的理由（会写进账本，便于事后回看为什么今天发了两篇）")
+    # ── 后端选择（2026-10-25 去浏览器化）──
+    # 默认 api：登录预检与反查都走纯 HTTP，不需要浏览器，反查快一个数量级
+    # （实测 node 25.8s → api 0.93s）。写路径（发布/存草稿）仍然默认 browser，
+    # 见 _api_write 的两道闸与 SKILL.md 的「api 后端尚未验证的部分」。
+    ap.add_argument("--backend", choices=list(BACKENDS), default="api",
+                    help="api：登录预检+反查走纯 HTTP，写操作需 --allow-unverified-write；"
+                         "browser：全部走 vendored toutiao-ops（Playwright）。默认 api")
+    ap.add_argument("--allow-unverified-write", action="store_true",
+                    help="允许 api 后端执行写操作（发布/存草稿/上传封面）。"
+                         "这些参数序列化从未经线上验证，只在人工强确认时使用")
+    # 反查后端单独可切，是为了不把 ADR-0047 的微头条泄漏检测弄丢：
+    # api 的数据源只含图文，看不到微头条。默认 auto 跟随写入后端 ——
+    # 写入走 browser（默认情况）时反查也走 browser，安全判据一点不减；
+    # 想享受 api 反查的 0.9s 就显式说 --verify-backend api，账本会记下
+    # verify_weitoutiao_blind 说明这次没查微头条。
+    ap.add_argument("--verify-backend", choices=list(VERIFY_BACKENDS), default="auto",
+                    help="反查用哪个后端。auto（默认）= 跟随实际写入后端")
     args = ap.parse_args()
 
     root = repo_root()
@@ -545,17 +775,18 @@ def main() -> int:
 
     with FileLock(root / ".newsagg" / "browser.lock", timeout=args.lock_timeout):
         # ── 门 2：登录预检（只读，可重试；ADR-0011 + ADR-0030）──
+        # api 后端下这一步是 `GET /mp/agw/media/user_login_status_api`：
+        # 实测 0.69s，且**浏览器关着也能跑**（不需要 Playwright/Chromium）。
         login_ok = False
         for attempt in range(1, 4):
-            code, out, err = run_toutiao(["auth", "check", "--account", args.account],
-                                         env, timeout=180)
-            kind = classify_failure(out + err)
-            if code == 0 and '"logged_in": true' in out:
+            ok, kind, code = _login_probe(args.backend, args.account, env)
+            if ok:
                 login_ok = True
-                steps.append({"step": "auth_check", "attempt": attempt, "ok": True})
+                steps.append({"step": "auth_check", "backend": args.backend,
+                              "attempt": attempt, "ok": True})
                 break
-            steps.append({"step": "auth_check", "attempt": attempt, "ok": False,
-                          "kind": kind, "code": code})
+            steps.append({"step": "auth_check", "backend": args.backend,
+                          "attempt": attempt, "ok": False, "kind": kind, "code": code})
             if kind == "login_lost":
                 break
             time.sleep(5)
@@ -563,28 +794,75 @@ def main() -> int:
             breaker.trip("login_lost", {"slug": args.slug, "steps": steps})
             print(json.dumps({
                 "ok": False, "stage": "auth", "message": "登录预检失败，已熔断",
-                "steps": steps, "how_to_fix": "重新扫码：node index.js auth login（HOME=<repo>/.home）",
+                "steps": steps,
+                "how_to_fix": ("在浏览器里登录 mp.toutiao.com 后重试（api 后端读浏览器 cookie）；"
+                               "或用 --backend browser 走 node index.js auth login 扫码"
+                               "（HOME=<repo>/.home）"),
             }, ensure_ascii=False, indent=2))
             return 1
 
         # ── 发布或 dry-run ──
-        cmd = ["publish", "article",
-               "--title", title,
-               "--content-file", str(root / "outputs" / f"{args.slug}.md"),
-               "--cover", str(Path(args.cover).resolve()),
-               "--cover-mode", "single",
-               "--declaration", args.declaration,
-               "--account", args.account,
-               # ADR-0034：头条发布页默认勾选「同时发布微头条」，必须显式取消。
-               # 本项目一次运行只产出一篇文章；同发微头条会造成内容重复
-               # （平台禁止批量重复内容），且无法被每日上限与冷却期约束。
-               "--no-weitoutiao"]
-        if args.mode == "dry-run":
-            cmd.append("--draft")   # 存草稿而非发布（最接近"停在发布前"）
+        out = ""
+        err = ""
+        api_info: dict = {}
+        write_backend = args.backend
+        write_fallback = None
+        if args.backend == "api" and not args.allow_unverified_write:
+            # api 写路径未验证 → 自动回落 browser。
+            #
+            # 为什么是「回落」而不是「报错」：`--backend api` 的默认值必须让
+            # `run_all.sh`（不能改，调用时不给 --backend）继续按原样工作。
+            # 登录预检与反查已经是纯 HTTP 了，只剩写这一步还是要浏览器 ——
+            # 这正是本次去浏览器化的真实进度，不该用「默认即坏」来表达。
+            # 回落在账本里留痕（write_backend / write_fallback_reason），
+            # 事后能查清这一篇到底是哪条路发出去的。
+            write_backend = "browser"
+            write_fallback = (
+                "api 写路径的参数序列化未经线上验证，已回落 browser 后端执行写操作。"
+                "确需试 api 写：加 --allow-unverified-write"
+            )
+        if write_backend == "api":
+            # api 写路径。未给 --allow-unverified-write 时不会走到这里（上面已回落），
+            # 给了之后仍由 _api_write 自己再挡一道 —— 两道闸是故意的。
+            try:
+                _mod, client = _api_client(args.account)
+                code, api_info = _api_write(
+                    client=client, mode=args.mode, title=title, body=body,
+                    cover_path=Path(args.cover).resolve(),
+                    declaration=args.declaration,
+                    allow_unverified_write=args.allow_unverified_write,
+                )
+                kind = ""
+                out = json.dumps({"title": title, "expected_title": title,
+                                  **api_info}, ensure_ascii=False)
+            except Exception as exc:  # noqa: BLE001
+                mod = _load_api_module()
+                unverified = isinstance(exc, getattr(mod, "UnverifiedWrite", ()))
+                code = 2 if unverified else 1
+                kind = classify_failure(str(exc))
+                err = f"{type(exc).__name__}: {exc}"
+                out = json.dumps({"success": False, "backend": "api",
+                                  "unverified_write": unverified,
+                                  "error": str(exc)}, ensure_ascii=False)
+        else:
+            cmd = ["publish", "article",
+                   "--title", title,
+                   "--content-file", str(root / "outputs" / f"{args.slug}.md"),
+                   "--cover", str(Path(args.cover).resolve()),
+                   "--cover-mode", "single",
+                   "--declaration", args.declaration,
+                   "--account", args.account,
+                   # ADR-0034：头条发布页默认勾选「同时发布微头条」，必须显式取消。
+                   # 本项目一次运行只产出一篇文章；同发微头条会造成内容重复
+                   # （平台禁止批量重复内容），且无法被每日上限与冷却期约束。
+                   "--no-weitoutiao"]
+            if args.mode == "dry-run":
+                cmd.append("--draft")   # 存草稿而非发布（最接近"停在发布前"）
 
-        code, out, err = run_toutiao(cmd, env, timeout=420)
-        kind = classify_failure(out + err)
+            code, out, err = run_toutiao(cmd, env, timeout=420)
+            kind = classify_failure(out + err)
         steps.append({"step": "publish" if args.mode == "publish" else "draft",
+                      "backend": write_backend,
                       "mode": args.mode, "code": code, "kind": kind})
 
         # ADR-0051：平台实际收到的标题可能被吞字。toutiao-ops 现在会读回输入框
@@ -600,6 +878,12 @@ def main() -> int:
                     title_on_platform = got
         except (json.JSONDecodeError, ValueError):
             pass
+
+        # 反查后端：auto 跟随实际写入后端（不是 args.backend —— 回落之后
+        # args.backend 已经不能代表真实执行路径了）。
+        verify_backend = args.verify_backend
+        if verify_backend == "auto":
+            verify_backend = write_backend
 
         record = {
             "at": now.isoformat(), "slug": args.slug, "title": title,
@@ -624,7 +908,16 @@ def main() -> int:
             # 写 null 而不是省略：省略与"没打标签"在消费端不可区分。
             "title_tags": (tr.tag_title(title, rules)
                            if rules.get("loaded") else None),
+            # 去浏览器化的进度必须在账本里可查：这一篇到底哪条路写出去的、
+            # 有没有发生回落、反查用的是哪个数据源。否则「api 后端上线了」
+            # 就只是一句口号，出事时无从复盘。
+            "write_backend": write_backend,
+            "verify_backend": verify_backend,
         }
+        if write_fallback:
+            record["write_fallback_reason"] = write_fallback
+        if api_info:
+            record["api_write"] = api_info
 
         # ── 门 5：反查验证（ADR-0024，仅真发时）──
         if args.mode == "publish":
@@ -645,23 +938,60 @@ def main() -> int:
 
             # 反查：按**平台实际标题**在作品列表中查找（ADR-0051）。
             # 用原标题查会在被吞字时找不到，把真实发布报成未发出。
+            #
+            # 两个后端的差别只在「怎么把列表拿回来」，判据（count_title_kinds /
+            # find_gid）一个字符都没改：api 后端把归一化结果喂给
+            # toutiao_api.as_verify_payload() 伪装成 node 的形状，再交给同一套函数。
+            record["verify_backend"] = verify_backend
             time.sleep(8)  # 给平台一点时间
-            rc, cout, cerr = run_toutiao(["content", "list", "--limit", "20",
-                                          "--account", args.account], env, timeout=240)
-            record["verify_code"] = rc
             found = None
             parse_failed = False
+            payload: dict = {}
+            api_articles: list[dict] = []
+            cout = ""
+            cerr = ""
+            if verify_backend == "api":
+                # 实测 0.93s（node 同一动作 25.81s）
+                rc, api_articles, verr = _api_verify(args.account, 20)
+                if rc == 0:
+                    payload = _load_api_module().as_verify_payload(api_articles)
+                else:
+                    cerr = verr
+                    record["verify_error"] = verr
+            else:
+                rc, cout, cerr = run_toutiao(["content", "list", "--limit", "20",
+                                              "--account", args.account], env, timeout=240)
+            record["verify_code"] = rc
             if rc == 0:
                 try:
-                    payload = json.loads(cout)
-                    blob = json.dumps(payload, ensure_ascii=False)
-                    if title_on_platform in blob:
-                        found = "title_found"
-                        # 尽力判断状态（reviewing / rejected / published）
-                        for status in ("rejected", "reviewing", "published"):
-                            if status in blob:
-                                found = f"title_found:{status}"
-                                break
+                    if verify_backend == "api":
+                        # 精确匹配标题（api 那边标题是干净字段，不需要子串搜索）
+                        want = title_on_platform.strip()
+                        hit = next((a for a in api_articles if a["title"] == want), None)
+                        if hit is not None:
+                            found = "title_found"
+                            suff = _load_api_module().status_suffix(hit)
+                            if suff:
+                                found = f"title_found:{suff}"
+                        # ADR-0047 的微头条计数在 api 后端**看不见**：这个数据源只有
+                        # 图文（genre=Pgc）。所以 weitoutiao 恒 0 不代表没泄漏。
+                        record["verify_weitoutiao_blind"] = (
+                            "api 数据源 /mp/agw/article/list 不含微头条，"
+                            "verify_kinds.weitoutiao 不可作为 ADR-0047 泄漏判据；"
+                            "需要该判据时用 --backend browser"
+                        )
+                    else:
+                        # 解析放在 try 里：ADR-0045 的 stdout 截断会在这里炸，
+                        # 必须走 JSONDecodeError → unknown_needs_review 那条路。
+                        payload = json.loads(cout)
+                        blob = json.dumps(payload, ensure_ascii=False)
+                        if title_on_platform in blob:
+                            found = "title_found"
+                            # 尽力判断状态（reviewing / rejected / published）
+                            for status in ("rejected", "reviewing", "published"):
+                                if status in blob:
+                                    found = f"title_found:{status}"
+                                    break
                     # ADR-0047：数一数这个标题下有几条**文章**、几条微头条。
                     # 一次发布动作本该只产出一篇文章；若同时出现微头条，
                     # 那是 --no-weitoutiao 没生效——这在 10-14 和 10-18 各发生过一次，
@@ -684,7 +1014,7 @@ def main() -> int:
                     # 2026-10-18 实测：CLI 的 stdout 被 process.exit 截断，
                     # 这里曾静默落入 title_not_found，把一次**成功发布**报成失败。
                     parse_failed = True
-                    record["verify_parse_error"] = f"{exc}；原始输出前 200 字：{cout[:200]}"
+                    record["verify_parse_error"] = f"{exc}；原始输出前 200 字：{str(cout)[:200]}"
             record["verify_result"] = found or (
                 "verify_parse_failed" if parse_failed else "title_not_found"
             )

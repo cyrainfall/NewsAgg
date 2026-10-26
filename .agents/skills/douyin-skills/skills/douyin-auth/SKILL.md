@@ -3,7 +3,7 @@ name: douyin-auth
 description: |
   抖音创作服务平台登录认证技能。检查登录状态、扫码登录、手机验证码登录。
   当用户说"登录抖音""检查抖音登录""抖音扫码""切换抖音账号"时触发。
-version: 1.0.0
+version: 1.1.0
 metadata:
   openclaw:
     requires:
@@ -24,14 +24,18 @@ metadata:
 
 **所有操作只能通过 `python scripts/cli.py` 完成：**
 
-| 子命令        | 用途                 |
-| ------------- | -------------------- |
-| `check-login` | 检查登录状态         |
-| `get-qrcode`  | 获取二维码（非阻塞） |
-| `wait-login`  | 等待扫码完成         |
-| `login`       | 扫码登录（阻塞）     |
-| `send-code`   | 发送手机验证码       |
-| `verify-code` | 提交验证码           |
+| 子命令        | 用途                 | 是否需要浏览器 |
+| ------------- | -------------------- | -------------- |
+| `check-login` | 检查登录状态         | 不需要（默认） |
+| `get-qrcode`  | 获取二维码（非阻塞） | ✅ 必须         |
+| `wait-login`  | 等待扫码完成         | ✅ 必须         |
+| `login`       | 扫码登录（阻塞）     | ✅ 必须         |
+| `send-code`   | 发送手机验证码       | ✅ 必须         |
+| `verify-code` | 提交验证码           | ✅ 必须         |
+
+**除 `check-login` 外，其余子命令都必须加 `--browser`**（写在子命令前后都行）。
+登录二维码是页面里渲染出来的图片，验证码依赖页面控件，因此没有纯 HTTP 实现；
+不加 `--browser` 会立刻返回中文提示并以退出码 2 结束，不会悄悄启动浏览器。
 
 不得读取、导出、打印或上传任何 cookie / token 值。
 
@@ -50,10 +54,10 @@ python scripts/cli.py check-login
 
 ```bash
 # 步骤 1：生成本地二维码图片（会自动用系统看图工具打开）
-python scripts/cli.py get-qrcode
+python scripts/cli.py --browser get-qrcode
 
 # 步骤 2：告诉用户用抖音 App 扫码，然后等待结果
-python scripts/cli.py wait-login --timeout 180
+python scripts/cli.py --browser wait-login --timeout 180
 ```
 
 处理要点：
@@ -67,7 +71,7 @@ python scripts/cli.py wait-login --timeout 180
 如果用户希望一条命令搞定（会阻塞等待）：
 
 ```bash
-python scripts/cli.py login --timeout 180
+python scripts/cli.py --browser login --timeout 180
 ```
 
 ## 流程 C：手机验证码登录
@@ -76,10 +80,10 @@ python scripts/cli.py login --timeout 180
 
 ```bash
 # 步骤 1：发送验证码
-python scripts/cli.py send-code --phone 13800138000
+python scripts/cli.py --browser send-code --phone 13800138000
 
 # 步骤 2：用户把收到的 6 位验证码告诉你之后提交
-python scripts/cli.py verify-code --code 123456
+python scripts/cli.py --browser verify-code --code 123456
 ```
 
 处理要点：

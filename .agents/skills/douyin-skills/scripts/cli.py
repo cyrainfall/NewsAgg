@@ -1,9 +1,25 @@
-"""抖音自动化 CLI 入口（Extension Bridge 版）
+"""抖音自动化 CLI 入口（API 优先，浏览器兜底）
 
-通过浏览器扩展 Bridge 连接用户已打开的 Chrome，使用真实的登录态和浏览器环境
-操作抖音创作服务平台，不使用无头浏览器、不伪造指纹。
+两种模式：
 
-前置条件：
+* **API 模式（默认）** —— 只读取本机浏览器里**已登录的 Cookie**，用纯 HTTP 直接请求
+  ``creator.douyin.com`` 的接口，**不启动、不接管浏览器**。启动快、无窗口、可放进
+  脚本/CI（只要有已登录的 Cookie）。
+* **浏览器模式（``--browser``）** —— 通过浏览器扩展 Bridge 连接用户已打开的 Chrome，
+  使用真实的登录态和浏览器环境在页面上操作，不使用无头浏览器、不伪造指纹。
+
+哪个子命令走哪条路，见下面 ``_API_COMMANDS`` 与 ``_BROWSER_ONLY_COMMANDS``，
+以及 SKILL.md 里那张实测出来的对照表。
+
+为什么不能全部走 API
+--------------------
+发布 / 存草稿这几条接口在平台前端被标记了 ``needSign: true`` + ``withSecondVerify:
+true``，由 secure-consumer-sdk 在浏览器内按设备上下文 + 时间 + 请求体实时计算
+``bd-ticket-guard-*`` 签名头。这段逻辑与浏览器环境绑定、且随平台发版迭代，纯 HTTP
+无法复现。所以这些子命令**必须** ``--browser``；没加时会立刻以中文提示 + 退出码 2
+失败，**绝不会**悄悄起浏览器、更不会返回假的发布成功。
+
+浏览器模式前置条件：
     1. 运行 ``python scripts/bridge_server.py``（CLI 会自动尝试拉起）
     2. 在 Chrome 的 chrome://extensions 中加载本项目的 extension/ 目录
     3. 浏览器中已登录抖音创作服务平台
@@ -19,7 +35,8 @@ import json
 import logging
 import os
 import sys
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from douyin.types import PublishVideoContent
@@ -34,6 +51,38 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("douyin-cli")
+
+
+# ─── 能力划分：哪些子命令能免浏览器 ──────────────────────────────────────────
+
+#: 默认走纯 HTTP API 的子命令（每一条都实测过，见 SKILL.md 的对照表）。
+#: 只有在这里登记过的才走 API —— 新增子命令若忘了登记，会落到原来的 bridge 行为，
+#: 不会被误判成「已支持无浏览器」。
+_API_COMMANDS: set[str] = {
+    "check-login",
+    "user-info",
+    "creator-info",
+    "list-works",
+    "upload-preflight",
+}
+
+#: 必须浏览器的子命令 → 原因（没加 ``--browser`` 时据此给出明确中文提示）。
+_BROWSER_ONLY_COMMANDS: dict[str, str] = {
+    "login": "扫码登录需要打开页面读取/轮询二维码状态",
+    "get-qrcode": "二维码由页面渲染，需要浏览器",
+    "wait-login": "需要轮询页面的登录态",
+    "send-code": "发送验证码依赖页面控件",
+    "verify-code": "填写验证码依赖页面控件",
+    "fill-publish-video": "向页面注入文件、填写表单，依赖真实 DOM 与前端状态",
+    "publish-video": (
+        "发布接口 /web/api/media/aweme/create_v2/ 在前端标记 needSign=true，"
+        "由 secure-consumer-sdk 在浏览器内现算 bd-ticket-guard-* 签名头，纯 HTTP 无法复现"
+    ),
+    "click-publish": "点击页面上的发布按钮",
+    "save-draft": ("草稿接口 /web/api/media/aweme/draft 同样 needSign=true，需要浏览器内签名"),
+    "probe": "抓取当前页面的元素结构，必须有页面",
+    "page-info": "读取当前标签页信息，必须有页面",
+}
 
 
 # ─── 输出工具 ────────────────────────────────────────────────────────────────
@@ -54,6 +103,105 @@ def _fill_qrcode_result(result: dict, png_bytes: bytes) -> None:
     data_url = make_qrcode_data_url(png_bytes)
     if data_url:
         result["qrcode_image_url"] = data_url
+
+
+# ─── 模式判定 ────────────────────────────────────────────────────────────────
+
+
+def _use_browser(args: argparse.Namespace) -> bool:
+    """该子命令本次是否走浏览器模式。
+
+    默认是 API；只有 ``_API_COMMANDS`` 里明确实测过能免签名的才走 API。
+    """
+    if getattr(args, "browser", False):
+        return True
+    return getattr(args, "command", "") not in _API_COMMANDS
+
+
+def _require_browser_mode(args: argparse.Namespace) -> None:
+    """浏览器专属子命令在没加 ``--browser`` 时报错退出，而不是悄悄去起浏览器。
+
+    这样「我忘了加 --browser」会立刻得到一句明确的中文提示 + exit 2，而不是让用户
+    等二十秒看它去开 Chrome、最后还因为缺签名失败。
+    """
+    command = getattr(args, "command", "")
+    reason = _BROWSER_ONLY_COMMANDS.get(command)
+    if reason is None or getattr(args, "browser", False):
+        return
+    _output(
+        {
+            "success": False,
+            "mode": "browser",
+            "requiresBrowser": True,
+            "reason": reason,
+            "error": f"子命令 {command} 必须使用浏览器模式：{reason}。请加 --browser 重试。",
+            "hint": f"python scripts/cli.py --browser {command} ...",
+        },
+        exit_code=2,
+    )
+
+
+def _cookie_error_hint(exc: Exception) -> dict:
+    """读不到本机浏览器 Cookie 时的结构化提示（不含任何 Cookie 值）。"""
+    return {
+        "success": False,
+        "mode": "api",
+        "error": str(exc),
+        "hint": (
+            "无法从本机浏览器读取抖音 Cookie（只读、不上传）。请确认："
+            "1) 已用 Chrome 登录 https://creator.douyin.com/；"
+            "2) 当前系统用户能访问浏览器数据目录；"
+            "3) 或用 --browser 走扩展桥接。"
+        ),
+    }
+
+
+# ─── API 模式执行 ────────────────────────────────────────────────────────────
+
+
+def _run_api(
+    args: argparse.Namespace,
+    action: Callable[[Any], Any],
+    *,
+    fallback: Callable[[argparse.Namespace], None] | None = None,
+) -> Any:
+    """在 API 模式下跑一次 ``action(api)``。
+
+    ``action`` 抛 ``CookieError``（读不到本机浏览器 Cookie）时，自动降级到浏览器模式
+    重试**一次**；降级也失败则打印中文提示并以 exit 2 结束。
+
+    只对 ``CookieError`` 降级。「未登录」不降级 —— 那该让用户去登录，悄悄起浏览器
+    反而更慢更迷惑；「需要签名」也不降级，那必须由用户显式加 ``--browser``，
+    否则会在没告知的情况下替用户开浏览器发布作品。
+    """
+    # 从 douyin.api 导入：它会先把 .agents/lib 加进 sys.path，直接 import
+    # browserless.* 会因路径没配好而 ModuleNotFoundError
+    from douyin.api import COOKIE_ERRORS, DouyinApi
+
+    try:
+        return action(DouyinApi())
+    except COOKIE_ERRORS as exc:
+        if fallback is not None and not getattr(args, "browser", False):
+            logger.warning("读不到浏览器 Cookie，自动降级到浏览器模式重试一次")
+            try:
+                fallback(args)
+            except COOKIE_ERRORS as retry_exc:
+                data = _cookie_error_hint(retry_exc)
+                data["error"] = f"{exc}；降级到浏览器模式后仍失败：{retry_exc}"
+                _output(data, exit_code=2)
+            raise  # fallback 正常都会 _output 退出；走到这里说明它没退出
+        _output(_cookie_error_hint(exc), exit_code=2)
+        raise  # 供类型检查；_output 已 sys.exit
+
+
+def _api_or_output(
+    args: argparse.Namespace,
+    action: Callable[[Any], Any],
+    *,
+    fallback: Callable[[argparse.Namespace], None] | None = None,
+) -> None:
+    """``_run_api`` 的便捷包装：把 action 的返回值直接输出为成功结果。"""
+    _output(_run_api(args, action, fallback=fallback))
 
 
 # ─── Bridge 连接 ──────────────────────────────────────────────────────────────
@@ -143,6 +291,15 @@ def _connect(args: argparse.Namespace):
 
 
 def cmd_check_login(args: argparse.Namespace) -> None:
+    """检查登录状态。默认走 API（不开浏览器）；``--browser`` 时保持原页面流程。"""
+    if not _use_browser(args):
+        _api_or_output(args, lambda api: api.check_login(), fallback=_check_login_browser)
+        return
+    _check_login_browser(args)
+
+
+def _check_login_browser(args: argparse.Namespace) -> None:
+    """浏览器模式下的登录检查（原行为，未改动）。"""
     from douyin.login import check_login_status, get_nickname
 
     browser, page = _connect(args)
@@ -152,14 +309,45 @@ def cmd_check_login(args: argparse.Namespace) -> None:
             _output(
                 {
                     "logged_in": False,
+                    "mode": "browser",
                     "hint": "未登录。运行 `python scripts/cli.py get-qrcode` 获取二维码，"
                     "或 `python scripts/cli.py send-code --phone <手机号>` 走验证码登录。",
                 },
                 exit_code=1,
             )
-        _output({"logged_in": True, "nickname": get_nickname(page), "url": page.get_url()})
+        _output(
+            {
+                "logged_in": True,
+                "nickname": get_nickname(page),
+                "url": page.get_url(),
+                "mode": "browser",
+            }
+        )
     finally:
         browser.close()
+
+
+def cmd_user_info(args: argparse.Namespace) -> None:
+    """账号信息（昵称 / 抖音号 / 粉丝数 / 头像）。纯 HTTP，不需要浏览器。"""
+    _api_or_output(args, lambda api: api.user_info())
+
+
+def cmd_creator_info(args: argparse.Namespace) -> None:
+    """创作者信息（开通日期 / 实名状态 / 权限位）。纯 HTTP，不需要浏览器。"""
+    _api_or_output(args, lambda api: api.creator_info())
+
+
+def cmd_list_works(args: argparse.Namespace) -> None:
+    """已发布作品列表。纯 HTTP，不需要浏览器。"""
+    _api_or_output(
+        args,
+        lambda api: api.list_works(count=args.count, order_by=args.order_by),
+    )
+
+
+def cmd_upload_preflight(args: argparse.Namespace) -> None:
+    """只读检查上传前置条件（VOD 域名 + 能否拿到 STS 凭证，不打印凭证本身）。"""
+    _api_or_output(args, lambda api: api.upload_preflight())
 
 
 def cmd_get_qrcode(args: argparse.Namespace) -> None:
@@ -369,18 +557,59 @@ def _add_publish_args(sub: argparse.ArgumentParser, *, video_required: bool = Tr
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="douyin-cli",
-        description="抖音创作服务平台自动化 CLI（Extension Bridge 版）",
+        description=(
+            "抖音创作服务平台自动化 CLI（默认走纯 HTTP API，需要页面/签名的能力用 --browser）"
+        ),
     )
     parser.add_argument(
         "--bridge-url",
         default="ws://localhost:9334",
         help="Bridge server WebSocket 地址 (default: ws://localhost:9334)",
     )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="强制使用浏览器模式（扩展 Bridge + 页面操作）。默认走纯 HTTP API",
+    )
+
+    # ``--browser`` 既要能写在子命令之前（全局），也要能写在子命令之后 —— 后者更符合
+    # 直觉，但 argparse 的全局选项默认不支持，故给每个子命令也补一份同名的
+    # store_true，用 ``default=argparse.SUPPRESS`` 保证它不覆盖全局那份的值。
+    class _SubParserFactory:
+        """给每个子命令自动补一个 ``--browser``。"""
+
+        def __init__(self, real: Any) -> None:
+            self._real = real
+
+        def add_parser(self, *args: Any, **kwargs: Any) -> Any:
+            sub = self._real.add_parser(*args, **kwargs)
+            sub.add_argument(
+                "--browser",
+                action="store_true",
+                default=argparse.SUPPRESS,
+                help="强制使用浏览器模式（等价于写在子命令前面的 --browser）",
+            )
+            return sub
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = _SubParserFactory(subparsers)  # type: ignore[assignment]
 
     sub = subparsers.add_parser("check-login", help="检查登录状态")
     sub.set_defaults(func=cmd_check_login)
+
+    sub = subparsers.add_parser("user-info", help="账号信息（昵称/抖音号/粉丝数）")
+    sub.set_defaults(func=cmd_user_info)
+
+    sub = subparsers.add_parser("creator-info", help="创作者信息（开通日期/权限位）")
+    sub.set_defaults(func=cmd_creator_info)
+
+    sub = subparsers.add_parser("list-works", help="已发布作品列表")
+    sub.add_argument("--count", type=int, default=10, help="每页条数 (default: 10)")
+    sub.add_argument("--order-by", type=int, default=0, help="0=按发布时间倒序 (default: 0)")
+    sub.set_defaults(func=cmd_list_works)
+
+    sub = subparsers.add_parser("upload-preflight", help="只读检查上传前置条件（不打印任何凭证）")
+    sub.set_defaults(func=cmd_upload_preflight)
 
     sub = subparsers.add_parser("login", help="扫码登录（阻塞等待）")
     sub.add_argument("--timeout", type=float, default=180.0)
@@ -434,15 +663,33 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    # 子命令上的 --browser 用 argparse.SUPPRESS，未出现时不写回 namespace，
+    # 因此全局那份的值会保留下来；这里只做一次兜底归一化。
+    args.browser = bool(getattr(args, "browser", False))
+
+    # 浏览器专属子命令在没加 --browser 时立刻报错（而不是悄悄去启动 Chrome）
+    _require_browser_mode(args)
+
     try:
         args.func(args)
+    except SystemExit:
+        raise
     except Exception as e:
         from douyin.errors import NotLoggedInError
 
+        # 未登录用 exit 1 与其他错误（2）区分开，便于脚本判断
         if isinstance(e, NotLoggedInError):
             logger.error("未登录: %s", e)
-            _output({"success": False, "error": str(e), "logged_in": False}, exit_code=1)
-        logger.error("执行失败: %s", e, exc_info=True)
+            _output(
+                {
+                    "success": False,
+                    "logged_in": False,
+                    "mode": "browser" if getattr(args, "browser", False) else "api",
+                    "error": str(e),
+                },
+                exit_code=1,
+            )
+        logger.error("执行失败: %s", e)
         _output({"success": False, "error": str(e)}, exit_code=2)
 
 

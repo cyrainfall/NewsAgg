@@ -217,6 +217,9 @@ python3 .agents/skills/newsagg-publish/scripts/publish.py \
 | 参数 | 说明 |
 | --- | --- |
 | `--mode` | `dry-run`（默认，存草稿）/ `publish`（真发） |
+| `--backend` | `api`（默认）/ `browser`。见下节「两种后端」 |
+| `--verify-backend` | `auto`（默认，跟随写入后端）/ `api` / `browser` |
+| `--allow-unverified-write` | 允许 api 后端做写操作。**默认关**，只在人工强确认时开 |
 | `--declaration` | 作品声明，默认 `个人观点`（ADR-0046；**含已知合规风险**，见该 ADR） |
 | `--min-free-mb` | 发布前可用内存下限，默认 800（ADR-0023） |
 | `--lock-timeout` | 等待浏览器锁的秒数，默认 300 |
@@ -228,16 +231,99 @@ python3 .agents/skills/newsagg-publish/scripts/publish.py \
 > ADR-0027 可能被清理或跨环境不同步），只有发布那一刻记下的 `card_file` 是可靠归因。
 > 归因读取顺序是**账本优先、决策文件兜底**。
 
+## 两种后端（api / browser）
+
+发布链路拆成三段，两段已经不需要浏览器：
+
+| 环节 | api 后端 | browser 后端 |
+| --- | --- | --- |
+| 登录预检 | `GET /mp/agw/media/user_login_status_api`，**0.69s，浏览器关着也能跑** | `node index.js auth check`，要起 Playwright/Chromium |
+| 反查 | `GET /mp/agw/article/list`，**0.93s**，还能看见草稿 | `node index.js content list`，**25.8s**，看不见草稿 |
+| 写（发布/存草稿/上传封面） | 端点与字段名已核对，**但序列化形态未线上验证** | Playwright DOM 自动化，**已验证** |
+
+**默认 `--backend api`** 的真实含义是：登录预检与反查走纯 HTTP，
+写这一步**自动回落** `browser`。回落会在账本里留下
+`write_backend` / `write_fallback_reason`，事后可查这一篇到底是哪条路发出去的。
+之所以选「回落」而不是「直接报错」：`run_all.sh` 调用本脚本时不传 `--backend`，
+默认值必须保持它原来能跑。
+
+实测数字（2026-10-25，同一账号、同一次反查）：
+- 登录预检：api 0.69s vs browser（起浏览器 + node）数十秒
+- 反查：api 0.93s vs node 25.81s（约 28 倍）
+- 一致性：node 的 10 条作品与 api 的 15 条（10 已发布 + 5 草稿）逐条比对，
+  `gid` 与 `title` **10/10 完全相同**
+
+### 真实发布前的确认要求
+
+1. **默认就是安全的。** 不传 `--mode publish` 只存草稿；不传 `--allow-unverified-write`
+   写操作一定走 browser 后端（已验证那条路）。
+2. **想用 api 真发，必须先自己确认三件事**（下一节逐条列了缺什么），
+   然后显式加 `--allow-unverified-write`。这个 flag 是"我知道我在赌"，
+   不是"跳过检查"。
+3. **发布不可逆，且平台禁止重复内容（ADR-0047）。** 一旦 api 写路径真发成功过一次，
+   要立刻把结果记进 ADR，并把该路径从 beta 提升为已验证 —— 而不是默默继续用。
+
+### api 后端尚未验证的部分（写路径为什么默认被挡）
+
+端点 URL、query 参数、字段名都是从发布页真实 bundle 里逐个核对的
+（`publish.b8c90341ac.js` 模块 12306 的表单默认值、`timing` builder 的
+`save` 映射、`common` builder 的 `source:29` / `extra` JSON 字符串）。
+共 35 个字段，`build_publish_form()` 按真实名字拼。**但有三处拿不到线上证据：**
+
+1. **`coverList` 的嵌套序列化。** JS 里它是数组对象，提交时必有某层做了
+   stringify，那一层在压缩产物里看不出来。这里选择写成 JSON 字符串
+   （头条系接口的常见形态），但没有线上证据。
+2. **`slaveItems` 同上。**
+3. **正文 `content` 的 HTML 形态。** browser 后端是把 markdown **粘贴进编辑器**，
+   由编辑器自己转 HTML、自己加内联样式；api 后端没有编辑器，只能自己产 HTML。
+   现在只做标题/段落/引用/列表/粗体/链接的最保守转换，
+   **排版不可能与 browser 后端一致**。
+
+另外两件已实测但要记住的事：
+
+- **发布端点拦不拦无签名请求，结论是「不确定」。** 发布页注册了
+  `window.byted_acrawler.init({aid:1231, intercept:!0, enablePathList:["/mp/agw/article/publish"]})`，
+  而 `acrawler.js` 是 vm 混淆的字节码，静态读不出签名算法。
+  实测**空 body** 请求返回的是业务层 `code 7050 保存失败`（不是 `2222 可信浏览器校验`），
+  说明空请求穿过了签名闸 —— 但空请求能过不等于带真实内容能过（反爬常按内容分层）。
+  这一步只能靠一次真实写入确认，而本次任务禁止真发，所以停在这里。
+- **`verify_kinds.weitoutiao` 在 api 后端恒为 0，且不可信。**
+  `/mp/agw/article/list` 只含图文（genre=Pgc），微头条不在这个数据源里。
+  账本会写 `verify_weitoutiao_blind` 说明这次没查微头条。
+  **ADR-0047 的泄漏检测必须用 `--backend browser`**（它拦 `/pgc/ma/content/...`，含微头条）。
+
+### api 后端可以放心用的命令
+
+```bash
+# 登录状态（浏览器关闭即可）
+python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py login
+
+# 作品列表（含草稿，比 node 多 5 个字段：is_draft/is_passed/is_unpass/status_desc/info_source）
+python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py list --limit 20
+
+# 草稿列表 / 草稿数
+python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py drafts
+python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py draft-count
+```
+
+这四个都是**只读**，已实测可用（2026-10-25）。
+
 ## 安全门（按执行顺序）
 
 | 门 | 内容 | 不过时 |
 | --- | --- | --- |
 | 0 | **熔断状态**（`.newsagg/breaker.json`） | 拒绝，提示如何解除 |
+| 0.5 | **每日上限 1 篇**（`.newsagg/publish-ledger.jsonl`，ADR-0014） | 拒绝，除非 `--allow-daily-override` |
 | 1 | 成稿存在 + 标题 2~30 字 + 封面存在 | 拒绝 |
 | 2 | **内存预检**（ADR-0023） | 熔断 + 告警 |
 | 3 | **登录预检**（只读，可重试 3 次） | 登录失效 → 熔断 |
 | 4 | 发布 / 存草稿 | — |
 | 5 | **反查验证**（仅真发，ADR-0024） | 见下 |
+
+门 3 与门 5 的实际实现取决于 `--backend`：`api` 走纯 HTTP（不需要浏览器），
+`browser` 走 vendored toutiao-ops。**门序、判据函数、`verdict` 取值一个字符都没改** ——
+api 后端只是把列表数据翻译成 node 的形状（`toutiao_api.as_verify_payload()`），
+再交给同一个 `count_title_kinds()` / `find_gid()` 去判。
 
 ## 硬规则
 

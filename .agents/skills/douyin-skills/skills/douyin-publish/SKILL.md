@@ -4,7 +4,7 @@ description: |
   抖音视频作品发布技能。支持上传本地视频、填写作品标题与作品简介、添加 #话题、
   设置可见范围与定时发布、保存草稿、发布后确认。当用户要求"发抖音视频""上传视频到抖音"
   "抖音发布作品""把这段视频发到抖音""抖音定时发布"时触发。
-version: 1.0.0
+version: 1.1.0
 metadata:
   openclaw:
     requires:
@@ -38,6 +38,26 @@ metadata:
 | `publish-video`      | 一步完成上传 + 填写 + 发布     |
 | `click-publish`      | 点击「发布」按钮               |
 | `save-draft`         | 保存为草稿                     |
+
+**上表所有子命令都必须加 `--browser`**（写在子命令前后都行）。原因见下面
+「为什么发布必须走浏览器」：发布/草稿接口在前端标了 `needSign: true`，签名由浏览器内的
+secure-consumer-sdk 现算，纯 HTTP 复现不了。不加 `--browser` 会立刻返回中文提示 + 退出码 2。
+
+## ⚠️ 为什么发布必须走浏览器（不要试图绕开）
+
+| 接口                                  | 前端标记                              |
+| ------------------------------------- | ------------------------------------- |
+| `POST /web/api/media/aweme/create_v2/` | `needSign: true` + `withSecondVerify: true` |
+| `POST /web/api/media/aweme/draft`      | `needSign: true`                      |
+| `POST /web/api/media/aweme/update_v2/` | `needSign: true`                      |
+
+签名由 secure-consumer-sdk 劫持 `XMLHttpRequest.prototype.setRequestHeader`，在浏览器内按
+设备证书上下文 + 时间 + 请求体现算并注入 `bd-ticket-guard-*` 请求头。它与浏览器环境绑定，
+且**随平台发版迭代**——硬编码一份实现会随升级静默失效，那时最危险的表现不是报错，而是
+「看起来发了、其实没发」或触发风控。
+
+因此脚本**不做本地签名，也绝不返回假的发布成功**：无法确认发布成功就以退出码 2 结束。
+只读的账号/作品信息（`check-login` / `list-works` 等）可以无浏览器，但发布/草稿不行。
 | `probe`              | 抓取发布页元素，用于修复选择器 |
 
 ---
@@ -102,7 +122,7 @@ printf '%s' "简介内容" > /tmp/dy_desc.txt
 
 ```bash
 # 步骤 1：上传视频 + 填写表单（不会点发布）
-python scripts/cli.py fill-publish-video \
+python scripts/cli.py --browser fill-publish-video \
   --title-file /tmp/dy_title.txt \
   --desc-file /tmp/dy_desc.txt \
   --video "/abs/path/video.mp4" \
@@ -117,10 +137,10 @@ python scripts/cli.py fill-publish-video \
 # 步骤 2：让用户在浏览器里肉眼确认封面、标题、简介、话题、可见范围
 
 # 步骤 3a：用户确认 → 发布
-python scripts/cli.py click-publish
+python scripts/cli.py --browser click-publish
 
 # 步骤 3b：用户取消或要改 → 先存草稿，再改
-python scripts/cli.py save-draft
+python scripts/cli.py --browser save-draft
 ```
 
 > ⚠️ **用户取消时不要关闭标签页**：必须调用 `save-draft`，否则刚填好的内容会丢失。
@@ -128,7 +148,7 @@ python scripts/cli.py save-draft
 ### 一步发布（用户明确要求"直接发"时）
 
 ```bash
-python scripts/cli.py publish-video \
+python scripts/cli.py --browser publish-video \
   --title-file /tmp/dy_title.txt \
   --desc-file /tmp/dy_desc.txt \
   --video "/abs/path/video.mp4" \
@@ -169,13 +189,13 @@ python scripts/cli.py publish-video \
 
 ```bash
 # 场景 1：排查上传区（file input）—— 带 --url，probe 会自己导航过去
-python scripts/cli.py probe --url "https://creator.douyin.com/creator-micro/content/upload"
+python scripts/cli.py --browser probe --url "https://creator.douyin.com/creator-micro/content/upload"
 
 # 场景 2：排查表单字段（标题 / 简介 / 发布按钮）
 #   1) 先跑一次 fill-publish-video —— 它会视频上传成功、然后在坏掉的选择器上报错，
 #      此时页面已经处于「已上传、表单已渲染」状态（这正是我们需要的前提）
 #   2) 不带 --url 直接抓当前页面
-python scripts/cli.py probe
+python scripts/cli.py --browser probe
 ```
 
 **不需要**为了进入这个状态去写额外命令 —— 失败的 `fill-publish-video` 本身就把页面留在

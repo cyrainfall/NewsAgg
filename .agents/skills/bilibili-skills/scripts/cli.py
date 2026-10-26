@@ -1,12 +1,18 @@
-"""B站自动化 CLI 入口（Extension Bridge 版）
+"""B站自动化 CLI 入口（默认无浏览器，协议优先）
 
-通过浏览器扩展 Bridge 连接用户已打开的 Chrome，使用真实的登录态和浏览器环境
-操作 B站创作中心，不使用无头浏览器、不伪造指纹。
+默认走 ``bilibili.api`` 的纯 HTTP 协议层：从本机浏览器**只读**取一次 B站 Cookie，
+之后所有请求都是普通 HTTPS，不需要打开浏览器、不需要装扩展、不需要 bridge。
 
-前置条件：
-    1. 运行 ``python scripts/bridge_server.py``（CLI 会自动尝试拉起）
-    2. 在 Chrome 的 chrome://extensions 中加载本项目的 extension/ 目录
-    3. 浏览器中已登录 B站创作中心
+``--browser`` 是显式兜底：改走「bridge server + 浏览器扩展 + 页面 DOM」的老路径。
+只在两种情况下需要它：
+    1. Cookie 读不到（``CookieError``）—— 此时 CLI 会打印中文提示并**自动**
+       降级到浏览器路径重试一次；
+    2. 有些操作只能在页面里做（登录扫码、填表、点按钮、保存草稿、元素自检），
+       这些命令本身就只走浏览器路径。
+
+前置条件（默认路径）：
+    1. 本机已安装 Chrome / Edge / Brave 之一，且其中已登录 B站创作中心；
+    2. 该浏览器允许读取其 Cookie 库（macOS 首次可能弹钥匙串授权）。
 
 输出：JSON（ensure_ascii=False）
 退出码：0=成功, 1=未登录, 2=错误
@@ -181,7 +187,7 @@ def _ensure_bridge_ready(bridge_url: str) -> None:
 
 
 def _connect(args: argparse.Namespace):
-    """返回 (browser, page)。"""
+    """返回 (browser, page)。只在浏览器路径上用。"""
     from bilibili.bridge import BridgePage
 
     bridge_url = getattr(args, "bridge_url", "ws://localhost:9335")
@@ -189,10 +195,64 @@ def _connect(args: argparse.Namespace):
     return _DummyBrowser(), BridgePage(bridge_url)
 
 
+# ─── 协议层分发 ──────────────────────────────────────────────────────────────
+#
+# 默认走 bilibili.api（纯 HTTP）；--browser 走老的 bridge/扩展/页面路径。
+#
+# CookieError 是唯一会自动降级的错误：它代表「技术上读不到浏览器 Cookie」，
+# 这时候浏览器里多半还是登录着的，退到扩展路径仍能干活。其余错误（未登录、
+# 服务端拒绝、网络失败）一律不降级 —— 换个通道重试只会把真实原因盖掉。
+
+
+def _make_api(args: argparse.Namespace):
+    """按 ``--cookie-source`` 构造协议层客户端。"""
+    from bilibili.api import BilibiliAPI
+
+    return BilibiliAPI(getattr(args, "cookie_source", "chrome") or "chrome")
+
+
+def _run_with_fallback(args: argparse.Namespace, api_func, browser_func) -> None:
+    """先协议、必要时降级。两个 func 都自己负责 ``_output``。"""
+    from bilibili.api import CookieError
+
+    if getattr(args, "browser", False):
+        browser_func(args)
+        return
+    try:
+        api_func(args)
+    except CookieError as exc:
+        logger.warning("读不到浏览器的 B站 Cookie（%s）。自动改用浏览器扩展路径重试一次……", exc)
+        logger.warning(
+            "若接下来也失败，请确认：1) Chrome/Edge/Brave 中已登录 B站创作中心；"
+            "2) macOS 首次读取 Cookie 需要钥匙串授权；3) 走扩展路径还需在 "
+            "chrome://extensions 加载本项目 extension/ 目录"
+        )
+        browser_func(args)
+
+
 # ─── 认证相关 ────────────────────────────────────────────────────────────────
 
 
-def cmd_check_login(args: argparse.Namespace) -> None:
+def _api_check_login(args: argparse.Namespace) -> None:
+    from bilibili.api import AuthRequired
+
+    try:
+        info = _make_api(args).check_login()
+    except AuthRequired as exc:
+        _output(
+            {
+                "logged_in": False,
+                "mode": "api",
+                "error": str(exc),
+                "hint": "未登录。在浏览器里登录 B站后重试，或运行 "
+                "`python scripts/cli.py get-qrcode` 获取二维码。",
+            },
+            exit_code=1,
+        )
+    _output({"mode": "api", **info})
+
+
+def _browser_check_login(args: argparse.Namespace) -> None:
     from bilibili.login import check_login_status, get_nickname
 
     browser, page = _connect(args)
@@ -202,14 +262,26 @@ def cmd_check_login(args: argparse.Namespace) -> None:
             _output(
                 {
                     "logged_in": False,
+                    "mode": "browser",
                     "hint": "未登录。运行 `python scripts/cli.py get-qrcode` 获取二维码，"
                     "或 `python scripts/cli.py send-code --phone <手机号>` 走短信登录。",
                 },
                 exit_code=1,
             )
-        _output({"logged_in": True, "nickname": get_nickname(page), "url": page.get_url()})
+        _output(
+            {
+                "logged_in": True,
+                "mode": "browser",
+                "nickname": get_nickname(page),
+                "url": page.get_url(),
+            }
+        )
     finally:
         browser.close()
+
+
+def cmd_check_login(args: argparse.Namespace) -> None:
+    _run_with_fallback(args, _api_check_login, _browser_check_login)
 
 
 def cmd_get_qrcode(args: argparse.Namespace) -> None:
@@ -301,6 +373,65 @@ def cmd_verify_code(args: argparse.Namespace) -> None:
         browser.close()
 
 
+# ─── 稿件列表 ────────────────────────────────────────────────────────────────
+
+
+def _api_list_archives(args: argparse.Namespace) -> None:
+    data = _make_api(args).list_archives(pn=args.page, ps=args.page_size)
+    _output({"mode": "api", **data})
+
+
+def _browser_list_archives(args: argparse.Namespace) -> None:
+    """扩展路径：在页面里同源 fetch 稿件列表（复用真实登录态）。"""
+    browser, page = _connect(args)
+    try:
+        data = page.evaluate(
+            f"""
+            (async () => {{
+              const r = await fetch(
+                "/x/web/archives?pn={int(args.page)}&ps={int(args.page_size)}"
+                + "&status=is_pubing,pubed,not_pubed",
+                {{ credentials: "include" }}
+              );
+              return await r.json();
+            }})()
+            """
+        )
+        payload = (data or {}).get("data") or {}
+        archives = []
+        for item in payload.get("arc_audits") or []:
+            archive = (item or {}).get("Archive") or {}
+            if not archive:
+                continue
+            archives.append(
+                {
+                    "aid": archive.get("aid"),
+                    "bvid": archive.get("bvid"),
+                    "title": archive.get("title"),
+                    "tid": archive.get("tid"),
+                    "state": archive.get("state"),
+                    "state_desc": archive.get("state_desc"),
+                    "ptime": archive.get("ptime"),
+                    "duration": archive.get("duration"),
+                    "reject_reason": archive.get("reject_reason") or "",
+                }
+            )
+        _output(
+            {
+                "mode": "browser",
+                "counts": payload.get("class") or {},
+                "page": payload.get("page") or {},
+                "archives": archives,
+            }
+        )
+    finally:
+        browser.close()
+
+
+def cmd_list_archives(args: argparse.Namespace) -> None:
+    _run_with_fallback(args, _api_list_archives, _browser_list_archives)
+
+
 # ─── 投稿相关 ────────────────────────────────────────────────────────────────
 
 
@@ -373,7 +504,33 @@ def cmd_fill_publish_video(args: argparse.Namespace) -> None:
         browser.close()
 
 
-def cmd_publish_video(args: argparse.Namespace) -> None:
+def _api_publish_video(args: argparse.Namespace) -> None:
+    """协议路径的一步投稿：校验 → 上传 → 封面 → 提交。"""
+    title = _read_text_file(args.title_file, "标题")
+    description = _read_text_file(args.desc_file, "简介")
+
+    def _progress(index: int, chunks: int, uploaded: int, total: int) -> None:
+        # 大文件要传十几分钟，静默会让人以为卡死 —— 走 stderr，不污染 JSON 输出
+        logger.info("上传分块 %d/%d（%d/%d 字节）", index + 1, chunks, uploaded, total)
+
+    result = _make_api(args).publish_video(
+        video_path=args.video,
+        title=title,
+        category=args.category or "",
+        human_type=getattr(args, "human_type", "") or "",
+        tags=args.tags or [],
+        description=description,
+        cover_path=args.cover,
+        declaration=getattr(args, "declaration", "") or "",
+        schedule_at=args.schedule_at,
+        source=getattr(args, "source", "") or "",
+        dry_run=getattr(args, "dry_run", False),
+        progress=_progress,
+    )
+    _output({"mode": "api", **result})
+
+
+def _browser_publish_video(args: argparse.Namespace) -> None:
     from bilibili.publish_video import publish_video_content
 
     content = _build_video_content(args)
@@ -381,9 +538,13 @@ def cmd_publish_video(args: argparse.Namespace) -> None:
     try:
         result = publish_video_content(page, content)
         result.update({"title": content.title, "video": content.video_path})
-        _output(result)
+        _output({"mode": "browser", **result})
     finally:
         browser.close()
+
+
+def cmd_publish_video(args: argparse.Namespace) -> None:
+    _run_with_fallback(args, _api_publish_video, _browser_publish_video)
 
 
 def cmd_click_publish(args: argparse.Namespace) -> None:
@@ -440,7 +601,13 @@ def _add_publish_args(sub: argparse.ArgumentParser, *, video_required: bool = Tr
         "--category",
         help='分区，格式 "一级,二级"（如 "生活,日常"），分隔符可用 , 、 > /',
     )
-    sub.add_argument("--cover", help="封面图片绝对路径（可选；不传则用 B站 自动抽帧封面）")
+    sub.add_argument(
+        "--cover",
+        help=(
+            "封面图片绝对路径（协议层必填：B站 提交前会拦「请先上传封面」；"
+            "只走 --browser 路径时可省略，改用页面自动抽帧）"
+        ),
+    )
     sub.add_argument("--schedule-at", help="定时发布时间，ISO8601 如 2026-03-10T12:00")
     sub.add_argument(
         "--replace-tags",
@@ -459,7 +626,18 @@ def _add_publish_args(sub: argparse.ArgumentParser, *, video_required: bool = Tr
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bilibili-cli",
-        description="B站创作中心自动化 CLI（Extension Bridge 版）",
+        description="B站创作中心自动化 CLI（默认走纯 HTTP 协议层，--browser 兜底走浏览器）",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="强制走浏览器扩展路径（bridge + 页面 DOM），用于协议层签不出来或要复现页面行为时",
+    )
+    parser.add_argument(
+        "--cookie-source",
+        default="chrome",
+        choices=["chrome", "edge", "brave"],
+        help="从哪个浏览器只读读取 B站 Cookie（默认 chrome）",
     )
     parser.add_argument(
         "--bridge-url",
@@ -469,8 +647,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    sub = subparsers.add_parser("check-login", help="检查登录状态")
+    sub = subparsers.add_parser("check-login", help="检查登录状态（默认协议层，无需浏览器）")
     sub.set_defaults(func=cmd_check_login)
+
+    sub = subparsers.add_parser("list-archives", help="列出稿件（默认协议层，无需浏览器）")
+    sub.add_argument("--page", type=int, default=1, help="页码，从 1 开始（默认 1）")
+    sub.add_argument("--page-size", type=int, default=10, help="每页条数（默认 10）")
+    sub.set_defaults(func=cmd_list_archives)
 
     sub = subparsers.add_parser("login", help="扫码登录（阻塞等待）")
     sub.add_argument("--timeout", type=float, default=180.0)
@@ -500,12 +683,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.set_defaults(func=cmd_fill_publish_video)
 
-    sub = subparsers.add_parser("publish-video", help="视频一步投稿")
+    sub = subparsers.add_parser("publish-video", help="视频一步投稿（默认协议层，无需浏览器）")
     _add_publish_args(sub)
     sub.add_argument(
         "--force",
         action="store_true",
-        help="跳过「页面上有弹窗」的保护检查（确认没有遮挡时才用）",
+        help="（仅 --browser 路径）跳过「页面上有弹窗」的保护检查（确认没有遮挡时才用）",
+    )
+    sub.add_argument(
+        "--human-type",
+        default="",
+        help=(
+            '「类型」（human_type2），例如 "生活兴趣"。B站 现在的投稿表单在分区之外'
+            "还要求选类型；不传时按二级分区名 / 一级分区名推断，推断不出来会列全部可选值"
+        ),
+    )
+    sub.add_argument(
+        "--source",
+        default="",
+        help="转载来源。创作声明选「内容为转载」时必填（--declaration 转载）",
+    )
+    sub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="（仅协议层）做完分区解析、视频上传、封面上传，但不提交稿件，打印将提交的 payload",
     )
     sub.set_defaults(func=cmd_publish_video)
 
@@ -548,11 +749,44 @@ def main() -> None:
     except Exception as e:
         from bilibili.errors import NotLoggedInError
 
-        if isinstance(e, NotLoggedInError):
+        # 协议层的「未登录」有两种表现：底座的 AuthRequired，或服务端的登录失效码。
+        # 两者对用户是同一件事，退出码都应该是 1，不能让调用方以为这是脚本错误。
+        unauth: tuple[type[BaseException], ...] = (NotLoggedInError,)
+        try:
+            from bilibili.api import AuthRequired
+
+            unauth = (NotLoggedInError, AuthRequired)
+        except Exception:  # pragma: no cover - 底座缺失时仍能报错退出
+            pass
+
+        if isinstance(e, unauth):
             logger.error("未登录: %s", e)
             _output({"success": False, "error": str(e), "logged_in": False}, exit_code=1)
         logger.error("执行失败: %s", e, exc_info=True)
-        _output({"success": False, "error": str(e)}, exit_code=2)
+        hint = _failure_hint(e)
+        payload: dict = {"success": False, "error": str(e)}
+        if hint:
+            payload["hint"] = hint
+        _output(payload, exit_code=2)
+
+
+def _failure_hint(exc: BaseException) -> str:
+    """给最常见的几类失败补一句「下一步该做什么」，避免只甩一句报错。"""
+    name = type(exc).__name__
+    if name == "CookieError":
+        return (
+            "读不到浏览器的 B站 Cookie。请确认：1) Chrome/Edge/Brave 中已登录 B站；"
+            "2) macOS 首次读取 Cookie 需要钥匙串授权；3) 也可用 --browser 走扩展路径。"
+        )
+    if name == "HttpError":
+        return "网络请求失败，请检查网络/代理；B站 接口偶发 5xx，可稍后重试。"
+    if name == "ApiError":
+        return (
+            "B站 接口拒绝了这次请求。若提示分区/类型/声明不合法，可用 "
+            "`python scripts/cli.py publish-video --help` 看参数，"
+            "或改用 --browser 走页面提交。"
+        )
+    return ""
 
 
 if __name__ == "__main__":

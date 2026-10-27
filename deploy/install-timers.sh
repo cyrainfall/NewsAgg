@@ -27,6 +27,32 @@ fi
 
 mkdir -p "${LOG_DIR}"
 
+# 模型凭证：把 DSH 凭证库里的 key 导出成一个 0600 的 EnvironmentFile。
+# 为什么不在 unit 里写 Environment=DEEPSEEK_API_KEY=...：unit 文件在
+# /etc/systemd/system 下是全局可读的，而那是账号凭证。
+# 为什么不能让 dsh headless 自己读：headless 跑非交互任务时不读 DSH 的
+# 凭证库（实测报 MISSING_CREDENTIAL: llm-deepseek），所以必须显式导出。
+CRED_FILE="/etc/newsagg/dsh-credentials.env"
+if [[ ! -f "${CRED_FILE}" ]]; then
+  mkdir -p /etc/newsagg
+  if [[ -f /root/.dsh/.credentials.yaml ]]; then
+    python3 - > "${CRED_FILE}" <<'PY'
+import re, sys
+text = open("/root/.dsh/.credentials.yaml", encoding="utf-8").read()
+m = re.search(r"DEEPSEEK_API_KEY:\s*(\S+)", text)
+if not m:
+    sys.exit("凭证库里找不到 DEEPSEEK_API_KEY")
+print(f"DEEPSEEK_API_KEY={m.group(1)}")
+PY
+    chmod 600 "${CRED_FILE}"
+    echo "已生成 ${CRED_FILE}（0600）"
+  else
+    echo "[!] 找不到 /root/.dsh/.credentials.yaml，无法自动导出模型凭证" >&2
+    echo "    请手动创建 ${CRED_FILE}，内容一行：DEEPSEEK_API_KEY=<你的 key>" >&2
+    exit 1
+  fi
+fi
+
 for u in "${UNITS[@]}"; do
   install -m 0644 "${DEPLOY}/${u}" "${UNIT_DIR}/${u}" || exit 1
 done

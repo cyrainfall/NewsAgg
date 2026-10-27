@@ -27,6 +27,25 @@ export PATH="/usr/local/node/bin:${PATH}"
 export HOME="${HOME:-/root}"
 export TZ="Asia/Shanghai"
 
+# 模型凭证：服务器上的 dsh headless 报 MISSING_CREDENTIAL: llm-deepseek，
+# 因为那把 key 存在 DSH 自己的凭证库里（/root/.dsh/.credentials.yaml 的
+# refs.DEEPSEEK_API_KEY），而 headless 跑非交互任务时不读它。
+# 这里把它导出到环境变量——**只导出，不打印**。
+#
+# 为什么不把 key 直接写进 unit 的 Environment=：unit 文件在 /etc/systemd/system
+# 下，全世界可读，而 key 是账号凭证。写成 0600 的文件 + 一个只读它的
+# EnvironmentFile，systemd 不会打印它的内容。
+CRED_FILE="/etc/newsagg/dsh-credentials.env"
+if [[ -z "${DEEPSEEK_API_KEY:-}" && -f "${CRED_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CRED_FILE}"
+fi
+if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+  echo "[!] 找不到 DEEPSEEK_API_KEY（既没设环境变量，也没有 ${CRED_FILE}）" >&2
+  echo "    服务器上的 dsh headless 需要它才能跑模型调用（ADR-0077）。" >&2
+  exit 1
+fi
+
 # 仓库内的 DSH 技能目录要能被识别：以仓库为 cwd（DSH 技能目录约定见
 # packages/skill/skill-filesystem/src/index.ts:244-264）
 cd "${REPO}" || exit 1

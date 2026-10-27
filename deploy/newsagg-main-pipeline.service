@@ -10,6 +10,9 @@ WorkingDirectory=/opt/newsagg/repo
 Environment=TZ=Asia/Shanghai
 Environment=PATH=/usr/local/node/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=HOME=/root
+# 模型凭证：headless 不读 DSH 凭证库，必须显式给（ADR-0077）。
+# 这个文件是 0600，内容不打印。
+EnvironmentFile=-/etc/newsagg/dsh-credentials.env
 ExecStart=/opt/newsagg/repo/deploy/run-prompt.sh /opt/newsagg/repo/deploy/prompt-main-pipeline.md
 # 主流程要跑模型（分拣判断 + 写作），比采集慢得多，给足时间
 TimeoutStartSec=7200

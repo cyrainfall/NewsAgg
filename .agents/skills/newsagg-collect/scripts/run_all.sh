@@ -782,7 +782,7 @@ except Exception:
 PY
 )"
   if [[ -n "$PHOTO_QUERY" ]]; then
-    PHOTO_JSON="$(mktemp -t newsagg-photo)"
+    PHOTO_JSON="$(mktemp -t newsagg-photo.XXXXXX)"
     set +e
     "$COVER_PY" .agents/skills/newsagg-publish/scripts/fetch_photo.py \
       --query "$PHOTO_QUERY" > "$PHOTO_JSON" 2>/dev/null
@@ -811,7 +811,7 @@ fi
 # ⚠️ 必须写 ${A[@]+"${A[@]}"}：bash 3.2（macOS 自带）在 set -u 下展开**空数组**
 # 会报 "A[@]: unbound variable" 并终止脚本。没有 spec 时（最常见的情形）
 # 这一步会直接失败——一个只在"没写封面 spec"时才触发的静默故障。
-COVER_JSON="$(mktemp -t newsagg-cover)"
+COVER_JSON="$(mktemp -t newsagg-cover.XXXXXX)"
 set +e
 "$COVER_PY" .agents/skills/newsagg-publish/scripts/make_cover.py --slug "$SLUG" \
   ${COVER_SPEC_ARG[@]+"${COVER_SPEC_ARG[@]}"} \

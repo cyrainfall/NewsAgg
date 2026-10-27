@@ -683,9 +683,17 @@ def main() -> int:
     # 默认 api：登录预检与反查都走纯 HTTP，不需要浏览器，反查快一个数量级
     # （实测 node 25.8s → api 0.93s）。写路径（发布/存草稿）仍然默认 browser，
     # 见 _api_write 的两道闸与 SKILL.md 的「api 后端尚未验证的部分」。
-    ap.add_argument("--backend", choices=list(BACKENDS), default="api",
+    # 默认后端可用环境变量覆盖（2026-10-28，Windows 本机）：
+    # api 后端经 `Client.from_browser()` 读本机 Chrome 的 cookie，而本机 Chrome
+    # 被占用时读不到、且 Playwright 持久化 profile 在这台机器上不落盘，
+    # 于是登录预检必然 login_lost。browser 后端可以用 NEWSAGG_COOKIE_FILE
+    # 注入的那份 cookie（reference/toutiao-ops/cli/src/browser.js 的补丁）。
+    # 服务器不设这个变量，行为与原来一致。
+    ap.add_argument("--backend", choices=list(BACKENDS),
+                    default=os.environ.get("NEWSAGG_PUBLISH_BACKEND", "api"),
                     help="api：登录预检+反查走纯 HTTP，写操作需 --allow-unverified-write；"
-                         "browser：全部走 vendored toutiao-ops（Playwright）。默认 api")
+                         "browser：全部走 vendored toutiao-ops（Playwright）。"
+                         "默认 api，可用 NEWSAGG_PUBLISH_BACKEND 覆盖")
     ap.add_argument("--allow-unverified-write", action="store_true",
                     help="允许 api 后端执行写操作（发布/存草稿/上传封面）。"
                          "⚠ 写路径的字段名与平台签名闸都未对齐（ADR-0073），"

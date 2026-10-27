@@ -102,6 +102,14 @@ mkdir -p .newsagg/covers .newsagg/briefs
 export WEWRITE_HOME="$REPO/.wewrite"
 export PATH="$REPO/.uv-bin:$PATH"
 
+# ── 子进程 stdout 的编码（Windows）──────────────────────────────────
+# Python 的 stdout 在被**重定向到文件**时用 locale 编码，Windows 上是 cp936。
+# 于是 `performance.py > perf.json` 写出来的是 GBK，调用方再按 UTF-8
+# `json.load` 就抛 UnicodeDecodeError —— 表现为「输出无法解析，跳过」，
+# 而数据其实是好的（2026-10-28 本机实测，与 ADR-0076 同族：平台假设）。
+# 钉成 UTF-8；POSIX 上这个变量本就等于默认值，无副作用。
+export PYTHONIOENCODING=utf-8
+
 # ── python 解释器（ADR-0076）────────────────────────────────────────
 # **全部** NewsAgg 脚本都要求 Python ≥ 3.9（用了 `from __future__ import
 # annotations` 与 `list[dict]` 这类 3.9+ 语法；wewrite 本身要求 ≥ 3.11）。
@@ -533,13 +541,32 @@ ADR-0018：人的改动优先，系统不得替人决定提交什么。"
 # ── ② 风格学习（ADR-0026：必须早于写作）──────────────────────────
 style_learn() {
   log "② 风格学习（若你改过教学副本）"
-  "$PY" .agents/skills/newsagg-triage/scripts/style_learn.py > /tmp/newsagg-style.json 2>&1 || true
-  "$PY" - <<'PY'
-import json
+  # ⚠️ 输出文件**不能**写死 /tmp：那是 POSIX 路径，而这段 Python 里的字符串
+  # 不经过 MSYS 路径转换——Windows 上的 Python 会把它解析成 `C:\tmp\...`，
+  # 与 bash 的 /tmp 不是同一个目录，于是「文件读不到 → 静默跳过」。
+  # 2026-10-28 在本机实测：表现数据明明读回成功（reports/performance.jsonl
+  # 有新增），这里却报「无法解析」。改用仓内临时目录，并把路径**作为参数**
+  # 传给 Python（argv 会被 MSYS 正确转换）。
+  local out="$REPO/.newsagg/tmp/style.json"
+  local err="$REPO/.newsagg/tmp/style.err"
+  mkdir -p "$REPO/.newsagg/tmp"
+  # stderr **单独落盘**：Windows 下 stderr 是 GBK，混进 JSON 会让 json.load 以
+  # UnicodeDecodeError 失败，表现成「无法解析」——失败原因却看不见（ADR-0052）。
+  "$PY" .agents/skills/newsagg-triage/scripts/style_learn.py > "$out" 2>"$err" || true
+  "$PY" - "$out" "$err" <<'PY'
+import json, sys
 try:
-    d = json.load(open("/tmp/newsagg-style.json", encoding="utf-8"))
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
-    print("（风格学习输出无法解析，跳过）"); raise SystemExit(0)
+    print("（风格学习输出无法解析，跳过）")
+    try:
+        tail = [l for l in open(sys.argv[2], encoding="utf-8",
+                               errors="replace").read().splitlines() if l.strip()]
+        if tail:
+            print(f"  错误末行：{tail[-1][:300]}")
+    except Exception:
+        pass
+    raise SystemExit(0)
 ch = d.get("changed", 0)
 print(f"检查 {d.get('checked',0)} 篇成稿，需学习 {ch} 篇")
 for r in d.get("results", []):
@@ -561,23 +588,32 @@ PY
 PERF_BACKEND="${NEWSAGG_PERF_BACKEND:-api}"
 performance() {
   log "②b 表现数据（循环 C：读回 + 自身基准 + 降频判定，后端 ${PERF_BACKEND}）"
+  # 同 ② 的理由：不写死 /tmp，路径作为参数传给 Python（MSYS 会转换 argv）。
+  local out="$REPO/.newsagg/tmp/perf.json"
+  local err="$REPO/.newsagg/tmp/perf.err"
+  mkdir -p "$REPO/.newsagg/tmp"
   "$PY" .agents/skills/newsagg-performance/scripts/performance.py \
-    --backend "${PERF_BACKEND}" > /tmp/newsagg-perf.json 2>&1 || true
-  "$PY" - <<'PY'
-import json
+    --backend "${PERF_BACKEND}" > "$out" 2>"$err" || true
+  "$PY" - "$out" "$err" <<'PY'
+import json, sys
 try:
-    d = json.load(open("/tmp/newsagg-perf.json", encoding="utf-8"))
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
-    # ADR-0052：这里原来只打印「无法解析」，把 traceback 留在 /tmp 里没人看，
+    # ADR-0052：这里原来只打印「无法解析」，把 traceback 留在临时文件里没人看，
     # 于是「node 不在 PATH」被当成「数据读不到」静默丢了整整两天。
     # 现在把最后一行原样带出来——失败必须自带它的原因。
+    # 先看 stderr（真正的失败原因在这里），再看 stdout 末行。
     tail = ""
-    try:
-        lines = [l for l in open("/tmp/newsagg-perf.json", encoding="utf-8",
-                                 errors="replace").read().splitlines() if l.strip()]
-        tail = lines[-1][:300] if lines else "(空输出)"
-    except Exception as e:
-        tail = f"(读不到输出文件：{e})"
+    for p in (sys.argv[2], sys.argv[1]):
+        try:
+            lines = [l for l in open(p, encoding="utf-8",
+                                     errors="replace").read().splitlines() if l.strip()]
+        except Exception:
+            continue
+        if lines:
+            tail = lines[-1][:300]
+            break
+    tail = tail or "(空输出)"
     print("（表现数据输出无法解析——本次读回失败，不影响本轮运行）")
     print(f"  输出末行：{tail}")
     raise SystemExit(0)
@@ -603,7 +639,7 @@ PY
 skip_day_gate() {
   local skip
   skip="$("$PY" .agents/skills/newsagg-performance/scripts/performance.py --check-skip 2>/dev/null \
-    | python3 -c 'import json,sys
+    | "$PY" -c 'import json,sys
 try: print("1" if json.load(sys.stdin).get("skip") else "0")
 except Exception: print("0")' 2>/dev/null || echo 0)"
   if [[ "$skip" == "1" ]]; then

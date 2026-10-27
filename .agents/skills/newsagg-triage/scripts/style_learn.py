@@ -39,7 +39,14 @@ from publish_ledger import read_merged, read_records as _read_records  # noqa: E
 
 
 def git(*args: str, cwd: Path, check: bool = True) -> str:
-    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    # encoding 必须显式给：text=True 走的是**系统默认编码**，Windows 上是 GBK，
+    # 而 git 输出的是 UTF-8（成稿里有中文）→ reader 线程
+    # `UnicodeDecodeError: 'gbk' codec can't decode byte 0x80`，
+    # stdout 读不出来，`cat-file` 于是返回 None → 上层 `sha256_text(None)`
+    # 崩成 AttributeError，最终表现为「风格学习输出无法解析，跳过」。
+    # 2026-10-28 本机实测。
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} 失败：{proc.stderr.strip()[:200]}")
     return proc.stdout
@@ -200,7 +207,8 @@ def main() -> int:
 
         proc = subprocess.run(
             ["wewrite", "learn-edits", "--draft", str(draft_p), "--final", str(path)],
-            capture_output=True, text=True, env=env, cwd=root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, cwd=root,
         )
         ok = proc.returncode == 0
 

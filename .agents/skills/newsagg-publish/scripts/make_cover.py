@@ -246,6 +246,13 @@ CJK_FONT_CANDIDATES = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    # Windows：少了这几条，本机一个候选都命不中 → load_default()（无中文字形）
+    # → 中文全渲染成方块，而自检用同一支坏字体测量，于是 problems 为 []。
+    # 2026-10-28 本机实测：封面只有 39 个小方块却能「通过」。
+    "C:/Windows/Fonts/msyhbd.ttc",   # 微软雅黑 Bold
+    "C:/Windows/Fonts/msyh.ttc",     # 微软雅黑 Regular
+    "C:/Windows/Fonts/simhei.ttf",   # 黑体
+    "C:/Windows/Fonts/simsun.ttc",   # 宋体
 ]
 
 _FONT_PATH: str | None = None
@@ -1107,6 +1114,18 @@ def make_cover(
                 f"（建议 ≥{READABLE_PX:.0f}px）：{main_el['text'][:20]!r} ——"
                 f"想让它更大只能把这句话改短（ADR-0049）"
             )
+
+    # ── 自检：有没有真的拿到一支带中文字形的字体 ────────────────────
+    #
+    # 这条必须存在，否则「字体全没命中」这件事对调用方完全不可见：
+    # 退回 PIL 默认字体后一切测量照常进行（默认字体没有中文字形，宽度按
+    # 缺字框算），`problems` 依然是 []，图里却只有一串方块。
+    # 判据同上一条：无人值守时没人看得见，所以失败必须自己说出来。
+    if _font_path() is None:
+        warnings.append(
+            "未找到任何中文字体（CJK_FONT_CANDIDATES 全部不存在），已退回 PIL "
+            "默认字体——中文会渲染成方块，请在本机安装中文字体或补一条候选路径"
+        )
 
     # ── 自检三：封面是否只是在复述标题 ──────────────────────────────
     #

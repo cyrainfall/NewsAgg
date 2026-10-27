@@ -43,7 +43,6 @@ VAR = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 # 的 shell」，不是「所有 .sh 文件」（有些是文档片段，故意用 $var 的写法）。
 SHELL_SCRIPTS = [
     ".agents/skills/newsagg-collect/scripts/run_all.sh",
-    "scripts/bootstrap-server.sh",
     "scripts/bootstrap-wewrite.sh",
 ]
 

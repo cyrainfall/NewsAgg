@@ -16,7 +16,8 @@
  *   node scripts/import-pw-cookies.mjs --from ... --account default
  *
  * 前提：目标机器上已经装好 toutiao-ops 的 node_modules 与 Playwright
- * 浏览器（scripts/bootstrap-server.sh 负责这件事）。
+ * 浏览器（在 reference/toutiao-ops/cli 下 `npm install`，
+ * `npx playwright install chromium`）。
  *
  * 安全：不打印 cookie 值。
  */

@@ -246,6 +246,15 @@
 
 **阶段 1：切换（人工，一次）**
 
+> **⚠️ 2026-10-28 决定：服务器退出生产角色（ADR-0079）。** 以下「阶段 1 / 阶段 2」
+> 中与服务器部署相关的条目（第 9、10 条的部署与验证）**不再执行**：服务器上的
+> timer、`/opt/newsagg`、`/etc/newsagg` 已全部删除，仓库侧对应删除 `deploy/` 下
+> 的 systemd 单元、`install-timers.sh`、`run-prompt.sh`、4 份 prompt 与
+> `scripts/bootstrap-server.sh`。调度回到本机 IDE 定时任务（08/13/18 采集 +
+> 21:00 主流程含真发），`deploy/` 只剩 `channel-policy.txt`（运行时契约）。
+> 第 8 条「停本地自动发布」随之**反转**为本机就是发布者，服务器那份已停用并删除。
+> 读这两段时请把它们当成历史，不要照着做。
+
 8. **停本地自动发布** ← **不可自动化，漏做会导致重复发文**（平台明令禁止）。**这是阶段 1 剩下的唯一人工项。**
 9. 服务器部署：~~mihomo 内核 + Xvfb + 按需 Chrome~~ ✅ **已完成**（2026-10-27，见上面「阶段 0 第 7f 条」）——`scripts/bootstrap-server.sh` 一条命令可复现；git 推送凭证 ✅ 已解决（deploy key）；浏览器登录态 ✅ 已解决（ADR-0075 拷 cookie，不必扫码）；**代理 ✅ 已定**（不装 mihomo，Jina 按 ADR-0078 降级并在简报说明）；**定时调度 ✅ 已落地**（ADR-0077，systemd timer + `dsh headless`，`deploy/install-timers.sh` 安装）。
 

@@ -47,13 +47,19 @@ sh = _load()
 
 
 class PolicyFileTest(unittest.TestCase):
-    def test_shipped_policy_disables_jina_with_a_reason(self):
-        """仓里那份策略：Jina 必须被关掉，且必须写了理由。"""
+    def test_shipped_policy_declares_no_disabled_channel(self):
+        """仓里那份策略：当前部署（本机）没有关掉任何渠道（ADR-0079）。
+
+        这条断言的方向是被有意反转的。ADR-0078 时它断言「web 必须被关掉」——
+        因为当时唯一的生产环境是没装代理的服务器。服务器退出生产角色后
+        （2026-10-28），本机有代理、Jina 可用，若还留着那条 disabled，
+        简报会天天报一个并不存在的降级。
+        """
         policy = sh.read_policy(REPO)
-        self.assertIn("web", policy, "仓里的渠道策略应包含 web（Jina Reader）")
-        self.assertEqual("disabled", policy["web"]["status"])
-        self.assertTrue(policy["web"]["reason"].strip(),
-                        "关掉一个渠道必须写理由，否则没人知道将来要不要恢复")
+        disabled = {name: entry for name, entry in policy.items()
+                    if entry.get("status") == "disabled"}
+        self.assertEqual({}, disabled,
+                         "当前部署没有禁用渠道；若真要禁用，必须写实测理由（ADR-0078）")
 
     def test_missing_policy_file_is_not_an_error(self):
         """本机没有 deploy/channel-policy.txt 是正常的（文件在仓库里，

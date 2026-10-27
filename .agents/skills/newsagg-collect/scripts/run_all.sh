@@ -142,8 +142,8 @@ find_python() {
 if ! PY="$(find_python)"; then
   echo "[X] 找不到 Python ≥ 3.9" >&2
   echo "    系统 PATH 里的 python3 是：$("$(command -v python3 2>/dev/null || echo '（无）')" -V 2>&1)" >&2
-  echo "    修法（服务器）：dnf install -y python3.11 && ln -sf /usr/bin/python3.11 /usr/local/bin/python3" >&2
-  echo "    或：bash scripts/bootstrap-server.sh" >&2
+  echo "    修法：装一个 ≥ 3.9 的解释器，或先跑 bash scripts/bootstrap-wewrite.sh" >&2
+  echo "    （它会在 .uv-tools/wewrite 建 3.12 venv，本脚本优先用那个）" >&2
   exit 1
 fi
 echo "python：${PY}（$("$PY" -V 2>&1)）"

@@ -27,9 +27,11 @@ import { createRequire } from 'module';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
 import { writeFileSync, mkdirSync, chmodSync } from 'fs';
-import { pathToFileURL } from 'url';
+import { pathToFileURL, fileURLToPath } from 'url';
 
-const REPO = resolve(new URL('..', import.meta.url).pathname);
+// fileURLToPath 而不是 .pathname：Windows 上后者给出 "/C:/Users/..."，
+// 再 resolve 一次会变成 "C:\C:\Users\..."（实测 MODULE_NOT_FOUND）。
+const REPO = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const CLI_DIR = join(REPO, 'reference', 'toutiao-ops', 'cli');
 
 // playwright 装在 CLI 的 node_modules 里，脚本本身在 scripts/ 下，

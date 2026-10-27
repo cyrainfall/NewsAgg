@@ -2,7 +2,7 @@ import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { homedir } from 'os';
 import { join } from 'path';
-import { mkdirSync } from 'fs';
+import { mkdirSync, readFileSync } from 'fs';
 
 chromium.use(StealthPlugin());
 
@@ -78,6 +78,31 @@ export async function launchBrowser(opts = {}) {
   try {
     await context.grantPermissions([], { origin: 'https://mp.toutiao.com' });
   } catch {}
+
+  // ✅ 本机补丁（reference/ 不入库，只影响这台 Windows 机器）：
+  // 实测本机 Playwright 持久化上下文**不落盘**（写入 __persist_probe 后重开即丢失），
+  // 所以登录态改以 cookie 文件为准：存在就注入，随后 auth check / 发布都能用。
+  // 服务器上不设 NEWSAGG_COOKIE_FILE 时行为不变。
+  // 用独立开关 NEWSAGG_COOKIE_INJECT=1，而不是复用 NEWSAGG_COOKIE_FILE：
+  // 后者在服务器上也被 run_all.sh 设置，复用它等于顺手改掉服务器已验证的行为。
+  const cookieFile = process.env.NEWSAGG_COOKIE_INJECT ? process.env.NEWSAGG_COOKIE_FILE : '';
+  if (cookieFile) {
+    try {
+      const raw = JSON.parse(readFileSync(cookieFile, 'utf8'));
+      const list = (raw.cookies || []).map((c) => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path || '/',
+        secure: Boolean(c.secure),
+        httpOnly: Boolean(c.http_only ?? c.httpOnly),
+        expires: c.expires && c.expires > 0 ? c.expires : -1,
+      }));
+      if (list.length) await context.addCookies(list);
+    } catch (e) {
+      console.warn(`[browser] 注入 cookie 失败（${cookieFile}）：${e.message}`);
+    }
+  }
 
   const page = context.pages()[0] || await context.newPage();
   return { context, page };

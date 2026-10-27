@@ -146,14 +146,14 @@ if ! PY="$(find_python)"; then
   echo "    或：bash scripts/bootstrap-server.sh" >&2
   exit 1
 fi
-echo "python：$PY（$("$PY" -V 2>&1)）"
+echo "python：${PY}（$("$PY" -V 2>&1)）"
 
 # ── 封面用解释器（ADR-0039）──────────────────────────────────────────
 # make_cover.py 依赖 Pillow，而 Pillow 只装在 wewrite 的 venv 里；用系统
 # python 跑它会以「未安装 Pillow」失败，且这个失败发生在第 3 段——那时
 # 稿子已经写好、简报还没出，等于每天白跑一次。定时任务不经过交互式 shell，
 # 没有"记得换个 python"的机会，所以这里把解释器钉死。
-# 退化路径：venv 不存在时回落到 $PY，让错误在封面这一步显式暴露，
+# 退化路径：venv 不存在时回落到 ${PY}，让错误在封面这一步显式暴露，
 # 而不是静默跳过封面（无封面会被发布门 1 拦下）。
 if [[ -x "$REPO/.uv-tools/wewrite/bin/python" ]]; then
   COVER_PY="$REPO/.uv-tools/wewrite/bin/python"
@@ -208,7 +208,7 @@ if [[ -n "${NEWSAGG_COOKIE_FILE:-}" ]]; then
   if [[ -r "$NEWSAGG_COOKIE_FILE" ]]; then
     echo "cookie：$NEWSAGG_COOKIE_FILE"
   else
-    echo "警告：NEWSAGG_COOKIE_FILE 指向 $NEWSAGG_COOKIE_FILE，但读不到——表现读回会失败" >&2
+    echo "警告：NEWSAGG_COOKIE_FILE 指向 ${NEWSAGG_COOKIE_FILE}，但读不到——表现读回会失败" >&2
   fi
 fi
 
@@ -725,7 +725,7 @@ if [[ -n "$AFTER_TRIAGE" && -z "$AFTER_WRITE" ]]; then
   if [[ $RC -eq 3 ]]; then
     echo "→ 写作模型未配置（退出码 3），按设计降级：由 agent 自写"
   elif [[ $RC -ne 0 ]]; then
-    fail_soft "write" "写作失败（退出码 $RC）" "" 1
+    fail_soft "write" "写作失败（退出码 ${RC}）" "" 1
   else
     echo "→ 初稿已生成 outputs/${DATE}-draft.md（审稿后另存为 outputs/<slug>.md）"
   fi

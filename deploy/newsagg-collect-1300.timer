@@ -1,0 +1,11 @@
+[Unit]
+Description=NewsAgg 定时采集（1300:00，Asia/Shanghai）
+
+[Timer]
+OnCalendar=*-*-* 1300:00:00
+Persistent=true
+AccuracySec=1min
+Unit=newsagg-collect-1300.service
+
+[Install]
+WantedBy=timers.target

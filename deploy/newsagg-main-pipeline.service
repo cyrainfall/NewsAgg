@@ -1,0 +1,15 @@
+[Unit]
+Description=NewsAgg 每日主流程（21:00：采集→分拣→写作→发布→写回→简报）
+Documentation=file:///opt/newsagg/repo/docs/adr/0077-server-becomes-primary-environment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/newsagg/repo
+Environment=TZ=Asia/Shanghai
+Environment=PATH=/usr/local/node/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=HOME=/root
+ExecStart=/opt/newsagg/repo/deploy/run-prompt.sh /opt/newsagg/repo/deploy/prompt-main-pipeline.md
+# 主流程要跑模型（分拣判断 + 写作），比采集慢得多，给足时间
+TimeoutStartSec=7200

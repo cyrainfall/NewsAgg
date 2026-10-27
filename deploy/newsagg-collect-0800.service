@@ -1,0 +1,14 @@
+[Unit]
+Description=NewsAgg 定时采集（08:00）
+Documentation=file:///opt/newsagg/repo/docs/adr/0077-server-becomes-primary-environment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/newsagg/repo
+Environment=TZ=Asia/Shanghai
+Environment=PATH=/usr/local/node/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=HOME=/root
+ExecStart=/opt/newsagg/repo/deploy/run-prompt.sh /opt/newsagg/repo/deploy/prompt-collect-0800.md
+TimeoutStartSec=1800

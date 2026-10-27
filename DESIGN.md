@@ -195,8 +195,10 @@
 77. **服务器上的登录态没有任何东西记录它是什么时候注入的（ADR-0075）。** ADR-0072 给纯 HTTP 那份做了过期提醒（表现层每次读数据检查、简报第⑤段在不足 7 天时打印命令），但**浏览器那份没有**——`import-pw-cookies.mjs` 注入完就结束，服务器上没有任何文件记录「这份 profile 的 cookie 是什么时候来的」。后果是：Playwright 那份 cookie 过期后，发布路径会突然开始失败（表现为 `auth check` 报未登录），而系统不会像对纯 HTTP 那份那样提前说一声。**今天没做**，因为服务器上的发布链路还没启用（阶段 2 第 11 步）。
 
  78. **「脚本假定环境是本机的」是一类缺陷，本轮一次撞出四个（ADR-0076）。** 第一次在服务器上跑，四个失败全在这一类：系统 `python3` 是 3.6.8（全部脚本 `from __future__ import annotations` 崩）、仓库没有 git 身份（收尾 commit 失败）、上一次失败的 `git add -A` 留下半暂存索引（之后每轮 pull 都失败）、cookie 文件在服务器上但编排器没告诉 performance.py 去哪找（表现读回静默回落旧值）。这四个在本机**都测不出来**（本机 python3 是 3.9、仓库有身份、cookie 找得到）。更麻烦的是它们在无人值守时的表现：**跑完了、退出码 0、但什么都没发生**——②b 读回失败后是「排序参考沿用旧值」，一句提示都没有。已修四处（`find_python` 验证版本、bootstrap 配 git 身份、pull 前单独提交 `reports/`、自动设 `NEWSAGG_COOKIE_FILE`），但**这类缺陷没有穷尽**：`npm`/`ts`/`curl`/`rpm` 都还是裸名字调用，且**定时任务环境与交互式 shell 的差异只会一次暴露一类**。
- 79. **服务器上的定时任务还没有着落（ADR-0076 勘察）。** 服务器 DSH 的 `schedule` 域**只在 web-app bundle 里**，headless/base bundle 不含 `dsh-schedule` → 服务器上用 `dsh headless` **建不了定时任务**。可行路径有两条：在服务器上用 web profile 建任务（GUI 在 `100.64.0.1:3080`），或用 systemd/cron 调 `dsh headless '<prompt>'`（已实测 `dsh headless` 可用、能跑通模型调用）。**没定。** 阶段 2 的模型部分（分拣判断 → 写作 → 封面 → dry-run 发布）依赖它。
- 80. **服务器上没有代理，Jina Reader 会带着绿色状态失效（ADR-0076 勘察）。** 实测 `r.jina.ai` 直连不通、`www.google.com` 不通、`api.exa.ai` 404 → ADR-0021 tier-0 的 `web` 渠道在服务器上是**坏的**。而信源体检只看「命令跑没跑通」，不看「这渠道今天有没有真的取到东西」→ 它会显示绿色。两条修法：装 mihomo 照搬订阅分流（ADR-0022，本机用的是 Clash Verge / `verge-mihomo`），或把 Jina 降级并在简报里说明不可用。**没定。**
+ 79. ~~**服务器上的定时任务还没有着落（ADR-0076 勘察）。**~~ **已于 2026-10-27 定案并落地（ADR-0077）**：用 **systemd timer + `dsh headless`**——DSH 的 schedule 域只在 web-app bundle 里，headless 建不了定时任务，所以调度落在服务器自己的 systemd（`deploy/install-timers.sh` 装 3 个采集 timer + 1 个主流程 timer），任务体是 `deploy/prompt-*.md` 由 `dsh headless -` 从 stdin 读。**新的责任**：`deploy/` 成了运行时配置载体（prompt、systemd 单元、渠道策略），必须跟着代码更新；`bootstrap-server.sh` 只装环境不装定时器，定时器要在 `git pull` 之后单独跑 `install-timers.sh`（让「代码更新」与「定时器更新」是同一步）。**本机 21:00 那条任务必须改成不再发布**——这一步不可自动化，留在用户的人工清单上（两边都发就是重复发文）。
+ 80. ~~**服务器上没有代理，Jina Reader 会带着绿色状态失效（ADR-0076 勘察）。**~~ **已于 2026-10-27 定案并落地（ADR-0078）**：用户选择**不装代理**（不动服务器网络），改为把 Jina **降级并在简报里说明**。做法不是改代码，而是新增部署级策略文件 `deploy/channel-policy.txt`——渠道可用性是**部署属性**不是代码属性，同一份代码在本机能用 Jina、在服务器上不能用。策略里声明关掉的渠道：① 单独列在简报第⑤段（措辞是「主动关掉了…不是故障」，与「它坏了」分开）；② **从可用率的分母里拿掉**（否则每天挂着一个已知项，第⑤段会被无视）；③ 必须写**实测过的**理由（凭感觉标上的 disabled 会在某天装了代理之后继续被当成不可用，而没人会想到去改）。**新增待办**：`bootstrap-server.sh --check` 还应加一项「渠道策略是否与本机网络相符」——今天没加。
+ 81. **「$var 紧跟全角标点」这个坑已经咬了四次（ADR-0076 延续）。** 在 `set -u` 且 `LC_ALL=C` 的 shell 里，全角字符首字节被 bash 当标识符字符吃进变量名 → `PY（: unbound variable`。ADR-0060 / ADR-0065 / ADR-0076 各犯一次，2026-10-27 08:00 的定时采集里又犯一次——**而这次正是 ADR-0076 自己刚写的代码**。四次里有三次是「刚修完同一个坑，过一会儿又犯」，一次还在同一个文件里。已加 `scripts/check-var-boundary.py` + `tests/test_shell_var_boundary.py`（把规则变成能跑的检查，并**测扫描器自己抓得到问题**）。**但只覆盖了三个已列名的脚本**——新增的 shell 脚本要手动加进 `SHELL_SCRIPTS` 列表，否则新的脚本不在检查范围内。
+ 82. **服务器上的浏览器登录态仍然没有过期提醒（ADR-0075 遗留，风险 77 的一半）。** 纯 HTTP 那份有（ADR-0072），Playwright profile 那份没有——`import-pw-cookies.mjs` 注入完就结束，服务器上没有文件记录注入时间。它过期后发布路径会突然开始失败（`auth check` 报未登录），而系统不会提前说一声。**今天没做**，因为阶段 2 第 11 步（开真发）还没开。
 
 
 
@@ -229,7 +231,14 @@
 - **服务器环境装齐且可复现**（`scripts/bootstrap-server.sh`，2026-10-27）：git 2.43.7 + python3.11 + Xvfb + Chromium 已装，wewrite venv 从 vendor 装好，DailyHotApi 在 6688 跑着，toutiao-ops 依赖 + Playwright 浏览器就位。**撞出 ADR-0028 HOME 重定向的一个真实后果**：publish.py 把 HOME 指向 `<repo>/.home`，Playwright 就去找 `<repo>/.home/.cache/ms-playwright`，而 npm 装时浏览器下到 `/root/.cache` —— 两处对不上，报 `Executable doesn't exist at .../.home/.cache/ms-playwright/...`。修法：装完把缓存复制到仓库 HOME 下。Xvfb `:99` + 无头 Playwright 实测打开 `https://www.toutiao.com/` → `title: 今日头条`；跑完 `available 910MB`（起浏览器前 891MB）→ **Chrome 用完就退**。
 - **服务器 git 推送凭证已解决**（2026-10-27）：服务器生成 ed25519 部署密钥，登记为仓库 deploy key（`newsagg-ecs-deploy`），remote 改 SSH + `core.sshCommand` 指定该密钥 → `ls-remote` 与 `push --dry-run` 均通过。→ **ADR-0074 的账本归档现在真的能跨环境同步了**。
 - **服务器的浏览器登录态不用人工扫码**（ADR-0075）：新写 `scripts/export-pw-cookies.mjs` / `scripts/import-pw-cookies.mjs`，从 toutiao-ops 的 Playwright profile 读**明文** cookie（绕过 SQLite 密文那道坎）→ 传到服务器注入 → 服务器 `auth check` → `logged_in: true`、`username: 淆雨学学`；`content list` 返回真实文章列表。**这修正了 ADR-0071 的一半说法**：「读不到 Playwright profile」指的是**那份 SQLite 的密文**，读得到的是**浏览器进程里的明文**。→ **阶段 1 剩下的唯一人工项是「停本地自动发布」。**
-- **服务器上还缺 mihomo（代理）**：实测 `r.jina.ai` 直连不通（curl 无响应）、`www.google.com` 不通、`api.exa.ai` 404（域名在但无代理）。采集层走 DailyHotApi 的国内源不依赖代理，**但 ADR-0021 的 tier-0 里有 `web`（Jina Reader）**——它在服务器上会**带着绿色状态失效**（本机有 Clash 时报 `web: ok`，直连 20s 超时，ADR-0059 残余风险 53）。**还没决定**：装 mihomo 并把订阅里的头条域名族分流照搬（ADR-0022），还是把 Jina 从 tier-0 里降级并在简报里说明它不可用。
+- **代理的决定已下（ADR-0078，2026-10-27）**：用户选择**不装 mihomo**（不动服务器网络），改为把 Jina **降级并在简报里说明**。做法是新增部署级策略文件 `deploy/channel-policy.txt`——渠道可用性是**部署属性**不是代码属性。声明关掉的渠道在简报第⑤段单独列出（措辞「主动关掉了…不是故障」，与「它坏了」分开）、且**从可用率分母里拿掉**。原先 ADR-0021 tier-0 里的 `web`（Jina Reader）在服务器这份策略里被标 disabled，并写了实测理由。
+
+7g. **服务器成为主环境：调度用 systemd，任务体用 dsh headless**（2026-10-27，ADR-0077）：
+- **为什么不能把本机那 4 条 DSH 定时任务搬过去**：DSH 的 schedule 域**只在 web-app bundle 里**，headless/base bundle 不含 `dsh-schedule` → 服务器上 `dsh headless` 建不了定时任务。要的是**不依赖 GUI 的服务器**，所以调度落在服务器自己的 systemd：3 个采集 timer（08/13/18）+ 1 个主流程 timer（21:00），`Persistent=true` 让服务器重启后补跑错过的任务。
+- **任务体仍然是 agent**：主流程里有两处必须模型做（分拣判断、写作——服务器的 wewrite writer key 没配，`llm-write` 退出码 3 → agent 自写是设计内路径），所以定时器不能只跑 `run_all.sh`，要能唤起 agent。`dsh headless -` 从 stdin 读任务文本，实测在服务器上能跑通模型调用（用它自己 `.credentials.yaml` 里那把 `DEEPSEEK_API_KEY`；直接跑会报 `MISSING_CREDENTIAL: llm-deepseek`）。
+- **prompt 是唯一副本**（`deploy/prompt-*.md` 四份），unit 只调 `deploy/run-prompt.sh` 读文件——写在 unit 里会造成第二份副本然后漂（本仓库已经因「三份解析器漂移」ADR-0042 与「四处赛道定义副本」ADR-0050 吃过两次亏）。`run-prompt.sh` 负责补 `PATH`（`/usr/local/node/bin`，ADR-0052）、`cd` 到仓库（DSH 技能目录约定）、日志落盘、退出码透传。
+- **本机 21:00 那条任务改成不再发布**（采集三条保留——纯脚本、不发布、不耗模型）。**这一步不可自动化**，留在用户的人工清单上：两边都发就是重复发文。
+- **`deploy/` 成了新的运行时配置载体**（prompt + systemd 单元 + 渠道策略），必须跟着代码更新。`bootstrap-server.sh` 只装环境不装定时器，定时器在 `git pull` 之后单独跑 `deploy/install-timers.sh`——让「代码更新」与「定时器更新」是同一步，不会脱节。
 
 
 
@@ -238,12 +247,12 @@
 **阶段 1：切换（人工，一次）**
 
 8. **停本地自动发布** ← **不可自动化，漏做会导致重复发文**（平台明令禁止）。**这是阶段 1 剩下的唯一人工项。**
-9. 服务器部署：~~mihomo 内核 + Xvfb + 按需 Chrome~~ ✅ **已完成**（2026-10-27，见上面「阶段 0 第 7f 条」）——`scripts/bootstrap-server.sh` 一条命令可复现；git 推送凭证 ✅ 已解决（deploy key）；浏览器登录态 ✅ 已解决（ADR-0075 拷 cookie，不必扫码）。**唯一没定的是 mihomo/代理**（Jina Reader 在服务器上直连不通）。
+9. 服务器部署：~~mihomo 内核 + Xvfb + 按需 Chrome~~ ✅ **已完成**（2026-10-27，见上面「阶段 0 第 7f 条」）——`scripts/bootstrap-server.sh` 一条命令可复现；git 推送凭证 ✅ 已解决（deploy key）；浏览器登录态 ✅ 已解决（ADR-0075 拷 cookie，不必扫码）；**代理 ✅ 已定**（不装 mihomo，Jina 按 ADR-0078 降级并在简报说明）；**定时调度 ✅ 已落地**（ADR-0077，systemd timer + `dsh headless`，`deploy/install-timers.sh` 安装）。
 
 
 **阶段 2：服务器验证**
 
-10. **服务器先 dry-run**：验 Xvfb、内存、mihomo 分流、git 同步。**本地 16GB 压不出 OOM，必须在此单独验证**——这是 ADR-0023 那套内存防御唯一真正生效的地方。**同时验表现数据读回**：它和发布共用浏览器会话与锁（ADR-0030），服务器上是最可能出现"锁竞争/登录态失效"的环境。**注意 ADR-0071 之后表现读回已不依赖 Chrome**（纯 HTTP + 注入 cookie），所以服务器上要验的是「注入的 cookie 还活着吗」，不是「Chrome 起得来吗」；但**发布写路径仍然要 Chrome + Xvfb**，那条路的内存压力照旧。
+10. **服务器先 dry-run**：验 Xvfb、内存、git 同步。**本地 16GB 压不出 OOM，必须在此单独验证**——这是 ADR-0023 那套内存防御唯一真正生效的地方。**同时验表现数据读回**：它和发布共用浏览器会话与锁（ADR-0030），服务器上是最可能出现"锁竞争/登录态失效"的环境。**注意 ADR-0071 之后表现读回已不依赖 Chrome**（纯 HTTP + 注入 cookie），所以服务器上要验的是「注入的 cookie 还活着吗」，不是「Chrome 起得来吗」；但**发布写路径仍然要 Chrome + Xvfb**，那条路的内存压力照旧。**代理分流这一项已被 ADR-0078 换掉**：服务器不装代理，改为验证「渠道策略生效 + 简报第⑤段说清楚了」。
 11. 确认无误后开真发。
 
 **阶段 3：插件层（最后做）**

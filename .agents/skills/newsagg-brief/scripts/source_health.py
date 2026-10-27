@@ -56,6 +56,35 @@ TIER0 = ("web", "rss", "exa_search", "github", "v2ex", "youtube")
 # 它们失效才是「采集面变窄」。
 TIMEOUT = 120  # 秒。doctor 会逐个渠道探测，16 个渠道全跑要十几秒。
 
+# 部署级渠道策略文件（ADR-0078）。渠道可用性是**部署属性**，不是代码属性：
+# 同一份代码在本机能用 Jina Reader，在不装代理的服务器上不能用。写在代码里
+# 等于把「本机的网络」硬编码进整个系统。
+POLICY_REL = Path("deploy") / "channel-policy.txt"
+
+
+def read_policy(root: Path) -> dict[str, dict]:
+    """读部署级渠道策略，返回 {渠道名: {"status": ..., "reason": ...}}。
+
+    格式见 deploy/channel-policy.txt：一行 `<渠道名> | <状态> | <理由>`。
+    文件不存在 → 空 dict（没有声明就是没有禁用，不报错——本机没这个文件
+    是正常的，它只在服务器那份部署里有）。
+    """
+    path = root / POLICY_REL
+    if not path.exists():
+        return {}
+    out: dict[str, dict] = {}
+    for line in path.read_text(encoding="utf-8").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2:
+            continue
+        name, status = parts[0], parts[1]
+        reason = parts[2] if len(parts) > 2 else ""
+        out[name] = {"status": status, "reason": reason}
+    return out
+
 
 def agent_reach_cmd(root: Path) -> list[str] | None:
     """找到 agent-reach 的可执行入口。
@@ -99,11 +128,22 @@ def read_health(root: Path) -> dict:
     `status/name/message/tier/backends/active_backend`，可以直接判 tier。
     两个命令探测的渠道集合相同。
     """
+    # 策略先读：即使体检跑不起来，已声明关掉的渠道也要报出来
+    # （否则「体检挂了」会把「这个渠道我们本来就不用」这件事盖住）。
+    policy = read_policy(root)
+    disabled = {name: entry["reason"]
+                for name, entry in policy.items()
+                if entry.get("status") == "disabled"}
+    effective = [k for k in TIER0 if k not in disabled]
+
+    def _unavailable(reason: str) -> dict:
+        return {"status": "unavailable", "channels": {}, "tier0_ok": 0,
+                "tier0_total": len(effective), "policy_disabled": disabled,
+                "reason": reason}
+
     cmd = agent_reach_cmd(root)
     if not cmd:
-        return {"status": "unavailable", "channels": {}, "tier0_ok": 0,
-                "tier0_total": len(TIER0),
-                "reason": "找不到 agent-reach 可执行文件（ADR-0021：只装 CLI、不入 PATH）"}
+        return _unavailable("找不到 agent-reach 可执行文件（ADR-0021：只装 CLI、不入 PATH）")
 
     try:
         proc = subprocess.run(
@@ -112,38 +152,26 @@ def read_health(root: Path) -> dict:
             cwd=str(root),
         )
     except subprocess.TimeoutExpired:
-        return {"status": "unavailable", "channels": {}, "tier0_ok": 0,
-                "tier0_total": len(TIER0),
-                "reason": f"agent-reach doctor 超时（>{TIMEOUT}s）"}
+        return _unavailable(f"agent-reach doctor 超时（>{TIMEOUT}s）")
     except OSError as exc:
-        return {"status": "unavailable", "channels": {}, "tier0_ok": 0,
-                "tier0_total": len(TIER0),
-                "reason": f"agent-reach doctor 无法执行：{exc}"}
+        return _unavailable(f"agent-reach doctor 无法执行：{exc}")
 
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        return {"status": "unavailable", "channels": {}, "tier0_ok": 0,
-                "tier0_total": len(TIER0),
-                "reason": f"agent-reach doctor 退出码 {proc.returncode}"
-                          + (f"：{tail[-1][:200]}" if tail else "")}
+        return _unavailable(f"agent-reach doctor 退出码 {proc.returncode}"
+                            + (f"：{tail[-1][:200]}" if tail else ""))
 
     raw = (proc.stdout or "").strip()
     start = raw.find("{")
     if start < 0:
-        return {"status": "unavailable", "channels": {}, "tier0_ok": 0,
-                "tier0_total": len(TIER0),
-                "reason": "agent-reach doctor 未输出 JSON"}
+        return _unavailable("agent-reach doctor 未输出 JSON")
     try:
         data = json.loads(raw[start:])
     except json.JSONDecodeError as exc:
-        return {"status": "unavailable", "channels": {}, "tier0_ok": 0,
-                "tier0_total": len(TIER0),
-                "reason": f"agent-reach doctor 输出无法解析：{exc}"}
+        return _unavailable(f"agent-reach doctor 输出无法解析：{exc}")
 
     if not isinstance(data, dict):
-        return {"status": "unavailable", "channels": {}, "tier0_ok": 0,
-                "tier0_total": len(TIER0),
-                "reason": "agent-reach doctor 输出不是对象"}
+        return _unavailable("agent-reach doctor 输出不是对象")
 
     # 只保留 tier-0（见模块文档的「边界二」）。
     channels: dict[str, dict] = {}
@@ -162,11 +190,27 @@ def read_health(root: Path) -> dict:
     tier0_total = len(TIER0)
     tier0_ok = sum(1 for k in TIER0
                    if channels.get(k, {}).get("status") == "ok")
+
+    # 部署级策略（ADR-0078）：声明关掉的渠道不算「坏了」，但要报出来。
+    for name in disabled:
+        channels[name] = {
+            "status": "disabled",
+            "tier": 0,
+            "name": name,
+            "message": disabled[name],
+        }
+    # 被声明关掉的渠道从分母里拿掉：我们已经接受了它不可用，拿它算「不可用」
+    # 只会让每天的简报都挂着一个已知项，久而久之整段就被无视了
+    # （与 ADR-0021 边界二同一个理由：第 ⑤ 段是「需你介入的事项」）。
+    tier0_ok = sum(1 for k in effective
+                   if channels.get(k, {}).get("status") == "ok")
+
     return {
-        "status": "ok" if tier0_ok == tier0_total else "degraded",
+        "status": "ok" if tier0_ok == len(effective) else "degraded",
         "channels": channels,
         "tier0_ok": tier0_ok,
-        "tier0_total": tier0_total,
+        "tier0_total": len(effective),
+        "policy_disabled": disabled,
         "reason": "",
     }
 
@@ -175,14 +219,34 @@ def render(health: dict) -> list[str]:
     """把体检结果渲染成简报第 ⑤ 段的条目。
 
     只在「有问题」时返回非空——健康时不占第 ⑤ 段的位置。
+
+    **两种「不可用」必须分开说**（ADR-0078）：
+    - `disabled` = **我们主动关掉的**（部署级策略声明过）。这不是故障，
+      是一条需要读者知道的部署事实：今天这个渠道不参与，正文得从别处取。
+    - `off`/`error`/`warn` = **它自己坏了**。这是需要人介入的事。
+
+    混在一起说会犯两个错：把「我们关的」说成「它坏了」，人去查一个根本没
+    坏的东西；把「它坏了」混进「我们关的」，人以为已经处理过了。
     """
     if not health:
         return []
     status = health.get("status")
-    if status == "ok":
-        return []
+    disabled = health.get("policy_disabled") or {}
+    channels = health.get("channels") or {}
 
     out: list[str] = []
+
+    # 一、主动关掉的渠道：即使体检全绿也要报——读者需要知道今天的采集面
+    # 少了一块，以及少的那块是怎么补的。
+    if disabled:
+        out += ["**本次部署主动关掉了这些信源渠道**（ADR-0078，不是故障）："]
+        for name, reason in disabled.items():
+            out += [f"- ○ {name}：{reason}"]
+        out += ["  关掉的渠道不参与采集，正文请从其余渠道取；",
+                "  这一条不熔断，也不计入「可用率」的分母。", ""]
+
+    if status == "ok":
+        return out
     if status == "unavailable":
         out += ["**信源健康观测不可用**（ADR-0021）：" + str(health.get("reason") or "未知原因"),
                 "  这不等于「信源都健康」——它等于我们**失去了观察能力**：",
@@ -192,12 +256,12 @@ def render(health: dict) -> list[str]:
         return out
 
     broken = []
-    for key, val in (health.get("channels") or {}).items():
+    for key, val in channels.items():
         st = val.get("status")
         if st in ("off", "error", "warn"):
             broken.append((key, val))
     if not broken:
-        return []
+        return out
 
     out += [f"**信源渠道失效**（ADR-0021，tier-0 "
             f"{health.get('tier0_ok')}/{health.get('tier0_total')} 可用）："]

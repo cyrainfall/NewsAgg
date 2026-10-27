@@ -39,6 +39,9 @@ CRED_FILE="/etc/newsagg/dsh-credentials.env"
 if [[ -z "${DEEPSEEK_API_KEY:-}" && -f "${CRED_FILE}" ]]; then
   # shellcheck disable=SC1090
   source "${CRED_FILE}"
+  # ★ source 只创建 shell 变量，**不会导出**到子进程的环境。dsh 是子进程，
+  #   不 export 它就等于没给——实测报 MISSING_CREDENTIAL: llm-deepseek。
+  export DEEPSEEK_API_KEY
 fi
 if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
   echo "[!] 找不到 DEEPSEEK_API_KEY（既没设环境变量，也没有 ${CRED_FILE}）" >&2

@@ -309,7 +309,19 @@ def extract_articles(raw: dict) -> tuple[list[dict], dict]:
             read = metrics.get("readCount")
             # 展现为 0 时阅读率无定义——记 None 而不是 0，避免把"没被展现"
             # 混进"被展现了但没人点"的统计里。
+            #
+            # 2026-10-28 补：阅读数**可能大于**展现数（实测 10-27 那篇
+            # show=5 / read=6 → 120%）。新文章的展现统计滞后于阅读统计，
+            # 平台先记点击再补展现，于是出现一个数学上不可能的比例。
+            # 这不是「数据坏了」，是两条计数不同步的窗口期。
+            # 但**不能把它当阅读率用**：它会进基准中位数（把阈值抬高 →
+            # 该降频时降不下来），也会被简报原样印成「阅读率 120%」
+            # （简报的信噪比是它唯一的资产，ADR-0055）。
+            # 判据：rate > 1 视为窗口期未同步，记 None（与「展现为 0」同类，
+            # 都是「此刻算不出有意义的比率」），并把两个原始数留给下游呈现。
             rate = (read / show) if (show and read is not None) else None
+            if rate is not None and rate > 1.0:
+                rate = None
 
             articles.append({
                 "gid": str(base.get("gidStr") or "") or None,
@@ -760,7 +772,11 @@ def fetch_content_list_api(account: str, limit: int) -> tuple[list[dict], dict]:
         show = metrics.get("showCount")
         read = metrics.get("readCount")
         # 展现为 0 时阅读率无定义——记 None 而不是 0（与浏览器路径同口径）。
+        # 阅读数大于展现数时同样记 None：见上方浏览器路径那段注释
+        # （2026-10-28 实测 show=5 / read=6 的窗口期）。
         rate = (read / show) if (show and read is not None) else None
+        if rate is not None and rate > 1.0:
+            rate = None
 
         url = str(item.get("article_url") or "")
         out.append({

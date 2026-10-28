@@ -291,6 +291,63 @@ class TestParityWithBrowserPath(unittest.TestCase):
             self.assertIn(key, arts[0], f"api 路径缺字段 {key}")
 
 
+class TestReadRateClamp(unittest.TestCase):
+    """阅读率不能大于 100%（2026-10-28 实测的窗口期）。
+
+    ## 为什么值得钉住
+
+    10-27 那篇在次日读回时是 `showCount=5 / readCount=6` —— **阅读数大于展现数**。
+    平台的两条计数不同步（先记点击、后补展现），于是算出一个数学上不可能的
+    120%。这不是「数据坏了」，是窗口期的正常现象。
+
+    但把这个值当阅读率用，会从两条路上造成实际损害：
+
+    1. **进基准中位数**——`evaluate()` 的基线取最近 N 篇 `read_rate` 的中位数，
+       一个 1.2 的值会把阈值抬高，于是**该降频时降不下来**（ADR-0010 的自动
+       降频是本系统唯一的行为调节器）。
+    2. **被简报原样印出**——`brief.py` 直接 `fmt_rate(read_rate)`，读者会看到
+       「阅读率 120%」。简报的信噪比是它唯一的资产（ADR-0055），一个明显的
+       不可能数字会让人开始怀疑同一段里的其他数字。
+
+    所以判据是：`rate > 1` 与「展现为 0」同类，都记 `None`（此刻算不出有意义
+    的比率），原始的两个数仍留在 `metrics` 里供人看。
+    """
+
+    def _browser_payload(self, show, read):
+        return {
+            "success": True, "source": "api_intercept", "count": 1,
+            "items": [
+                {"data": [{"assembleCell": {"itemCell": {
+                    "articleBase": {"gidStr": "7701389368845500963",
+                                    "title": "H200租金涨143%",
+                                    "publishTime": 1792870926,
+                                    "itemStatus": 20,
+                                    "articleURL": "https://www.toutiao.com/item/7701389368845500963/"},
+                    "itemCounter": {"showCount": show, "readCount": read},
+                }}}]},
+            ],
+        }
+
+    def test_read_greater_than_show_is_none_not_120_percent(self):
+        """展现 5 / 阅读 6 → read_rate 必须是 None，不能是 1.2。"""
+        arts, _ = perf.extract_articles(self._browser_payload(5, 6))
+        self.assertIsNone(arts[0]["read_rate"],
+                          "阅读数大于展现数时应记 None，不能记成 >1 的比率")
+        # 原始数必须还在——记 None 是为了不误用，不是为了隐藏事实。
+        self.assertEqual(arts[0]["metrics"]["showCount"], 5)
+        self.assertEqual(arts[0]["metrics"]["readCount"], 6)
+
+    def test_normal_ratio_still_computed(self):
+        """正常比率不受影响（防止把 clamp 写成「一律 None」）。"""
+        arts, _ = perf.extract_articles(self._browser_payload(1000, 7))
+        self.assertAlmostEqual(arts[0]["read_rate"], 0.007, places=6)
+
+    def test_exactly_100_percent_is_kept(self):
+        """恰好 100% 是合法边界（所有展现都被读了），不该被抹成 None。"""
+        arts, _ = perf.extract_articles(self._browser_payload(10, 10))
+        self.assertAlmostEqual(arts[0]["read_rate"], 1.0, places=6)
+
+
 class TestKindClassification(unittest.TestCase):
     def test_draft_is_article(self):
         self.assertEqual(

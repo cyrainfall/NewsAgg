@@ -95,6 +95,19 @@ def _load_title_rules():
     return title_rules
 
 
+def _load_prose_rules():
+    """加载同目录的 `prose_rules`（正文规则的唯一实现）。
+
+    与 `_load_title_rules` 同一套分工：规则本身在 `platforms/prose-rules.md`（归本人），
+    判定逻辑在 `prose_rules.py`，`build_brief.py` 也从这里读。
+    """
+    here = Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import prose_rules
+    return prose_rules
+
+
 class Breaker:
     """熔断状态（ADR-0025：存仓内文件，便于人工解除、guard 可同步读）。"""
 
@@ -788,6 +801,22 @@ def main() -> int:
                 "source": rules.get("source"),
             }, ensure_ascii=False, indent=2))
             return 1
+
+    # ── 正文观察项（`platforms/prose-rules.md`，规则唯一副本）──
+    # 与标题门相反：这里**不拦发**。正文没有「拒发」的正确阈值，
+    # 拦错一次就是一篇产能归零，而当前 n=13 的样本连"现有写法跑通没有"都还回答不了。
+    # 所以只打标签、写进账本、由简报告诉人——攒够样本再谈阈值（ADR-0069 的分界）。
+    pr = _load_prose_rules()
+    prose_rules_loaded = pr.load_rules(root)
+    prose_tags = None
+    if prose_rules_loaded.get("loaded"):
+        prose_tags = pr.tag_body(body, prose_rules_loaded)
+    else:
+        print(json.dumps({"ok": True, "stage": "prose_rules",
+                          "warning": prose_rules_loaded.get("error"),
+                          "message": "正文规则文件读不上，本篇不打正文标签（不影响发布）"},
+                         ensure_ascii=False, indent=2))
+
     if not Path(args.cover).exists():
         print(json.dumps({"ok": False, "stage": "input",
                           "message": f"封面不存在：{args.cover}（头条必填，ADR-0013）"},
@@ -952,6 +981,10 @@ def main() -> int:
             # 写 null 而不是省略：省略与"没打标签"在消费端不可区分。
             "title_tags": (tr.tag_title(title, rules)
                            if rules.get("loaded") else None),
+            # 正文观察项标签（`platforms/prose-rules.md`）。与 title_tags 同理：
+            # 不拦发，但每次发布留一份，简报 ③ 段读它——这是让「记录了」变成
+            # 「有人看」的那一步（本仓此前 title_tags 就是记了没人读）。
+            "body_tags": prose_tags,
             # 去浏览器化的进度必须在账本里可查：这一篇到底哪条路写出去的、
             # 有没有发生回落、反查用的是哪个数据源。否则「api 后端上线了」
             # 就只是一句口号，出事时无从复盘。

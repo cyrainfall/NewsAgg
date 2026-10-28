@@ -478,6 +478,52 @@ def section_overview(candidates, decision, trend_summary=None) -> list[str]:
     return out
 
 
+_ENDING_LABEL = {
+    "action": "行动句收尾",
+    "boundary": "边界句收尾",
+    "none": "既非行动也非边界",
+}
+
+
+def fmt_body_tags(rec: dict) -> list[str]:
+    """把账本里的 `body_tags` 印成人能读的几行（`platforms/prose-rules.md`）。
+
+    **为什么简报要印它。** `title_tags` 从 2026-10-27 起就在账本里，但从没有
+    任何代码读过它——那是本仓重复出现的失败形态：「记录下来」被当成「已经做完」。
+    正文标签如果也只在账本里躺着，几个月后它会和 title_tags 一样没人看。
+    印出来，人才能在每天扫简报时看见「收尾是不是又滑回边界句了」。
+
+    账本里的老记录没有 `body_tags`（本次改造之前发的），这时**什么都不印**，
+    不印「无标签」——「没打标签」与「打了标签说没问题」在简报上必须可区分。
+    """
+    tags = rec.get("body_tags") or {}
+    if not isinstance(tags, dict) or not tags:
+        return []
+    out: list[str] = []
+
+    em = tags.get("ending_mode") or {}
+    if em.get("mode"):
+        out.append(f"收尾：{_ENDING_LABEL.get(em['mode'], em['mode'])}")
+
+    cs = tags.get("contrast_has_source") or {}
+    total = cs.get("reversed_total") or 0
+    if total:
+        src = cs.get("with_source") or 0
+        # 0 处来源是这轮复盘的主要发现（38 处反转句、0 处给对照），
+        # 所以它在简报上不该只是一个数字，得带一句「这意味着什么」。
+        note = "（反转句多数没交代『多数人会怎么读』）" if src == 0 else ""
+        out.append(f"反转句：{src}/{total} 句有对照来源{note}")
+
+    prec = tags.get("has_precedent") or {}
+    out.append("先例段：" + ("有" if prec.get("hit") else "无"))
+
+    prior = tags.get("quotes_own_prior") or {}
+    if prior.get("hit"):
+        out.append("引了自己上一篇的结论")
+
+    return out
+
+
 def section_article(decision, publish_recs, body_dir: Path, perf: dict | None = None) -> list[str]:
     out = ["## ③ 本篇文章与发布结果", ""]
     d = unwrap(decision)
@@ -531,6 +577,18 @@ def section_article(decision, publish_recs, body_dir: Path, perf: dict | None = 
     drafts = [r for r in publish_recs if r.get("verdict") == "draft_saved"]
     if drafts:
         out += ["", "**本次为 dry-run**：已创建草稿，需人工清理。"]
+
+    # 正文结构标签（`platforms/prose-rules.md`）：只呈现、不评判。
+    # 挂在「本篇」这一节而不是 ⑤ 段，因为它是**这一篇长什么样**的事实，
+    # 不是需要人动手的事项——⑤ 段只放需要否决/介入的东西。
+    # 取最后一条带标签的记录：当天可能有 dry-run 草稿记录排在正式发布之后，
+    # 但草稿也有 body_tags（标签在发布门之前就打了），所以按「有没有标签」
+    # 而非「是不是最后一条」来选，避免拿一条没打标签的记录把整段吞掉。
+    tagged = [r for r in publish_recs if (r.get("body_tags") or {})]
+    tag_lines = fmt_body_tags(tagged[-1]) if tagged else []
+    if tag_lines:
+        out += ["", "**正文结构**（观察项，不拦发）："]
+        out += [f"- {ln}" for ln in tag_lines]
 
     out += perf_block
     out += [""]

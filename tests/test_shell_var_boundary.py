@@ -44,6 +44,10 @@ VAR = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 SHELL_SCRIPTS = [
     ".agents/skills/newsagg-collect/scripts/run_all.sh",
     "scripts/bootstrap-wewrite.sh",
+    # 四条定时任务的第一句（采集与主流程都要先确保热榜服务在跑）。
+    # ADR-0076 残余风险 81：新增 shell 脚本必须手动加进这个列表，
+    # 否则它不在检查范围内——而「不在检查范围内」正是那个坑复发的方式。
+    "scripts/ensure-hot.sh",
 ]
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -393,7 +394,66 @@ def section_conclusion(decision, publish_recs, date: str, perf: dict | None = No
     return out
 
 
-def section_overview(candidates, decision, trend_summary=None) -> list[str]:
+def _norm_issue(text: str) -> str:
+    """议题归一化键，**必须与 `card_backlog.norm_issue` 逐字节一致**（ADR-0042）。
+
+    简报只是回声，不产生计数，所以它不需要自己的口径——它需要与那个
+    真正数数的模块用同一把尺子。导不进来时退回空串（回声整段不印），
+    而不是自己写一份：一份漂移的归一化会让回声指向另一条台账，
+    显示「第 3 次」而实际记在别的键下，比不显示更坏。
+    """
+    mod = _load_card_backlog()
+    if mod is None:
+        return ""
+    try:
+        return mod.norm_issue(text)
+    except Exception:
+        return ""
+
+
+def _backlog_echo(item: dict, backlog: dict | None) -> str:
+    """把一个「无卡可接」条目接回台账，返回一行回声（ADR-0083）。
+
+    这一行是整套改动的对外可见面：它回答「这件事我上次见过吗、第几次了、
+    上一次为什么没为它建卡」。在此之前简报只是**打印**这条事件，
+    没有数字、没有前情，所以它每一轮都像第一次出现。
+
+    没有台账（老日期、或采集刚跑第一轮）时返回空串——**不要编一个「第 1 次」**，
+    那会让「没见过」和「第一次」看起来一样。
+    """
+    issue = str(item.get("issue") or "").strip()
+    if not issue:
+        return ""
+    issues = (backlog or {}).get("issues") or {}
+    if not issues:
+        return ""
+    # 归一化只留一份实现（ADR-0042）：这里绝不能自己写一份正则，
+    # 否则它与 triage 计数用的那份一旦漂移，回声就会指向另一条（或不存在的）台账。
+    key = _norm_issue(issue)
+    e = issues.get(key)
+    if not isinstance(e, dict):
+        return ""
+    n = int(e.get("times_seen") or 0)
+    if n <= 0:
+        return ""
+    # 门槛取台账里带过来的那个数（`triage` 写进输入包），缺省 2 与常量一致。
+    threshold = int((backlog or {}).get("threshold") or 2)
+    bits = [f"台账：该议题第 {n} 次出现（首见 {e.get('first_seen')}）"]
+    reasons = e.get("reasons") or {}
+    last_seen = e.get("last_seen")
+    last_reason = reasons.get(last_seen) if isinstance(reasons, dict) else None
+    if last_reason:
+        bits.append(f"上次（{last_seen}）不建的理由：{clip(last_reason, 200)}")
+    if e.get("card_file"):
+        bits.append("已挂卡")
+    elif n >= threshold:
+        # 门槛数字从台账读，不写死：`TIMES_SEEN_THRESHOLD` 是要按实测分布调整的
+        # 一个常量（ADR-0083 未做项），写死会让回声与实际判据悄悄分家。
+        bits.append(f"**已达建卡门槛（第 {threshold} 次起算）**——不建就要给 no_card_reason")
+    return "；".join(bits)
+
+
+def section_overview(candidates, decision, trend_summary=None, backlog=None) -> list[str]:
     out = ["## ② 采集与分拣概览", ""]
     if candidates:
         c = candidates.get("counts", {})
@@ -468,9 +528,23 @@ def section_overview(candidates, decision, trend_summary=None) -> list[str]:
         if nca:
             out += ["", "**值得关注但无卡可接**（供你人工指定）："]
             for it in nca:
-                out += [f"- {clip(it.get('event',''), 120)}"]
+                # ADR-0083：`issue` 是台账的计数键，也是**人事后指定建卡时要用的名字**。
+                # 此前这一节只印事件与理由，所以你想「就这个议题建张卡」时，
+                # 手里只有一句新闻描述，得自己重新想一个议题名——而分拣那边
+                # 用的名字可能完全不同，于是台账又记成两个议题。
+                issue = str(it.get("issue") or "").strip()
+                if issue:
+                    out += [f"- 「{clip(issue, 60)}」：{clip(it.get('event',''), 120)}"]
+                else:
+                    out += [f"- {clip(it.get('event',''), 120)}"]
                 if it.get("why"):
                     out += [f"  - {clip(it['why'], 400)}"]
+                # ADR-0083：这一节此前是**死胡同**——写进简报就没了，下一轮分拣
+                # 重新全量读卡，看不到「上一轮有人说这议题该建卡」。13 轮 0 张卡
+                # 的直接原因就是这句话没有回声。现在把它的第几次出现印出来。
+                echo = _backlog_echo(it, backlog)
+                if echo:
+                    out += [f"  - {echo}"]
         note = (decision.get("decision") or decision).get("ranking_note")
         if note:
             out += ["", f"**排序说明**：{clip(note, 800)}"]
@@ -595,7 +669,8 @@ def section_article(decision, publish_recs, body_dir: Path, perf: dict | None = 
     return out
 
 
-def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -> list[str]:
+def section_assets(decision, cards_dir: Path, article_slug: str | None = None,
+                   backlog: dict | None = None, date: str = "") -> list[str]:
     out = ["## ④ 资产变动", ""]
     before = len(list(cards_dir.glob("*.md"))) if cards_dir.exists() else 0
     out += [f"- 观点卡总数：{before}"]
@@ -617,6 +692,7 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -
             landed = f"来源 {article_slug}" in card_path.read_text(encoding="utf-8")
         status = "已写回，带**未复核**标记（ADR-0026 循环 A）" if landed else "**未写回**（发布未成功，或写回失败）"
         out += [f"- **修订**：{cf} — {status}"]
+    out += _card_stock_lines(cards_dir, backlog, date)
     # 治理建议（退役/合并）由分拣层在需要时提供
     for key, label in (("retire_suggestions", "退役建议"), ("merge_suggestions", "合并建议")):
         items = (decision or {}).get(key) or []
@@ -626,6 +702,124 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None) -
                 out += [f"- {it}"]
     out += [""]
     return out
+
+
+def _card_stock_lines(cards_dir: Path, backlog: dict | None, date: str) -> list[str]:
+    """卡库的两条体检线（ADR-0083）：到期议题、退役候选。
+
+    这两条此前**都不存在**，而它们各自对应一个一直在漏的洞：
+    - 到期议题：13 轮 0 张卡，每次都没人知道「这个议题已经第 2 次了」
+    - 退役候选：ADR-0007 写了退役，但 `created` 从未被读进内存，
+      「建卡 30 天一次没接住新闻」在全系统算不出来
+
+    只印**需要动作的**：到期议题印前 5 条、退役候选印前 3 条。
+    没有就印「无」——一行「无」比整段消失更有用，它证明这一轮真的查过。
+    """
+    out = []
+    if not cards_dir.exists():
+        return out
+
+    cards = []
+    for p in sorted(cards_dir.glob("*.md")):
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm = _parse_card_fm(text)
+        cards.append({"file": p.name, "issue": fm.get("issue") or p.stem,
+                      "created": fm.get("created"), "last_written": fm.get("last_written"),
+                      "status": fm.get("status") or "active"})
+    active = [c for c in cards if str(c.get("status")) == "active"]
+
+    # ① 到期议题：出现次数够了、却仍没有卡
+    due = []
+    if backlog:
+        issues = backlog.get("issues") or {}
+        have = {c["file"] for c in cards}
+        for e in issues.values():
+            if not isinstance(e, dict):
+                continue
+            cf = e.get("card_file")
+            if cf and cf in have:
+                continue
+            n = int(e.get("times_seen") or 0)
+            if n >= int(backlog.get("threshold") or 2):
+                due.append((n, e.get("issue") or "?", e.get("last_seen")))
+        due.sort(key=lambda x: -x[0])
+    if due:
+        out += ["", f"- **到期未建卡**（同一议题第 {int(backlog.get('threshold') or 2)} 次起算，ADR-0083）："]
+        for n, issue, last in due[:5]:
+            out += [f"  - {issue}——第 {n} 次出现（最近 {last}）"]
+        if len(due) > 5:
+            out += [f"  - 另有 {len(due) - 5} 个"]
+    elif backlog and (backlog.get("issues") or {}):
+        out += [f"- 台账：{len(backlog.get('issues') or {})} 个议题在跟，无到期未建卡"]
+
+    # ② 退役候选：建满 30 天，一次都没被 continue（`last_written` 为空）
+    # 判定委托给 `card_backlog.retire_candidates`（ADR-0042：同一判据只留一份实现）。
+    # 简报这里自己数一遍日期差，就会重演 ADR-0042 的漂移——两份口径一旦分家，
+    # 会出现「简报说它该退了、校验器说它还没到」这种谁也说不清的状态。
+    backlog_mod = _load_card_backlog()
+    today = date or datetime.now(CST).strftime("%Y-%m-%d")
+    review_days = 30
+    if backlog_mod:
+        review_days = getattr(backlog_mod, "REVIEW_DAYS", 30)
+        retired = backlog_mod.retire_candidates(active, today)
+    else:  # 模块缺失时退回最小实现，不让这条线整段消失
+        retired = []
+        for c in active:
+            created = str(c.get("created") or "")[:10]
+            if not created or c.get("last_written"):
+                continue
+            try:
+                age = (datetime.fromisoformat(today) - datetime.fromisoformat(created)).days
+            except ValueError:
+                continue
+            if age >= review_days:
+                retired.append({"age_days": age, "issue": c["issue"], "file": c["file"]})
+        retired.sort(key=lambda x: -x["age_days"])
+    if retired:
+        out += ["", f"- **退役候选**（建卡满 {review_days} 天、一次都没接住新闻，ADR-0007）："]
+        for c in retired[:3]:
+            out += [f"  - {c.get('issue')}（{c.get('file')}，已 {c.get('age_days')} 天）"]
+        out += ["  - 只是候选：改 `status: retired` 才生效，机器不自动退役"]
+    return out
+
+
+def _load_card_backlog():
+    """加载 `card_backlog` 模块（议题台账唯一实现，ADR-0042/0083）。
+
+    与 `_parse_card_fm` 同样的取舍：导不进来返回 None 而不是崩——简报是每日心跳
+    （ADR-0038），台账模块缺失只该让「台账回声」那几行不出现，不该让整份简报消失。
+    """
+    try:
+        here = Path(__file__).resolve().parent
+        triage_dir = here.parents[1] / "newsagg-triage" / "scripts"
+        if str(triage_dir) not in sys.path:
+            sys.path.insert(0, str(triage_dir))
+        import card_backlog  # noqa: PLC0415
+        return card_backlog
+    except Exception:
+        return None
+
+
+def _parse_card_fm(text: str) -> dict:
+    """取观点卡 frontmatter（复用 cardfm 唯一实现，ADR-0042）。
+
+    自己再写一份 YAML 解析就会重演 ADR-0042 的三份拷贝漂移。这里 import 失败
+    时**返回空 dict 而不是崩**——简报是每日心跳（ADR-0038），
+    一个 frontmatter 解析器缺失不该让整份简报消失。
+    """
+    try:
+        here = Path(__file__).resolve().parent
+        triage_dir = here.parents[1] / "newsagg-triage" / "scripts"
+        if str(triage_dir) not in sys.path:
+            sys.path.insert(0, str(triage_dir))
+        import cardfm  # noqa: PLC0415
+        fm, _body, _ = cardfm.parse_frontmatter(text)
+        return fm if isinstance(fm, dict) else {}
+    except Exception:
+        return {}
 
 
 def section_actions(publish_recs, candidates, decision, cover_path: Path | None, article_slug: str | None, perf: dict | None = None, run_status: dict | None = None, ledger_path: Path | None = None, cover_report: dict | None = None, photo_line: str = "", date: str = "", root: Path | None = None, all_recs: list[dict] | None = None) -> list[str]:
@@ -898,9 +1092,14 @@ def main() -> int:
     perf = read_performance(root)
     run_status = read_run_status(root, date)
     lines += section_conclusion(decision, publish_recs, date, perf, run_status)
-    lines += section_overview(cand, decision, (triage_input or {}).get("trend_summary"))
+    # 议题台账（ADR-0083）：简报的两处回声——②概览里每个「无卡可接」条目的
+    # 第几次出现，以及④资产里的到期议题与退役候选。都从**同一份输入包**取，
+    # 而输入包本来就已在这里读进来了（只差没用）。台账文件缺失时退化为 None，
+    # 两处都按「没有台账」渲染——不会凭空造出「第 1 次」。
+    backlog = (triage_input or {}).get("backlog")
+    lines += section_overview(cand, decision, (triage_input or {}).get("trend_summary"), backlog)
     lines += section_article(decision, publish_recs, root / ".newsagg" / "bodies", perf)
-    lines += section_assets(decision, root / "knowledge" / "cards", slug)
+    lines += section_assets(decision, root / "knowledge" / "cards", slug, backlog, date)
     cover_report = read_json(root / ".newsagg" / "covers" / f"{date}.report.json")
     lines += section_actions(publish_recs, cand, decision, cover, slug, perf, run_status,
                              ledger_path=root / ".newsagg" / "publish-ledger.jsonl",

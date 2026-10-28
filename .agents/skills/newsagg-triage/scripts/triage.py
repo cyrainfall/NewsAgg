@@ -53,6 +53,26 @@ def _load_cardfm():
     return cardfm
 
 
+def _load_backlog_module():
+    """加载同目录的 `card_backlog`（议题台账，ADR-0083）。理由同上。
+
+    台账是本轮唯一新增的**状态**：没有它，「同一议题第几次出现」无从计算，
+    而那道闸就只能靠人记着。调用方（`validate_decision`）把它当可选参数，
+    但生产路径一定传——`main()` 会读 `.newsagg/triage/card-backlog.json`。
+    """
+    here = Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import card_backlog
+    return card_backlog
+
+
+try:  # 模块级 import 失败不该让整份脚本不可用（测试与旧调用方仍要能 import）
+    card_backlog = _load_backlog_module()
+except Exception:  # pragma: no cover - 只有在文件被删掉时才会走到
+    card_backlog = None  # type: ignore[assignment]
+
+
 def parse_frontmatter(text: str) -> tuple[dict, str]:
     """委托给同目录 `cardfm`（ADR-0042：三份拷贝漂移过一次，只留一份实现）。
 
@@ -77,6 +97,10 @@ def load_cards(cards_dir: Path) -> list[dict]:
                 "file": path.name,
                 "issue": fm.get("issue") or path.stem,
                 "status": fm.get("status") or "active",
+                # ADR-0083：退役回检需要「建成多久了」的起点，`created` 是唯一来源。
+                # 此前它没有被读进内存，于是「建卡满 30 天却一次没接住新闻」
+                # 在全系统任何地方都算不出来——ADR-0007 的退役条款因此一直空转。
+                "created": fm.get("created"),
                 "covered_events": fm.get("covered_events") or [],
                 "last_written": fm.get("last_written"),
                 "body": body.strip(),
@@ -444,9 +468,16 @@ def compute_trends(items: list[dict]) -> tuple[list[dict], dict]:
 
 
 def build_triage_input(candidates: dict, cards: list[dict], cooldown: dict,
-                       performance: dict | None = None) -> dict:
-    """组装模型的输入包：候选条目 + 全部卡 + 冷却状态 + 限额 + 历史表现参考。"""
+                       performance: dict | None = None,
+                       backlog: dict | None = None) -> dict:
+    """组装模型的输入包：候选条目 + 全部卡 + 冷却状态 + 限额 + 历史表现参考。
+
+    ADR-0083 加了 `backlog` 一节。**这是本轮改动的关键**——闸门只是兜底，
+    模型看不见台账时它只能每轮从零重推同一个结论，13 轮 0 张卡就是这么来的。
+    把「这个议题第几次出现了、上一轮为什么不建」放在模型眼前，它才有据可依。
+    """
     trends, trend_summary = compute_trends(candidates.get("items", []))
+    due = card_backlog.due_issues(backlog or {}, cards) if card_backlog else []
     return {
         "prepared_at": datetime.now(CST).isoformat(),
         "instruction": (
@@ -454,6 +485,8 @@ def build_triage_input(candidates: dict, cards: list[dict], cooldown: dict,
             "（skip / continue / new）。判据见 SKILL.md 的硬规则。"
             "候选条目上的 trend 是**同源位次变化**（ADR-0056），"
             "trend_summary 说明该信号的覆盖率——它退化时按当前热度排序。"
+            "backlog.due 里的议题已达新建门槛：要么这一轮为它建卡，要么写下"
+            "no_card_reason（见 SKILL.md 硬规则 3）。"
         ),
         "limits": {
             "max_articles_per_day": 1,
@@ -464,6 +497,7 @@ def build_triage_input(candidates: dict, cards: list[dict], cooldown: dict,
         "cards": cards,
         "candidates": trends,
         "trend_summary": trend_summary,
+        "backlog": _backlog_block(backlog or {}, cards, due),
         "collection_counts": candidates.get("counts", {}),
         "stale_sources": candidates.get("stale_sources", []),
         "failed_sources": [f.get("source") for f in candidates.get("failures", [])],
@@ -471,11 +505,61 @@ def build_triage_input(candidates: dict, cards: list[dict], cooldown: dict,
     }
 
 
-def validate_decision(decision: dict, cards: list[dict], cooldown: dict, limits: dict) -> dict:
-    """校验模型的三态决策。返回 (ok, problems)。
+def _backlog_block(backlog: dict, cards: list[dict], due: list[dict]) -> dict:
+    """输入包里的台账视图。
+
+    只给**未挂卡**的议题全文（已建卡的议题对分拣没有信息量，只会稀释注意力），
+    外加最近一条 `no_card_reason`——「上一轮为什么没建」是这一轮最该读的一句话，
+    没有它，同一个决定会被无理由地重复一次。
+    """
+    issues = (backlog or {}).get("issues") or {}
+    have = {c.get("file") for c in cards}
+    open_items = []
+    for e in issues.values():
+        if not isinstance(e, dict):
+            continue
+        cf = e.get("card_file")
+        if cf and cf in have:
+            continue
+        reasons = e.get("reasons") or {}
+        last_day = e.get("last_seen")
+        open_items.append({
+            "issue": e.get("issue"),
+            "times_seen": int(e.get("times_seen") or 0),
+            "first_seen": e.get("first_seen"),
+            "last_seen": last_day,
+            "last_reason": (reasons or {}).get(last_day) if isinstance(reasons, dict) else None,
+            "events": (e.get("events") or [])[-3:],
+        })
+    open_items.sort(key=lambda x: (-x["times_seen"], str(x["first_seen"] or "")))
+    return {
+        # 数字一律读台账（`card_backlog.empty_backlog` 会种下默认值），
+        # 让 `due_issues` 实际用的阈值和这里报给人看的阈值是同一个。
+        "threshold": int((backlog or {}).get("threshold")
+                         or (card_backlog.TIMES_SEEN_THRESHOLD if card_backlog else 2)),
+        "review_days": (card_backlog.REVIEW_DAYS if card_backlog else 30),
+        "due": [d["issue"] for d in due],
+        "open_issues": open_items,
+        "note": (
+            "同一个议题第二次出现就必须有卡，或者必须写下不建的理由（ADR-0083）。"
+            "`times_seen` 由脚本按天去重计数，不是模型自报——同一议题的措辞请保持稳定，"
+            "否则会计成两个议题（归一化只去标点、不合并语义）。"
+            "`due` 非空时这一轮只能二选一：action=new 为它建卡，或给 no_card_reason。"
+        ),
+    }
+
+
+def validate_decision(decision: dict, cards: list[dict], cooldown: dict, limits: dict,
+                      backlog: dict | None = None, day: str | None = None) -> dict:
+    """校验模型的三态决策。返回 {ok, problems}。
 
     这是确定性校验，不是判断替代：它只检查结构性合法性与已知的硬约束
-    （冷却期、每日限额、卡是否存在）。语义正确性仍需人工在简报中复核。
+    （卡是否存在、每日上限、议题台账到期）。语义正确性仍需人工在简报中复核。
+
+    `backlog` 是议题台账（`card_backlog.load`）。不传就等于没有台账，
+    「到期议题必须二选一」这道闸不生效——调用方漏传时**不是静默通过**，
+    而是退回到 2026-10-28 之前的行为（13 轮 0 张卡）。生产路径
+    （`main()`）总是传，测试里也要求传。
     """
     problems = []
     action = decision.get("action")
@@ -503,9 +587,11 @@ def validate_decision(decision: dict, cards: list[dict], cooldown: dict, limits:
     if action == "new":
         if not decision.get("new_issue"):
             problems.append("new 必须给出 new_issue（新卡的议题名）")
-        # ADR-0007：可复用性判据
-        if not decision.get("reusable_because"):
-            problems.append("new 必须说明 reusable_because（为何能接住未来的新闻）")
+        # ADR-0083：`reusable_because` 从「必填的自述」降为「可选的自述」。
+        # 它要求模型预测「这张卡能不能接住未来的新闻」——那是预测，不是判定，
+        # 13 轮里没有一次拦住过任何东西（实测：`reusable_because: "不知道"` 也能通过）。
+        # 真正的可复用性判据挪到了事后：建成的卡 30 天内一次都没被 continue 就进退役候选
+        # （card_backlog.retire_candidates）。字段保留是因为它对写作阶段仍有信息量。
         # 2026-10-17 实测发现：new 原先不校验 card_file，而第 3 段的写回靠它取卡
         # （run_all.sh 的 `[[ -n "$CARD" ]]`），缺失时写回被**静默跳过**——
         # 新卡永远不会拿到 covered_events 与 last_written，认知资产停止生长且不报错。
@@ -521,6 +607,60 @@ def validate_decision(decision: dict, cards: list[dict], cooldown: dict, limits:
                 f"new 的 card_file 不存在：{cf}——建卡与决策是同一个动作，"
                 f"必须先写 knowledge/cards/{cf} 再产出决策"
             )
+
+    # ── 到期议题的闸（ADR-0083）────────────────────────────────────
+    # 这一道此前不存在：`no_card_available`（唯一能指向「该建卡」的事实）
+    # 只被 `brief.py` 打印给人看，从没有任何代码把它读回来做校验。
+    # 结果是 2026-10-14 到 10-28 的 13 轮里 `action: new` 出现 0 次，
+    # 而同期有 5 个无卡可接的事件簇——每轮都没错，代价是卡库不生长。
+    #
+    # 注意这里**不设每日额度闸**。`max_new_cards_per_day` 从 ADR-0014 落地起
+    # 就没被触碰过（13 轮用了 0 次），真正的限流在成文侧（每日 1 篇，ADR-0059
+    # 已给它补了消费者）。留一个从不生效的额度闸，只会让人以为系统有节流。
+    # 它仍作为 `limits` 的一个字段留在输入包里，说明「不是无限建」的意图。
+    #
+    # 判据只有一条：到期议题必须**被处理**。处理有两种形态——为它建卡，
+    # 或为它写下不建的理由。两种都算，混着用也算（两个议题到期，建一个、
+    # 对另一个写明理由，是合法的）。所以这里先算「已被处理」的集合，再看差集，
+    # 而不是按 action 分支各写一套。
+    due = []
+    if backlog is not None and card_backlog is not None:
+        due = card_backlog.due_issues(backlog, cards)
+    if due:
+        handled = set()
+        if action == "new":
+            # 建了卡就销账：新卡的议题要在到期名单里（归一化后比较），
+            # 否则说明「到期的是 A 议题，你建的是 B 卡」，那不是在解决它。
+            built = card_backlog.norm_issue(decision.get("new_issue") or "")
+            if any(d["key"] == built for d in due):
+                handled.add(built)
+        reason = decision.get("no_card_reason")
+        reason_keys = set()
+        if isinstance(reason, dict):
+            reason_keys = {card_backlog.norm_issue(k)
+                           for k, v in reason.items() if str(v or "").strip()}
+        elif isinstance(reason, str) and reason.strip():
+            # 一个字符串统管所有到期议题（最常见的情形）
+            reason_keys = {d["key"] for d in due}
+        handled |= reason_keys
+        pending = [d for d in due if d["key"] not in handled]
+        if pending:
+            # 门槛数字读台账里的 `threshold`，与 `due_issues` 实际用的判据同源。
+            # 写死常量会让「改阈值」与「报错文案」分家：判据变成 3 了，提示还说 2。
+            threshold = int((backlog or {}).get("threshold")
+                            or card_backlog.TIMES_SEEN_THRESHOLD)
+            problems.append(
+                "以下议题已达新建门槛（同一议题第 "
+                f"{threshold} 次出现）但仍无卡："
+                f"{card_backlog.fmt_due(pending)}。\n"
+                "你必须逐一二选一：① 建卡（action=new，new_issue 与议题一致，"
+                "并先写下 knowledge/cards/<file>.md）；"
+                "② 给出 no_card_reason 说明为什么还不建——多个议题时写成 "
+                '{"议题名": "理由"} 对象，只有一个时可写字符串。\n'
+                "这不是新门槛，是把原本零成本的那个动作变得有成本——"
+                "此前「建」要动笔，「不建」什么都不用留，所以 13 轮 0 张卡。"
+            )
+
 
     if decision.get("confidence") is None:
         problems.append("必须给出 confidence")
@@ -570,6 +710,8 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="triage 输入包输出路径")
     ap.add_argument("--cooldown-days", type=float, default=3.0, help="冷却期天数（ADR-0014）")
     ap.add_argument("--validate", default=None, help="校验一个决策 JSON 文件")
+    ap.add_argument("--backlog", default=None,
+                    help="议题台账路径；默认 .newsagg/triage/card-backlog.json（ADR-0083）")
     args = ap.parse_args()
 
     root = repo_root()
@@ -595,6 +737,13 @@ def main() -> int:
         "cooldown_days": args.cooldown_days,
     }
 
+    # 议题台账（ADR-0083）。放在 .newsagg/ 而不是 knowledge/：
+    # 它是每日运行的中间产物（哪个议题第几次出现），不是冻结成结论的东西。
+    # 与 ADR-0018 的归属约定一致：knowledge/ 放判断本体，.newsagg/ 放过程状态。
+    backlog_path = Path(args.backlog) if args.backlog else (
+        root / ".newsagg" / "triage" / "card-backlog.json")
+    backlog = card_backlog.load(backlog_path) if card_backlog else None
+
     # 校验模式：只校验，不重写输入包
     if args.validate:
         raw = json.loads(Path(args.validate).read_text(encoding="utf-8"))
@@ -602,7 +751,40 @@ def main() -> int:
         # no_card_available, abstain_reason}；也接受扁平的 decision 对象，
         # 以免调用方必须包一层。
         decision = raw.get("decision", raw)
-        result = validate_decision(decision, cards, cooldown, limits)
+        # 决策文件自带 date 时以它为准：跨零点续跑或重放历史决策时，
+        # 用「今天」去比对 `created` 会把当天的建卡额度算错。
+        day = str(raw.get("date") or "").strip() or f"{now:%Y-%m-%d}"
+        # SKILL.md 规定的输出形状是 `no_card_available` 在**顶层**（决策对象之外），
+        # 但把它写进 `decision` 里是极自然的手误——而这两处的后果都是**静默**的：
+        # 台账不计数（`observe` 读 `raw["no_card_available"]`）、
+        # 闸门看不见到期议题（`due` 恒为空）、附加检查也不报字段缺失。
+        # 于是「第 2 次出现」永远数不出来，整套门槛退回 2026-10-28 之前的样子，
+        # 而退出码仍是 0。实测遇到一次（2026-10-28 自测），所以两种位置都接受，
+        # 并统一成顶层形状再往下走。
+        for key in ("no_card_available", "low_confidence_skipped"):
+            if key not in raw and isinstance(decision, dict) and key in decision:
+                raw[key] = decision[key]
+        # `no_card_reason` 方向相反：它读自 `decision`（与 `money_point` 同层，
+        # 因为它是**这一轮决策**的一部分，不是候选事件的注解）。但 SKILL.md 的
+        # 示例里它与 `no_card_available` 相邻，很容易被写到顶层——那样闸门会
+        # 看不见它，于是「写了理由却仍被判缺理由」。两边都接受。
+        if isinstance(decision, dict) and "no_card_reason" not in decision:
+            top = raw.get("no_card_reason")
+            if top not in (None, "", {}, []):
+                decision["no_card_reason"] = top
+        # ── 先记账，再校验（ADR-0083）──
+        # 顺序不能反。若先校验后记账，那么「第二次出现」这一天校验看到的仍是
+        # 1 次 → 闸门不响，真正的拦截要等到**第三次**，门槛整体晚了一轮
+        # （2026-10-28 自测实测到这个 off-by-one）。
+        #
+        # 即使校验没过也记：`observe` 按**天**去重，同一天改完决策重跑不会
+        # 重复计数（一天里主流程可能跑多轮，同一条新闻每轮都在候选池里）。
+        # 而 `no_card_reason` 恰恰是校验失败的常见原因——那条理由必须留下来，
+        # 否则「第 2 次了还没建，理由是什么」永远答不出来。
+        if card_backlog:
+            touched = card_backlog.observe(backlog, raw, cards, day)
+        result = validate_decision(decision, cards, cooldown, limits,
+                                   backlog=backlog, day=day)
         # 附带简报相关的结构检查（不计入 ok，但会在简报中用到）
         extras = []
         for key in ("low_confidence_skipped", "no_card_available"):
@@ -625,9 +807,33 @@ def main() -> int:
                                 f"{key}[{i}] 缺 {field} 字段"
                                 f"（简报靠它渲染，缺了会变成空条目；现有键：{sorted(it)}）"
                             )
+                    # ADR-0083：`issue` 是议题台账的计数键。缺了它，这一条
+                    # 「无卡可接」进不了台账，「第二次出现」就永远数不出来——
+                    # 那正是 13 轮 0 张卡的直接原因。所以它是硬字段。
+                    if key == "no_card_available" and not str(it.get("issue") or "").strip():
+                        extras.append(
+                            f"{key}[{i}] 缺 issue 字段（该议题的名字，用作新建卡台账的计数键）。"
+                            f"措辞请与上一轮保持一致，否则会计成两个议题——"
+                            f"归一化只去标点不合并语义（ADR-0083）"
+                        )
         if extras:
             result["problems"].extend(extras)
             result["ok"] = False
+
+        # ── 落盘并回显台账（ADR-0083）──
+        # 记账已在校验**之前**做完（理由见上）。这里只负责保存与回显：
+        # 保存无论如何都要发生——校验失败的那一轮，`no_card_reason` 与出现次数
+        # 都是真实发生过的事实，不能因为校验没过就丢掉。
+        if card_backlog:
+            card_backlog.save(backlog_path, backlog)
+            result["backlog"] = {
+                "path": str(backlog_path),
+                "attached": touched["attached"],
+                "bumped": touched["bumped"],
+                "reasons": touched["reasons"],
+                "due_after": [d["issue"] for d in card_backlog.due_issues(backlog, cards)],
+            }
+
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
 
@@ -638,6 +844,7 @@ def main() -> int:
             root / ".newsagg" / "triage",
             root,
         ),
+        backlog=backlog,
     )
     pkg["limits"] = limits
 
@@ -662,6 +869,15 @@ def main() -> int:
             "note": pkg["trend_summary"]["note"],
         },
         "limits": limits,
+        # 到期议题要出现在人看得见的日志里（ADR-0083）。与 trend 同理：
+        # 一个只在 JSON 里存在的信号等于没有信号——编排器只打印这段。
+        "backlog": {
+            "path": str(backlog_path),
+            "open_issues": len(pkg["backlog"]["open_issues"]),
+            "due": pkg["backlog"]["due"],
+            "note": ("due 非空时本轮必须为它建卡或写下 no_card_reason"
+                     if pkg["backlog"]["due"] else "无到期议题"),
+        },
     }, ensure_ascii=False, indent=2))
     return 0
 

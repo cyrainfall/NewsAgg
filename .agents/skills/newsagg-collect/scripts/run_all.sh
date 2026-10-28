@@ -719,6 +719,12 @@ if [[ -z "$AFTER_TRIAGE" && -z "$AFTER_WRITE" ]]; then
        knowledge/cards/<file>.md（五节结构：当前判断 / 依据事实 /
        修订史 / 可接住的事件类型 / 边界与反方），并把文件名填进
        decision.card_file
+     · 注意输入包顶层的 backlog.due（ADR-0083）：里面每个议题都已达
+       新建门槛（同一议题第 2 次出现）。对它们只能二选一——这一轮为
+       它建卡，或写 no_card_reason 说明为什么还不建。多个议题同时到期
+       时 no_card_reason 写成 {"议题名": "理由"}。
+     · no_card_available 的每个条目必须带 issue（议题名，台账的计数键）。
+       缺了它这一条就进不了台账，下次出现也认不出来是同一件事。
   3. 跑校验：
      "$PY" .agents/skills/newsagg-triage/scripts/triage.py \\
        --validate ${DEC}

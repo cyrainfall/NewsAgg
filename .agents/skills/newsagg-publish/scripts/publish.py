@@ -405,12 +405,21 @@ def read_ledger(path: Path) -> list[dict]:
 def repo_root_of(ledger_path: Path) -> Path:
     """从账本路径反推仓库根。
 
-    账本路径固定是 `<root>/.newsagg/publish-ledger.jsonl`，所以上溯两级就是根。
-    之所以不直接用 `repo_root()`：这个函数是 publish.py 的既有风格（`root`
-    由 main() 传进来），从路径反推能保证「算的就是这个账本所在的那棵树的
-    归档」。
+    账本路径固定是 `<root>/.newsagg/publish-ledger.jsonl`，所以上溯两级就是根
+    （`publish-ledger.jsonl` → `.newsagg` → `<root>`）。
+
+    ⚠️ 2026-10-28 修：这里原本写的是 `parent.parent.parent`——**上溯了三级**，
+    于是它返回仓库的**父目录**，`read_merged()` 去找
+    `<仓库父目录>/.newsagg/publish-ledger.jsonl` 与 `<仓库父目录>/reports/publish-ledger.jsonl`，
+    两个都不存在 → 合并账本恒为空 → `count_published_today()` **永远返回 []**
+    → 「每日 1 篇」这道闸**从 ADR-0074 落地起就一直在空转**。
+
+    它与本函数的文档字符串直接矛盾（文档写「上溯两级」），而
+    `count_published_today` 当时没有任何测试覆盖，所以一直没人发现。
+    判据一直摆在那里（ADR-0014 定参数、ADR-0059 加闸门），缺的是
+    「有东西在跑它」——ADR-0057 的同一条判据。
     """
-    return Path(ledger_path).resolve().parent.parent.parent
+    return Path(ledger_path).resolve().parent.parent
 
 
 # ADR-0014 锁定的运行参数：每日发布上限 1 篇。

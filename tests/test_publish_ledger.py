@@ -177,5 +177,74 @@ class SyncArchiveTest(unittest.TestCase):
             self.assertNotIn("leaked", content)
 
 
+class DailyLimitGateTest(unittest.TestCase):
+    """「每日 1 篇」这道闸的门源（ADR-0014 / ADR-0059）。
+
+    ## 为什么这个测试必须存在
+
+    这道闸从 ADR-0074 落地起就**一直在空转**：`publish.py` 的
+    `repo_root_of()` 上溯了三级而不是两级，于是它去找**仓库父目录**下的
+    账本——那里什么都没有，`read_merged()` 恒返回空，`count_published_today()`
+    恒返回 `[]`，闸门永远放行。
+
+    它此前没有任何测试覆盖，而闸门「不报错、只是不拦」的失败形态意味着
+    症状永远不会显现，直到某天真发了两篇。ADR-0057 的判据在这里正好适用：
+    **测试只存在于有东西跑它的时候。**
+
+    钉住两件事：
+    1. `repo_root_of()` 必须真的指回仓库根（`<root>/.newsagg/publish-ledger.jsonl`
+       的上两级）。
+    2. 端到端：写一条今天真发的记录 → 闸门必须看见它。
+    """
+
+    def _load_publish(self):
+        import importlib.util
+
+        path = ROOT / ".agents" / "skills" / "newsagg-publish" / "scripts" / "publish.py"
+        spec = importlib.util.spec_from_file_location("_pub_under_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_repo_root_of_points_at_repo_root(self) -> None:
+        """账本是 `<root>/.newsagg/publish-ledger.jsonl`，上两级就是根。"""
+        pub = self._load_publish()
+        fake_root = Path(tempfile.gettempdir()) / "newsagg-repo-x"
+        ledger = fake_root / ".newsagg" / "publish-ledger.jsonl"
+        self.assertEqual(pub.repo_root_of(ledger), fake_root.resolve())
+
+    def test_gate_counts_todays_publish(self) -> None:
+        """今天真发了一篇 → 闸门必须数到 1（这正是空转时做不到的）。"""
+        pub = self._load_publish()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ledger = root / ".newsagg" / "publish-ledger.jsonl"
+            _write(ledger, [
+                {"at": "2026-10-28T00:44:59+08:00", "slug": "a", "mode": "publish",
+                 "verdict": "title_found"},
+            ])
+            done = pub.count_published_today(ledger, "2026-10-28")
+            self.assertEqual(len(done), 1, "当天已发的必须被数到")
+            self.assertEqual(done[0]["slug"], "a")
+
+    def test_gate_ignores_preview_drafts_and_accidents(self) -> None:
+        """dry-run 的草稿不消耗额度；误发也不占额度（ADR-0059 的两条例外）。"""
+        pub = self._load_publish()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ledger = root / ".newsagg" / "publish-ledger.jsonl"
+            _write(ledger, [
+                {"at": "2026-10-28T10:00:00+08:00", "slug": "draft", "mode": "dry-run",
+                 "verdict": "draft_saved"},
+                {"at": "2026-10-28T11:00:00+08:00", "slug": "acc", "mode": "publish",
+                 "verdict": "title_found", "accidental": True},
+                {"at": "2026-10-27T21:00:00+08:00", "slug": "yesterday", "mode": "publish",
+                 "verdict": "title_found"},
+            ])
+            self.assertEqual(pub.count_published_today(ledger, "2026-10-28"), [])
+            self.assertEqual(len(pub.count_published_today(ledger, "2026-10-27")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

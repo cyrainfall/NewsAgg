@@ -7,7 +7,7 @@ covered_events:
   - 2026-10-14 Gemini 4 Argon 上线（能力持平 + 成本降至对手 60%）
   - 2026-10-19 DeepSeek 在 10 月 17 日无预告把 API 切到 V4.1-Flash-1017，同时上线自研的 Search / Fetch 接口；10 月 18 日公布计费：每 1000 次成功请求 5 元，并说明 Harness / Claude Code / Codex 中的服务端搜索抓取此前未计费，11 月 1 日起开始收费。同期多方实测指出该模型在「许愿式编程」上确有跃升，但思考 token 消耗大、输出预算不足时会被硬截断。
   - 2026-10-23 AI 视频这条链上，价格战已经打完并反转成定价权：上游模型厂商开始涨价与缩水积分（即梦首充从 6 月 3999 元涨到 4999 元、年卡积分从每月 15000 缩到 6160，LibTV 年卡上调至少 1000 元，Seedance 一家独大），下游承制单价与商单量同时下滑（传统商单锐减 40%，AI 视频报价 300 元/15 秒），而供给端因为 5 人团队能日产上千条、单条成本不到 5 元而变得极度拥挤。省下的生产成本没有留在创作者手里，被上游收走了
-  - 2026-10-29 2026-10-29 一天之内 AI 榜首两度易主，同时两家厂商的定价动作把「同质化」从说法变成了可核对的数字：Artificial Analysis 发布 Intelligence Index v5，Claude Opus 5.5 以 58 分登顶（GPT-6 Astra 57 分），几小时后 Gemini 4 Carbon 以 59 分反超；在 Cognition 的 FrontierCode 2.0 上（132 项真实开源库任务，按维护者是否愿意合并计分），Opus 5.5 max 档 46%、GPT-6 Astra / GPT-6.1 Terra / Claude Sonnet 5.5 max 档全部卡在 42%。有人从 data.json 里扒出隐藏模型 Obsidian 3（高推理 46.8%，疑似未发布的 Fable 5.5），它把 Opus 5.5（45.5%）踩在脚下，但成本约为其 3.6 倍。同一天 OpenAI 上线 GPT-6.1 Terra：输入/输出单价从每百万 2/12 美元降到 1/5 美元，缓存输入 0.05 美元；AA 实测 max 档得分比旧版高 6 分，平均任务成本从 1.40 美元降到 0.40 美元，但 DesignArena 的同一道题里新版耗时近 4 倍、token 多 48%。
+  - 2026-10-29 一天之内 AI 榜首两度易主，同时两家厂商的定价动作把「同质化」从说法变成了可核对的数字：Artificial Analysis 发布 Intelligence Index v5，Claude Opus 5.5 以 58 分登顶（GPT-6 Astra 57 分），几小时后 Gemini 4 Carbon 以 59 分反超；在 Cognition 的 FrontierCode 2.0 上（132 项真实开源库任务，按维护者是否愿意合并计分），Opus 5.5 max 档 46%、GPT-6 Astra / GPT-6.1 Terra / Claude Sonnet 5.5 max 档全部卡在 42%。有人从 data.json 里扒出隐藏模型 Obsidian 3（高推理 46.8%，疑似未发布的 Fable 5.5），它把 Opus 5.5（45.5%）踩在脚下，但成本约为其 3.6 倍。同一天 OpenAI 上线 GPT-6.1 Terra：输入/输出单价从每百万 2/12 美元降到 1/5 美元，缓存输入 0.05 美元；AA 实测 max 档得分比旧版高 6 分，平均任务成本从 1.40 美元降到 0.40 美元，但 DesignArena 的同一道题里新版耗时近 4 倍、token 多 48%。
 source: 种子卡（人工植入，ADR-0007）
 ---
 # 大模型价格战是能力同质化的信号

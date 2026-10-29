@@ -93,11 +93,25 @@ class TestRealOutputs(unittest.TestCase):
                 self.assertEqual(expect, tags["ending_mode"]["mode"])
 
     def test_only_two_documented_cases_hit(self):
-        """先例段只有 10-19 命中、引自己上一篇只有 10-22 命中。
+        """先例段只有 10-19 命中；引自己上一篇是一张**显式白名单**。
 
-        这两条是全库仅有的真实命中（见复盘）。如果某天标记词被放宽到会
-        误命中，这两条断言里的「恰好一个」会先炸——这比等到人肉复核更早。
+        先例段（`has_precedent`）的标记词宁可漏检不可误标，全库仍只允许 10-19
+        一个命中——这条断言不动。
+
+        `quotes_own_prior` 不同：散文规则第 15 条**明确允许**一篇引一句自己
+        上一篇的结论，所以命中集本来就会随成稿增长（2026-10-29 那篇就按第 15
+        条引了 10-23 的结论）。原来断言「恰好等于 [10-22]」，形态是「守规矩的
+        成稿每天都会把 CI 打红」——一条对正确行为报错的测试，只会训练人忽略它。
+        改成白名单后它守的东西没变，而且更强了一点：**多出来的 slug 必须显式
+        写进来**，写的时候人就得看一眼「这是真引了自己，还是标记词放宽造成的
+        误命中」。
         """
+        known_prior = [
+            "2026-10-22-deepseek-per-card-economics-splits-ai-capital",
+            # 引 2026-10-23《AI视频省下的成本，正被模型厂商收走》的结论：
+            # 「省下的成本没留在创作者手里，被上游收走了」（规则第 15 条，一句）。
+            "2026-10-29-token-unit-price-vs-task-cost",
+        ]
         prec, prior = [], []
         for p in OUTPUTS:
             tags = pr.tag_body(p.read_text(encoding="utf-8"), self.rules)
@@ -106,7 +120,9 @@ class TestRealOutputs(unittest.TestCase):
             if tags["quotes_own_prior"]["hit"]:
                 prior.append(p.stem)
         self.assertEqual(["2026-10-19-deepseek-search-per-call-pricing"], prec)
-        self.assertEqual(["2026-10-22-deepseek-per-card-economics-splits-ai-capital"], prior)
+        self.assertEqual(sorted(known_prior), prior,
+                         msg="quotes_own_prior 的命中集变了：新命中的要看一眼是"
+                             "真引了自己上一篇，还是标记词被放宽导致的误命中")
 
 
 class TestMarkerRegressions(unittest.TestCase):

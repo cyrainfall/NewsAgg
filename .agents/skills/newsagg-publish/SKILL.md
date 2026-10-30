@@ -308,6 +308,59 @@ python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py draft-count
 
 这四个都是**只读**，已实测可用（2026-10-25）。
 
+## 修改与删除：人手里的两条刀（ADR-0087）
+
+CLI 现在有 `detail` / `edit` / `delete` 三条命令。前一条只读，后两条默认拒绝执行。
+
+```bash
+# 只读：线上这一篇到底是什么
+python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py \
+  --cookie-file .newsagg/toutiao-cookies.json detail --gid <19位>
+
+# 删除（不可逆）：标题闸 + 风险闸，之后必反查
+python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py \
+  --cookie-file .newsagg/toutiao-cookies.json \
+  delete --gid <19位> --expect-title '平台上现在的标题' --allow-unverified-write
+
+# 改写：先落快照到 .newsagg/snapshots/，再写，再反查
+python3 .agents/skills/newsagg-publish/scripts/toutiao_api.py \
+  --cookie-file .newsagg/toutiao-cookies.json \
+  edit --gid <19位> --expect-title '平台上现在的标题' \
+  --md outputs/<slug>.md --allow-unverified-write
+```
+
+**`--expect-title` 不是可选装饰。** gid 是 19 位数字，抄错一位就是另一篇文章；两条
+命令都先读回平台当前标题、**全等**才动手。少给这个参数，命令根本跑不起来。
+
+**`edit` 走不通，而且 2026-10-30 深夜已经把原因钉死了**：抓包拿到真实 publish body
+（27 字段）原样重放——**连 `msToken` / `a_bogus` 一起带上**——仍然 `7050`。
+所以纯 HTTP 写路径不是「字段没对齐」，是**请求环境绑定**（TLS/UA/头序/签名），
+urllib 复现不了。`edit` 会在 7050 处给出解释性错误，不假装成功。
+
+**真要改稿只能走浏览器**，而且有三处坑（都已实测）：
+
+| 环节 | 做法 | 坑 |
+|---|---|---|
+| 标题 | `fill()` | 无 |
+| 正文 | 真实剪贴板 + `Ctrl+V` | 合成的 `ClipboardEvent` ProseMirror 不认：DOM 变了、状态机没变，发出去还是旧正文 |
+| 发布 | 点 `button` 本身 | 点里面的 `span` 只弹预览 |
+| 确认状态 | 读「共 N 字」 | 唯一能证明状态已提交的信号 |
+
+**`修改审核中` 期间平台锁死编辑**：编辑页单选框列表为空、点发布不发请求。
+任何自动化在这个窗口内都会「点了没反应」，只能等审核结束。而且平台允许
+**部分生效**——标题先上线、正文等审核，读者可能看到「新标题 + 旧正文」。
+
+**`delete` 是通的**，但 `type` 与题材的映射尚未在真实目标上确认（实测 1–7 合法、
+0 与 ≥8 回 `1002 无效题材类型`；哪个是图文没有证据）。CLI 默认 `--type 1`；
+**第一次真删之前先在可弃目标上确认一次**，并把结果补进 ADR-0087。
+
+两条硬规矩：
+
+1. **编排器不调用这两条命令。** ADR-0017 定的边界没变：系统不自动删改已发布内容。
+   补全能力 ≠ 放开自动化 —— 这条线由「谁在调用」决定。
+2. **改稿消耗次数。** 平台对已发布文章有修改次数上限（详情里的
+   `remain_modify_count`，实测剩 5 次）。`edit` 在写之前检查它，撞到 0 直接拒绝。
+
 ### 服务器上没有 Chrome 时：用注入的 cookie（ADR-0071）
 
 服务器上 `from_browser()` 直接失败（`CookieError: 找不到浏览器 chrome 的 profile`），

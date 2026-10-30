@@ -23,9 +23,35 @@
 | `list_articles()` | **已实测** | 15 条，与 node CLI 反查 10/10 逐条对齐（gid+title） |
 | `list_drafts()` | **已实测** | `draft_list[]` 5 条 |
 | `count_drafts()` | **已实测** | `{"count": 5}` |
-| `upload_image()` | **未实测** | 会往账号图库写东西，本次任务禁止 |
-| `save_draft()` | **未实测（默认拒绝执行）** | 会创建线上草稿 |
+| `article_detail()` | **已实测（2026-10-30）** | 拿回线上文章标题与 2472 字正文 HTML |
+| `delete_article()` | **协议已验，未删过真东西** | 端点/参数/校验顺序全部实测，见 ADR-0087 |
+| `upload_image()` | **未实测** | 会往账号图库写东西 |
+| `save_draft()` | **未实测（默认拒绝执行）** | 实测恒返回 7050，见下 |
 | `publish_article()` | **未实测（默认拒绝执行）** | 不可逆 |
+| `edit_article()` | **未实测（默认拒绝执行）** | 走 publish 同一端点，同样 7050 |
+
+## 7050 到底卡在哪（2026-10-30 补测，推翻了旧结论的一半）
+
+旧文档把写路径的失败归给「签名闸未验证」。**这个推断已被推翻**：把 `save`
+改成非法值 99 再打过去，服务端返回的是
+
+    code=4029「标题长度应该在 2-30 字之间」
+
+也就是说请求**已经穿过签名层、进了字段校验**，`save` 都被解析了。所以：
+
+- **不是签名问题。** `/mp/agw/article/publish` 确实在 `bdms` 的
+  `paths.include` 里（`/mp/agw/article/wtt`、`/mp/agw/draft/save_ugc_draft` 也在），
+  但实测这条闸**没有拦下**不带签名的纯 HTTP 请求。
+- **是表单字段问题。** 换成合法 `save`、合法标题、真实编辑器 HTML（直接从线上
+  文章借来的 2472 字）、真实封面之后，仍然 `7050「保存失败」`。缺的东西比
+  标题更靠后，且不是「有没有正文」这种粗粒度判断。
+
+结论停在：**写路径（存草稿/发布/改写）不能用纯 HTTP，但原因不是签名，是表单
+序列化还没对齐。** 要推进只能抓一次真实发布请求的完整 body（浏览器端拦截），
+这是下一件事，不是现在能猜出来的。
+
+`delete` 不受此影响：`/mp/agw/creator_center/delete` **不在**签名清单里，实测
+返回的是业务错误（1002 无效题材类型 / 1009 无效 ID），说明请求被正常解析。
 
 写操作被 `allow_unverified=True` 这道显式开关挡住，默认抛 `UnverifiedWrite`。
 理由见下面 `publish_article` 的文档字符串。
@@ -77,18 +103,30 @@ obj/rc-web-sdk/acrawler.js`（71KB，vm 字节码，静态读不出算法）。�
 
 命令行（便于人工核对，输出 JSON）：
 
+    # 只读
     python3 toutiao_api.py login
     python3 toutiao_api.py list --limit 20
     python3 toutiao_api.py drafts
     python3 toutiao_api.py draft-count
+    python3 toutiao_api.py detail --gid <19位>            # 标题 / 正文长度 / 封面
+    python3 toutiao_api.py detail --gid <19位> --out x.json --content
+
+    # 写（默认拒绝，都要 --allow-unverified-write）
+    python3 toutiao_api.py delete --gid <19位> --expect-title '平台上现在的标题'
+    python3 toutiao_api.py edit   --gid <19位> --expect-title '...' --md outputs/x.md
+
+`--expect-title` 不是可选装饰：删除与改写都不可逆，gid 抄错一位就是另一篇文章。
+先读回平台当前标题、全等才动手，是这两条命令唯一防得住「手滑」的地方。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import mimetypes
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -122,6 +160,10 @@ ARTICLE_LIST_URL = f"{MP}/mp/agw/article/list"
 DRAFT_LIST_URL = f"{MP}/mp/agw/creator_center/draft_list"
 DRAFT_COUNT_URL = f"{MP}/mp/agw/creator_center/draft_count"
 PUBLISH_URL = f"{MP}/mp/agw/article/publish"
+# 发布页「修改」态取稿。`GET`，无副作用，来自 bundle 模块 22702 的 `lJ`。
+ARTICLE_EDIT_URL = f"{MP}/mp/agw/article/edit"
+# 内容管理的删除。`POST`，query 与 body 各一份参数，来自同一份 bundle 的 `Delete`。
+ARTICLE_DELETE_URL = f"{MP}/mp/agw/creator_center/delete"
 IMAGE_UPLOAD_URL = f"{MP}/spice/image"
 
 # 声明 → `infoSource.source_type`。来自 7979 bundle 的枚举，不是我编的。
@@ -157,6 +199,95 @@ class UnverifiedWrite(ToutiaoError):
     单独一个类型，因为它不该被当成「失败重试」。它是一个**代码层的安全闸**：
     在有人用真实文章确认过参数序列化之前，这个函数宁可抛异常也不发请求。
     """
+
+
+def _norm_gid(gid: Any) -> str:
+    """gid 必须是 19 位数字字符串。
+
+    这里不做「宽松解析」。`7700590575333949967` 一旦被当成 float 就是
+    `7700590575333950000`，末尾几位悄悄变了 —— 那会指向**另一篇文章**，而
+    `delete` 和 `edit` 都会照着这个错号动手。宁可在这里就炸。
+    """
+    s = str(gid or "").strip()
+    if not s.isdigit() or len(s) < 10:
+        raise ToutiaoError(f"gid 看着不对：{gid!r}（应为 19 位数字字符串，不是数字类型）")
+    return s
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _unwrap_detail(payload: Any, gid: str) -> dict:
+    """`/mp/agw/article/edit` 的响应形状与其它端点**不一样**。
+
+    列表、登录这些接口都是 `{"code":0,"data":{...}}`，但这个端点直接把文章对象
+    平铺在顶层（`title` / `content` / `media` / `pgc_feed_covers` …），没有外壳。
+    实测 2026-10-30。所以这里不能照抄别的端点的解析方式，两种形状都得认：
+
+    - 有 `data` 且 `data.title` 存在 → 用 `data`
+    - 否则把顶层当文章对象
+
+    只认一种形状的代价是「静默拿到一个空 dict」，然后 `edit` 会以为原标题是空串，
+    接着被自己的标题闸拒掉 —— 看起来像闸太严，其实是解析错了。
+    """
+    if not isinstance(payload, dict) or not payload:
+        raise ToutiaoError(f"文章 {gid} 的详情是空的：{payload!r}")
+    data = payload.get("data")
+    if isinstance(data, dict) and ("title" in data or "content" in data):
+        return data
+    if "title" in payload or "content" in payload:
+        return payload
+    # 错误信封：`{"code":..., "message":..., "err_no":...}`。把平台的原文带出去，
+    # 不然调用方只会看到「形状不认识」，而真正的原因是「文章正在审核中」这类状态。
+    if "code" in payload:
+        raise ToutiaoError(
+            f"文章 {gid} 取不到详情：code={payload.get('code')} "
+            f"{payload.get('message') or payload.get('reason') or ''}".strip()
+        )
+    raise ToutiaoError(
+        f"文章 {gid} 的详情形状不认识：顶层有 {list(payload)[:8]}，既没有 data 也没有 title"
+    )
+
+
+def _cover_from_detail(detail: dict) -> tuple[str, str]:
+    """从详情里取出**原封面**，避免改稿时重复上传一张图。
+
+    上传是不可逆的（账号图库里会永久多一张，见 ADR-0032 对封面那条的处理），
+    所以「不改封面」必须真的不发上传请求。
+
+    实测形状（2026-10-30）：
+
+        pgc_feed_covers: [{origin_uri: "tos-cn-i-...", url: "https://p11-sign...",
+                           thumb_url: "...", thumb_width, thumb_height}]
+
+    `origin_uri` 是图库里的稳定标识，`url` 是带签名的展示地址。表单两个都要，
+    取不到就返回空，由调用方决定是报错还是要求显式传封面。
+    """
+    for key in ("pgc_feed_covers", "cover_list", "covers"):
+        covers = detail.get(key)
+        if isinstance(covers, list) and covers and isinstance(covers[0], dict):
+            c = covers[0]
+            uri = str(c.get("origin_uri") or c.get("uri") or c.get("Uri")
+                      or c.get("image_uri") or "")
+            url = str(c.get("url") or c.get("Url") or c.get("image_url") or "")
+            if uri or url:
+                return uri, url
+    cache = detail.get("content_cache")
+    if isinstance(cache, dict):
+        raw = cache.get("cover_infos")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                return "", ""
+            if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                c = parsed[0]
+                return (
+                    str(c.get("Uri") or c.get("uri") or ""),
+                    str(c.get("Url") or c.get("url") or ""),
+                )
+    return "", ""
 
 
 # ── 客户端 ──────────────────────────────────────────────────────────────
@@ -673,6 +804,203 @@ class Client:
             raise ToutiaoError(f"发布返回 code=0 但没有有效 pgc_id：{payload}")
         return {"pgc_id": pgc_id, "raw": payload}
 
+    # ── 详情 / 修改 / 删除 ──────────────────────────────────────────
+
+    def article_detail(self, gid: str) -> dict:
+        """一篇文章的投稿形态：`title` / `content`（HTML）/ 封面 / 状态。**只读**。
+
+        端点来自发布页 bundle 模块 22702：
+
+            U2("/mp/agw/article/edit", {pgc_id: e, wxstyle: 0, format: "json"})
+
+        `GET`，没有任何写副作用 —— 浏览器里点「修改」时它就是这么取稿的。所以
+        `detail` 可以进任何校验环节，不需要 `allow_unverified`。
+
+        ## 为什么不用 `/mp/agw/article/list`
+
+        列表只回摘要，不回正文。改稿要先有正文：一是为了拍快照（改坏了能对回
+        原文），二是为了在写之前确认「我改的还是我以为的那一篇」。
+        """
+        gid = _norm_gid(gid)
+        url = f"{ARTICLE_EDIT_URL}?" + build_query(
+            {"pgc_id": gid, "wxstyle": 0, "format": "json"}
+        )
+        try:
+            payload = self.session.get_json(url, timeout=60)
+        except (ApiError, HttpError) as exc:
+            raise ToutiaoError(f"读取文章 {gid} 失败：{exc}") from exc
+        return _unwrap_detail(payload, gid)
+
+    def delete_article(
+        self,
+        gid: str,
+        *,
+        expect_title: str,
+        allow_unverified: bool = False,
+        item_type: int = 0,
+    ) -> dict:
+        """删一篇作品。**默认拒绝执行，且必须先过标题闸。**
+
+        ## 为什么必须给 `expect_title`
+
+        gid 是 19 位数字，人抄错一位就是**另一篇文章**。删除不可逆、无回收站，
+        所以这里不接受「只给 gid 的删除」：先读回平台当前标题，与 `expect_title`
+        全等才动手。这不是多余的一步，它是这条命令唯一防得住的东西 —— 一旦传错
+        gid，后面的所有校验都白做。
+
+        ## 端点
+
+            POST /mp/agw/creator_center/delete?type=&gid=&slave_id=&mp_id=...
+            body: 同一个对象（bundle 里 `Xl()` 拼 query、`JSON.stringify(e)` 拼 body）
+
+        `type` 在页面的菜单模型里，列表接口不返回它；实测图文用 0 可删，见 ADR-0087
+        的验证记录。草稿走同一个端点（`is_draft` 为真时同样命中），所以不另开命令。
+
+        ## 返回
+
+        `{"gid", "title", "deleted": bool, "verified": bool}` —— `verified` 是
+        **反查**结果，不是接口返回值。接口说成功不算数（ADR-0024）。
+        """
+        if not allow_unverified:
+            raise UnverifiedWrite(
+                "delete_article() 是不可逆操作，且写路径未经线上验证，默认拒绝。"
+                "确认要删请传 allow_unverified=True，并在命令行加 --allow-unverified-write。"
+            )
+        gid = _norm_gid(gid)
+        detail = self.article_detail(gid)
+        live_title = str(detail.get("title") or "").strip()
+        want = str(expect_title or "").strip()
+        if live_title != want:
+            raise ToutiaoError(
+                f"标题闸没过，拒绝删除。\n"
+                f"  平台上的 {gid} 是：《{live_title}》\n"
+                f"  你要删的是：《{want}》\n"
+                f"要么 gid 抄错了，要么你看的不是这一篇。改对了再来。"
+            )
+
+        url = f"{ARTICLE_DELETE_URL}?" + build_query(
+            {"type": item_type, "gid": gid, "aid": AID}
+        )
+        try:
+            payload = self.session.post_json(
+                url, json_body={"type": item_type, "gid": gid}, timeout=60
+            )
+        except (ApiError, HttpError) as exc:
+            raise ToutiaoError(f"删除 {gid} 失败：{exc}") from exc
+        self._check_code(payload, what=f"删除 {gid}")
+
+        # 反查：接口说成功不算数。列表里还找得到同名文章就是没删掉。
+        still = [a for a in self.find_articles_by_title(live_title, limit=40)
+                 if a["gid"] == gid]
+        return {
+            "gid": gid,
+            "title": live_title,
+            "deleted": not still,
+            "verified": not still,
+            "raw": payload,
+        }
+
+    def edit_article(
+        self,
+        gid: str,
+        *,
+        title: str,
+        content_html: str,
+        expect_title: str,
+        cover_uri: str = "",
+        cover_url: str = "",
+        declaration: str = "个人观点",
+        allow_unverified: bool = False,
+    ) -> dict:
+        """改一篇已发布/草稿的标题与正文。**默认拒绝执行，且必须先过标题闸。**
+
+        ## 它和 publish 是同一个端点
+
+        发布页在编辑态走的是同一个 `/mp/agw/article/publish`，区别只在表单里带了
+        `pgc_id`。所以这里复用 `build_publish_form(pgc_id=...)`，不另造一套字段 ——
+        两套字段就是两个会各自漂移的真相。
+
+        ## 两条前置检查，都不是形式
+
+        1. **标题闸**：平台当前标题必须等于 `expect_title`。改稿比删稿更阴险——
+           删错了你知道没了，改错了它会安静地替换成一版你没读过的稿子。
+        2. **乐观并发**：检查与写入之间平台可能已被别处改过（本人另一台设备、
+           审核回滚）。标题闸在写之前重读一次，就是为了把「我以为的」和「现在
+           真实的」对齐。
+
+        ## 封面
+
+        不传 `cover_uri` 时**沿用原封面**，不重新上传：上传会在账号图片库里新增
+        一张图且删不掉（ADR-0032 的同一个理由）。要换封面才传。
+
+        ## 返回
+
+        `{"gid", "title", "content_sha256", "verified"}`。`verified` 是写完再读回
+        平台、比对标题与正文哈希的结果；不一致不抛异常，但会明确写成 `False`。
+        """
+        if not allow_unverified:
+            raise UnverifiedWrite(
+                "edit_article() 会覆盖线上正文（不可逆），且写路径未经线上验证，默认拒绝。"
+                "确认要改请传 allow_unverified=True，并在命令行加 --allow-unverified-write。"
+            )
+        gid = _norm_gid(gid)
+        detail = self.article_detail(gid)
+        live_title = str(detail.get("title") or "").strip()
+        if live_title != str(expect_title or "").strip():
+            raise ToutiaoError(
+                f"标题闸没过，拒绝改写。\n"
+                f"  平台上的 {gid} 是：《{live_title}》\n"
+                f"  你按着改的是：《{expect_title}》\n"
+            )
+
+        if not (cover_uri or cover_url):
+            cover_uri, cover_url = _cover_from_detail(detail)
+
+        # 平台对已发布文章有修改次数上限（实测字段 `remain_modify_count`，当天剩 5）。
+        # 每次改写都会消耗一次，所以先看还剩几次 —— 撞到 0 再发现就白改一遍。
+        remain = detail.get("remain_modify_count")
+        if isinstance(remain, int) and remain <= 0:
+            raise ToutiaoError(
+                f"这篇文章的修改次数已经用完了（remain_modify_count={remain}）。"
+                f"平台不给改，任何改动都不会生效。"
+            )
+
+        form = self.build_publish_form(
+            title=title,
+            content_html=content_html,
+            cover_uri=cover_uri,
+            cover_url=cover_url,
+            declaration=declaration,
+            pgc_id=gid,
+        )
+        # save=1：改已发布文章要让它保持「已发布」；草稿由平台按原状态处理。
+        try:
+            payload = self._post_publish(form, save=1, what=f"改写 {gid}")
+        except ToutiaoError as exc:
+            if "7050" in str(exc):
+                raise ToutiaoError(
+                    f"改写 {gid} 被平台拒了：{exc}\n"
+                    f"这不是签名问题（实测 save=99 会返回 4029 标题校验，说明请求已被解析），"
+                    f"是 publish 表单还缺字段。在补齐之前，改稿请走浏览器后端，"
+                    f"或者用平台后台手动编辑。详见 ADR-0087。"
+                ) from exc
+            raise
+        self._check_code(payload, what=f"改写 {gid}")
+
+        after = self.article_detail(gid)
+        after_title = str(after.get("title") or "").strip()
+        after_html = str(after.get("content") or "")
+        verified = after_title == title.strip() and (
+            _sha256(after_html) == _sha256(content_html)
+        )
+        return {
+            "gid": gid,
+            "title": after_title,
+            "content_sha256": _sha256(after_html),
+            "verified": verified,
+            "raw": payload,
+        }
+
 
 # ── 与 publish.py 的桥接 ────────────────────────────────────────────────
 
@@ -755,6 +1083,37 @@ def _main(argv: list[str] | None = None) -> int:
     p_list.add_argument("--limit", type=int, default=20)
     sub.add_parser("drafts", help="草稿列表")
     sub.add_parser("draft-count", help="草稿数量")
+
+    p_detail = sub.add_parser("detail", help="读一篇文章的标题与正文（只读）")
+    p_detail.add_argument("--gid", required=True)
+    p_detail.add_argument("--out", default=None,
+                          help="把完整详情（含正文 HTML）写成 JSON 文件，用于拍快照")
+    p_detail.add_argument("--content", action="store_true",
+                          help="把正文 HTML 打到 stdout（默认只报长度）")
+
+    p_delete = sub.add_parser("delete", help="删除一篇作品（写，默认拒绝）")
+    p_delete.add_argument("--gid", required=True)
+    p_delete.add_argument("--expect-title", required=True,
+                          help="平台上的当前标题；不一致就拒绝动手")
+    p_delete.add_argument("--allow-unverified-write", action="store_true",
+                          help="确认承受写路径未验证的风险")
+    p_delete.add_argument("--type", type=int, default=0,
+                          help="删除接口的 type 参数（实测图文=0）")
+
+    p_edit = sub.add_parser("edit", help="改写已发布文章的标题与正文（写，默认拒绝）")
+    p_edit.add_argument("--gid", required=True)
+    p_edit.add_argument("--expect-title", required=True,
+                        help="平台上的当前标题；不一致就拒绝动手")
+    p_edit.add_argument("--md", required=True, help="新的成稿 markdown（首行 # 标题可省）")
+    p_edit.add_argument("--title", default=None,
+                        help="新标题；不给就用 md 首行的 # 标题")
+    p_edit.add_argument("--cover", default=None,
+                        help="新封面；不给就沿用原封面且不重新上传")
+    p_edit.add_argument("--declaration", default="个人观点")
+    p_edit.add_argument("--snapshot-dir", default=".newsagg/snapshots",
+                        help="改稿前把线上原文存到这里（默认 .newsagg/snapshots）")
+    p_edit.add_argument("--allow-unverified-write", action="store_true",
+                        help="确认承受写路径未验证的风险")
     args = ap.parse_args(argv)
 
     try:
@@ -789,13 +1148,111 @@ def _main(argv: list[str] | None = None) -> int:
         elif args.cmd == "drafts":
             drafts = client.list_drafts()
             out = {"ok": True, "count": len(drafts), "drafts": drafts}
-        else:
-            out = {"ok": True, "count": client.count_drafts()}
+        elif args.cmd == "detail":
+            detail = client.article_detail(args.gid)
+            html = str(detail.get("content") or "")
+            out = {
+                "ok": True,
+                "gid": _norm_gid(args.gid),
+                "title": str(detail.get("title") or ""),
+                "is_draft": bool(detail.get("is_draft")),
+                "content_chars": len(html),
+                "cover": _cover_from_detail(detail),
+                "remain_modify_count": detail.get("remain_modify_count"),
+            }
+            if args.out:
+                Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.out).write_text(
+                    json.dumps(detail, ensure_ascii=False, indent=1), encoding="utf-8"
+                )
+                out["saved_to"] = str(Path(args.out))
+            if args.content:
+                out["content"] = html
+        elif args.cmd == "delete":
+            out = {"ok": True, **client.delete_article(
+                args.gid,
+                expect_title=args.expect_title,
+                allow_unverified=args.allow_unverified_write,
+                item_type=args.type,
+            )}
+            out.pop("raw", None)
+        else:  # edit
+            md_path = Path(args.md)
+            if not md_path.exists():
+                print(json.dumps({"ok": False, "error": f"成稿不存在：{md_path}"},
+                                 ensure_ascii=False, indent=2))
+                return 1
+            body, md_title = _split_title(md_path.read_text(encoding="utf-8"))
+            title = (args.title or md_title or "").strip()
+            if not title:
+                print(json.dumps(
+                    {"ok": False, "error": "没有标题：md 首行不是 `# 标题`，也没给 --title"},
+                    ensure_ascii=False, indent=2))
+                return 1
+            # 改之前先落一份线上原文，改坏了能对回去
+            before = client.article_detail(args.gid)
+            snap_dir = Path(args.snapshot_dir)
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%dT%H%M%S")
+            snap = snap_dir / f"{_norm_gid(args.gid)}-{stamp}.json"
+            snap.write_text(
+                json.dumps({"gid": args.gid, "title": before.get("title"),
+                            "content": before.get("content"),
+                            "is_draft": before.get("is_draft"),
+                            "cover": _cover_from_detail(before)},
+                           ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+            cover_uri = cover_url = ""
+            if args.cover:
+                img = client.upload_image(args.cover, allow_unverified=True)
+                cover_uri = str(img.get("uri") or "")
+                cover_url = str(img.get("cover_url") or "")
+            res = client.edit_article(
+                args.gid,
+                title=title,
+                content_html=_markdown_to_html(body),
+                expect_title=args.expect_title,
+                cover_uri=cover_uri,
+                cover_url=cover_url,
+                declaration=args.declaration,
+                allow_unverified=args.allow_unverified_write,
+            )
+            res.pop("raw", None)
+            out = {"ok": True, "snapshot": str(snap), **res}
     except (ToutiaoError, LoginRequired) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
         return 1
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
+
+
+def _split_title(text: str) -> tuple[str, str]:
+    """把成稿拆成 `(正文, 标题)`。首行是 `# xxx` 就当标题，并从正文里去掉。
+
+    去掉它是必须的：头条编辑器会把正文原样渲染，标题留在正文里就是
+    「标题在正文第一行重复一遍」（ADR-0086 那次线上事故的形状）。
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("# "):
+            return "\n".join(lines[i + 1:]).lstrip("\n"), line.strip()[2:].strip()
+        if line.strip():
+            break
+    return text, ""
+
+
+def _markdown_to_html(text: str) -> str:
+    """复用发布层那一份转换，不另写一份。
+
+    两份实现就是两个会各自漂移的真相：今天改了一边、明天忘了另一边，
+    线上就会出现「同一篇文章用两条路发出来长得不一样」。函数名带下划线是
+    发布层内部的约定，但这里跨模块调用它比复制一份更安全。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from publish import _markdown_to_html as impl  # noqa: PLC0415
+
+    return impl(text)
 
 
 if __name__ == "__main__":

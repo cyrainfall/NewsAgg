@@ -47,6 +47,39 @@ SOURCE_TTL_MINUTES = {
 }
 DEFAULT_SOURCE_TTL_MINUTES = 60.0  # DailyHotApi 默认 CACHE_TTL=3600s
 
+# 各源的**请求超时**（秒）。默认值来自 `--timeout`（`main()` 的 20 秒），
+# 但 github 必须更长：它在 DailyHotApi 里是唯一**自己回源抓 HTML**的源
+# （`src/routes/github.ts:121` 直接 fetch 网页，不是调一个 JSON 接口），
+# 且自带 3 次重试、每次 abort 在 20 秒（`:112` `maxRetries = 3`、`:119`）。
+# 也就是说它最坏要 **60 秒**才回话。
+#
+# 客户端若仍用 20 秒，会在服务端还在重试时先弃权，把 `timed out` 写进 failures ——
+# **真错误永远进不了账本与简报**。2026-10-30 实测正是这个形状：
+# `reference/DailyHotApi/logs/error.log` 里三次都是 `fetch failed`（3 次重试后放弃），
+# 而候选文件里记的是 `timed out`，简报于是只能说"github 失败"，
+# 说不出"它通过代理连 github.com 时 TLS 握手被中断"。错误文本指向了错误的方向，
+# 和 ADR-0057（假的绿色）、ADR-0081（空转的闸）是同一类：**观测失真的代价大于故障本身**。
+#
+# 75 秒 = 3 × 20 秒 + 余量。代价是 github 真挂时该轮采集多等约 55 秒；
+# 一天三次采集，最坏多 2 分 45 秒，是可接受的确定性成本。
+SOURCE_TIMEOUTS = {
+    "github": 75,
+}
+
+# 预筛**除 title 之外还匹配 desc** 的源。
+#
+# 预筛默认只看 title：热榜的 title 就是那条内容本身，而 desc 常是不相干的摘要，
+# 全源一起匹配会把"消费电子评测"因为提到 AI 灌进池子（赛道预筛精度靠这个）。
+# github 是唯一例外：它的 title 是**英文仓库名**（`claude-mem` / `OpenBot` /
+# `ziwei-doushu`），中文关键词表基本命中不了，而它的 desc 是一句完整的项目说明——
+# 那个字段才是内容本身。
+# 2026-10-30 实测：15 条 trending 里只有 `claude-mem` 能靠仓库名命中 `Claude`；
+# 而它在连续成功采集的两天（10-27、10-28）进池条目都是 **0 条**，
+# 所以"这个源到底有没有用"在预筛改掉之前**根本测不出来**——
+# 一个每轮 0 产出、却唯一依赖代理的源，光看失败率会让人误判它"只是不稳定"。
+DESC_MATCH_SOURCES = {"github"}
+
+
 # 陈旧阈值 = max(配置阈值, 源自身 TTL × STALE_TTL_FACTOR)。
 #
 # 为什么是乘一个系数而不是加「最大采集间隔」：在一次**采集时刻**能观察到的
@@ -151,6 +184,9 @@ def normalize_dailyhot(source: str, payload: dict) -> tuple[list[dict], dict]:
                 "source": source,
                 "id": str(raw.get("id") or ""),
                 "title": title,
+                # desc 是上游给的条目描述，此前被丢掉。它是 github 唯一能命中
+                # 中文赛道词的字段（title 是英文仓库名），见 DESC_MATCH_SOURCES。
+                "desc": (raw.get("desc") or raw.get("description") or "").strip(),
                 "hot": normalize_hot(raw.get("hot") if raw.get("hot") is not None else raw.get("hotValue")),
                 "url": raw.get("url") or raw.get("mobileUrl") or "",
                 "cover": raw.get("cover") or "",
@@ -235,8 +271,11 @@ def niche_prescreen(items: list[dict], keywords: list[str]) -> tuple[list[dict],
 
     kept, dropped = [], []
     for it in items:
-        title = it["title"]
-        hits = [kw for kw, pat in zip(keywords, patterns) if pat.search(title)]
+        # 匹配字段：默认只 title；github 额外含 desc（见 DESC_MATCH_SOURCES 的长注释）
+        text = it["title"]
+        if it.get("source") in DESC_MATCH_SOURCES:
+            text = f"{text}\n{it.get('desc') or ''}"
+        hits = [kw for kw, pat in zip(keywords, patterns) if pat.search(text)]
         if hits:
             it = {**it, "niche_hits": hits[:5]}
             kept.append(it)
@@ -245,12 +284,17 @@ def niche_prescreen(items: list[dict], keywords: list[str]) -> tuple[list[dict],
     return kept, dropped
 
 
+def source_timeout(source: str, default: int) -> int:
+    """该源的请求超时（秒）。默认用 `--timeout`，个别源见 `SOURCE_TIMEOUTS`。"""
+    return int(SOURCE_TIMEOUTS.get(source, default))
+
+
 def collect(sources: list[str], base: str, timeout: int) -> tuple[list[dict], list[dict], list[dict]]:
     """返回 (all_items, source_meta, failures)。单源失败不影响其余源。"""
     all_items, meta, failures = [], [], []
     for source in sources:
         try:
-            payload = http_json(f"{base}/{source}", timeout=timeout)
+            payload = http_json(f"{base}/{source}", timeout=source_timeout(source, timeout))
             if payload.get("code") not in (200, None):
                 raise ValueError(f"code={payload.get('code')}")
             items, m = normalize_dailyhot(source, payload)

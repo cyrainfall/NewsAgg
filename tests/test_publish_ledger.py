@@ -246,5 +246,63 @@ class DailyLimitGateTest(unittest.TestCase):
             self.assertEqual(len(pub.count_published_today(ledger, "2026-10-27")), 1)
 
 
+class PublishBodyFileTest(unittest.TestCase):
+    """交给平台的正文不能带标题行（2026-10-30 实测：手机上标题显示了两遍）。
+
+    根因不是排版，是**同一个语义有两个输入源**：`read_publish_snapshot()` 早就把
+    标题与正文分开了（api 写路径一直传 strip 后的 `body`），浏览器写路径却重新读了
+    `outputs/<slug>.md` 原文件。而浏览器恰好是生产路径（ADR-0073/0080），于是每一篇
+    的正文第一行都是 `# 标题`，平台又把标题渲染在标题栏——读者看到两遍。
+
+    连带后果值得单独记：`prose_tags` 也是按 strip 后的 `body` 算的，所以「标签算的
+    那份正文」与「平台收到的那份正文」不是同一份。修法是让两条写路径共用同一份。
+    """
+
+    def _load_publish(self):
+        import importlib.util
+
+        path = ROOT / ".agents" / "skills" / "newsagg-publish" / "scripts" / "publish.py"
+        spec = importlib.util.spec_from_file_location("_pub_body_under_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_body_file_drops_title_line(self) -> None:
+        pub = self._load_publish()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "outputs"
+            out.mkdir(parents=True)
+            (out / "2026-10-30-x.md").write_text(
+                "# 一个标题\n\n第一段。\n\n第二段。\n", encoding="utf-8")
+
+            title, body = pub.read_publish_snapshot(out, "2026-10-30-x")
+            self.assertEqual(title, "一个标题")
+            self.assertFalse(body.lstrip().startswith("# "), "正文不该再带标题行")
+
+            p = pub.write_body_file(root, "2026-10-30-x", body)
+            self.assertTrue(p.exists())
+            self.assertEqual(p.read_text(encoding="utf-8"), body,
+                             "正文必须逐字节交出去，不能顺手删改别的")
+            self.assertNotIn("一个标题", p.read_text(encoding="utf-8"), "标题不该出现在正文里")
+            self.assertIn(".newsagg", str(p), "临时正文放 .newsagg/tmp（gitignore，事后可核对）")
+
+    def test_browser_publish_uses_stripped_body(self) -> None:
+        """源码级断言：浏览器路径必须交 strip 后的正文，而不是原文件。
+
+        这一条钉的是「线有没有接上」——2026-10-30 之前这里写的是
+        `--content-file outputs/<slug>.md`，功能测试全绿，只有人在手机上才看得见。
+        """
+        src = (ROOT / ".agents" / "skills" / "newsagg-publish" / "scripts"
+               / "publish.py").read_text(encoding="utf-8")
+        # 用 assertTrue 而不是 assertIn：assertIn 失败时会把整个源文件打出来，
+        # 报告里只剩下几千行源码，真正的那一句反而找不到。
+        self.assertTrue("str(write_body_file(root, args.slug, body))" in src,
+                        "浏览器路径没有交 strip 后的正文（write_body_file）")
+        self.assertFalse('"--content-file", str(root / "outputs" / f"{args.slug}.md")' in src,
+                         "又改回传原文件了：正文会带上标题行，平台上标题显示两遍")
+
+
 if __name__ == "__main__":
     unittest.main()

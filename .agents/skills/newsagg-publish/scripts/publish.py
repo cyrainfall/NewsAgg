@@ -367,6 +367,30 @@ def read_publish_snapshot(out_dir: Path, slug: str) -> tuple[str, str] | None:
     return title, body
 
 
+def write_body_file(root: Path, slug: str, body: str) -> Path:
+    """把**去掉标题行**的正文写成 toutiao-ops 要读的文件。
+
+    为什么需要这一步（2026-10-30 用户在手机上看到重复标题后倒查）：
+    浏览器写路径此前直接把 `outputs/<slug>.md` 整份交给 toutiao-ops，而那份
+    文件的第一行是 `# 标题`。平台把标题当**独立字段**渲染在标题栏，正文里那行
+    H1 于是成了标题的第二遍。
+
+    更值得记的是它为什么会漂移：`read_publish_snapshot()` 早就把标题与正文分开
+    了，**api 写路径一直传 strip 过的 `body`**，只有浏览器路径重新读了原文件。
+    同一个语义两个输入源，而浏览器恰好是生产路径（ADR-0073/0080）。连带后果：
+    `prose_tags` 也是拿 strip 后的 `body` 算的 —— 标签算的那份正文，和平台收到
+    的那份，不是同一份。
+
+    写进 `.newsagg/tmp/`（gitignore）而不是 `tempfile`：路径固定，事后能直接
+    打开核对这一次到底交了什么给平台。
+    """
+    tmp_dir = root / ".newsagg" / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out = tmp_dir / f"publish-{slug}-body.md"
+    out.write_text(body, encoding="utf-8")
+    return out
+
+
 def snapshot_fingerprint(md_path: Path) -> dict:
     """记录发布那一刻成稿的指纹（ADR-0036）。
 
@@ -920,7 +944,10 @@ def main() -> int:
         else:
             cmd = ["publish", "article",
                    "--title", title,
-                   "--content-file", str(root / "outputs" / f"{args.slug}.md"),
+                   # 交**去掉标题行**的正文：标题已经是独立字段，正文再带一次
+                   # H1 就是平台上的重复标题（2026-10-30 实测）。同时让 api 与
+                   # browser 两条写路径用同一份正文（prose_tags 一直是按它算的）。
+                   "--content-file", str(write_body_file(root, args.slug, body)),
                    "--cover", str(Path(args.cover).resolve()),
                    "--cover-mode", "single",
                    "--declaration", args.declaration,

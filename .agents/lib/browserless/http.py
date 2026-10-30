@@ -20,8 +20,10 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import ssl
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -91,6 +93,69 @@ class Response:
         return self.body.decode("utf-8", errors="replace")
 
 
+_WINDOWS_EXPOSURE_SIDS = (
+    ("S-1-1-0", "Everyone"),
+    ("S-1-5-32-545", "BUILTIN\\Users"),
+    ("S-1-5-11", "Authenticated Users"),
+)
+
+
+def _check_cookie_file_exposure(p: Path, st: os.stat_result) -> None:
+    """cookie 文件的「别的用户能不能读」闸。按平台分叉，判据都是真实系统状态。
+
+    ## POSIX
+
+    `mode & 0o077` 必须为 0。防的是一次 `chmod 644` 手滑。
+
+    ## Windows
+
+    NTFS 没有 POSIX 位：`os.stat()` 对任何普通文件都返回 `0o666`，拿 mode 判
+    等于「永远拒绝」。真实的判据是 DACL，而 `icacls` 的中文名会随系统语言变
+    （Everyone / 所有人 / Jeder），所以按 **SID** 查、不按名字查：
+
+        icacls <file> /findsid S-1-1-0
+
+    退出码 0 = 找到该条目。找到任意一个「非本机管理员组」的宽口径主体就拒绝。
+
+    ## 判不出来就拒绝（fail closed）
+
+    `icacls` 不存在、超时、返回码既不是 0 也不是 1332 —— 一律拒绝并说清原因。
+    这里宁可挡住一次正常使用，也不能在「不知道谁能读」的情况下把会话凭证
+    加载进来；那是把「我不知道」写成「应该没事」。
+    """
+    if os.name != "nt":
+        if st.st_mode & 0o077:
+            raise CookieError(
+                f"cookie 文件 {p} 权限太宽（mode={oct(st.st_mode & 0o777)}）："
+                f"组/其他用户可读就等于把账号交出去。"
+                f"改成 `chmod 600 {p}` 再试。"
+            )
+        return
+
+    for sid, label in _WINDOWS_EXPOSURE_SIDS:
+        try:
+            proc = subprocess.run(
+                ["icacls", str(p), "/findsid", sid],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CookieError(
+                f"cookie 文件 {p} 的 ACL 查不出来（icacls 调用失败：{exc}）。"
+                f"Windows 上没有 mode 位可判，查不出来就按「可能泄露」处理。"
+            ) from exc
+        if proc.returncode == 0:
+            raise CookieError(
+                f"cookie 文件 {p} 的 ACL 太宽：`{label}`（{sid}）能读。"
+                f"收干净再试：\n"
+                f'    icacls "{p}" /inheritance:r /grant:r "%USERNAME%":R'
+            )
+        if proc.returncode != 1332:  # 1332 = 没找到该 SID，是正常结果
+            raise CookieError(
+                f"cookie 文件 {p} 的 ACL 查不出来：icacls 返回 {proc.returncode}，"
+                f"既不是「找到」也不是「没找到」。按「可能泄露」处理。"
+            )
+
+
 class Session:
     """带 Cookie 的 HTTP 会话。
 
@@ -149,6 +214,11 @@ class Session:
         （即 `mode & 0o077` 必须为 0），否则拒绝加载并说清怎么改。
         这不是「安全最佳实践」的泛泛建议——它防的是一次 `chmod 644` 手滑。
 
+        Windows 上这条判据**恒假也恒真**：NTFS 没有 POSIX 位，`os.stat()` 对
+        任何普通文件都返回 `0o666`，于是 `0o666 & 0o077 == 0o066` 恒为真——
+        所有 cookie 文件都会被拒，包括 ACL 已经收干净的那些。所以按平台分叉：
+        POSIX 看 mode 位，Windows 看 DACL（见 `_check_cookie_file_exposure`）。
+
         ## 为什么不提供「从环境变量读」
 
         环境变量会进 `ps e`、进 shell history、进 systemd unit 文件。
@@ -162,12 +232,7 @@ class Session:
         except OSError as exc:
             raise CookieError(f"读不到 cookie 文件 {p}：{exc}") from exc
 
-        if st.st_mode & 0o077:
-            raise CookieError(
-                f"cookie 文件 {p} 权限太宽（mode={oct(st.st_mode & 0o777)}）："
-                f"组/其他用户可读就等于把账号交出去。"
-                f"改成 `chmod 600 {p}` 再试。"
-            )
+        _check_cookie_file_exposure(p, st)
         try:
             payload = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

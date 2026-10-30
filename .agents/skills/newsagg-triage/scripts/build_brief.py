@@ -327,6 +327,18 @@ def build_brief(decision: dict, card: dict | None, style: dict, target_words: st
     lines.append("    而钩子和推荐流读者之间没有信任可透支（第 6 条仍要求第一段就给判断）。")
     lines.append("    注意这是**设问**，不是「创业者的 Why」（模型 1 / 启发式 1 明确不做，见规则文件第三节）。")
     lines.append("")
+    lines.append("### 平台格式（2026-10-31 实测，n=7，`platforms/toutiao-format.md`）")
+    lines.append("20. **首段压到 60 字以内，只放一句判断。** 平台样本首段中位 38 字，我们 15 篇中位 97 字。")
+    lines.append("    首段的作用是把人从信息流拽进正文，不是交代背景——背景挪到第二段。")
+    lines.append("    第 6 条（第一段就给判断）不变，这条只是把它压短：判断在前，理由在后。")
+    lines.append("21. **小标题 0~2 个。** 平台 7 篇里 6 篇**完全没有小标题**（唯一有的那篇是 2 个），")
+    lines.append("    我们 15 篇中位 5 个。小标题一多，1500 字的稿子会变成汇报材料，而推荐流的读者是竖着滑的。")
+    lines.append("    仍要小标题时，按第 7 条写成读者利益句。")
+    lines.append("22. **篇幅往短端写。** 目标仍是 1200–1800，但平台正文中位 1504 字、我们中位 2343 字。")
+    lines.append("    写到 1800 以内就停，不要为了「讲透」继续堆——删掉技术段落后钱落点仍站得住（第 17 条）。")
+    lines.append("23. **不要写「如图」「见下图」这类占位。** 平台正文中位 2 张内文图，而本系统目前**没有**")
+    lines.append("    正文插图能力（只有封面，见 `platforms/toutiao-format.md` 的已知缺口），写了就是空指。")
+    lines.append("")
 
     # ── 正文观察项（`platforms/prose-rules.md`）──
     # 只说明"会被记什么"，**不印标记词**。这是刻意的：把「先别」「记下来」这些词

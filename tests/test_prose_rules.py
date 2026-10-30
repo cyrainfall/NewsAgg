@@ -111,6 +111,9 @@ class TestRealOutputs(unittest.TestCase):
             # 引 2026-10-23《AI视频省下的成本，正被模型厂商收走》的结论：
             # 「省下的成本没留在创作者手里，被上游收走了」（规则第 15 条，一句）。
             "2026-10-29-token-unit-price-vs-task-cost",
+            # 引 2026-10-27《H200租金涨143%》里「从挂牌租金转向有效卡时」的判断，
+            # 用来把它挪到公司层面（规则第 15 条，一句）。
+            "2026-10-30-google-free-cash-flow-flips-negative",
         ]
         prec, prior = [], []
         for p in OUTPUTS:

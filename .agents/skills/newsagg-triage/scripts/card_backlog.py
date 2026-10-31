@@ -112,31 +112,78 @@ def _entry(issue: str, day: str) -> dict:
         "first_seen": day,
         "last_seen": day,
         "days": [],
+        # 这个议题**已经见过的报道**（URL 集合）。计数键从「议题 × 天」扩成
+        # 「议题 × 报道」：同一篇文章在热榜上挂两天，不该被数成「第二次出现」。
+        # 2026-10-31 实测的正是这个形状——10-29 那两条议题，10-30 候选池里
+        # 出现的仍是**同一 URL 的原报道**，按天计数它们就该被逼着建卡了。
+        "urls_seen": [],
         "card_file": None,
         "reasons": {},
         "events": [],
     }
 
 
-def _touch(entry: dict, day: str, event: str = "") -> bool:
-    """记一次出现。同一天重复调用只算一次（返回 False 表示已记过）。
+def _norm_urls(urls) -> list[str]:
+    """把决策里的 urls 收成去重、有序、只留 http(s) 的列表。"""
+    out: list[str] = []
+    for u in urls or []:
+        s = str(u or "").strip()
+        if not s.lower().startswith(("http://", "https://")):
+            continue
+        if s not in out:
+            out.append(s)
+    return out
 
-    为什么按天去重：一天里主流程可能跑多次（白天 3 次采集 + 21:00 主流程），
-    同一条新闻在每一轮都会重新出现在候选池里。若按轮计数，一个议题
-    「出现 2 次」只需要半天，门槛就退回成「每轮都可能建卡」。
+
+def _touch(entry: dict, day: str, event: str = "", urls=None) -> bool:
+    """记一次出现。返回 True 表示**这一次计入 `times_seen`**。
+
+    两重去重，缺一不可：
+
+    1. **按天**（原有）：一天里主流程可能跑多次（白天 3 次采集 + 21:00 主流程），
+       同一条新闻每轮都会重新出现在候选池里；按轮计数会让「出现 2 次」只需半天。
+    2. **按报道**（2026-10-31 加）：同一篇文章在热榜上挂两三天，**每天都会再被
+       分拣看见一次**。按天计数会把「一篇挂了三天」读成「三次出现」，逼着建一张
+       没有新证据支撑的卡——而阈值 2 的全部意义是「不是孤例」。
+
+    所以判据是：**只要这一次带来了没见过的 URL，才算新的一次出现**；URL 都见过，
+    就只更新 `last_seen` 与事件列表，不计数。没有给 `urls` 的（老决策、老条目）
+    退回按天计数，保持历史语义不变。
     """
     days = entry.setdefault("days", [])
-    if day in days:
+    seen = entry.setdefault("urls_seen", [])
+    norm = _norm_urls(urls)
+    fresh = [u for u in norm if u not in set(seen)]
+    if fresh:
+        seen.extend(fresh)  # 证据集无论计不计数都要更新
+
+    if norm:
+        counted = bool(fresh) and day not in days
+    else:
+        # 没有可用 URL（老决策，或 urls 里全是空值/非 http）：退回按天计数。
+        # 注意判据用的是**归一化之后**的列表——不能因为调用方填了个空数组就
+        # 静默把这一次丢掉，那会让计数悄悄变少，而台账的全部价值在于可信。
+        counted = day not in days
+
+    if not counted:
+        entry["last_seen"] = day
+        if event:
+            _append_event(entry, day, event, counted=False)
         return False
+
     days.append(day)
     entry["times_seen"] = int(entry.get("times_seen") or 0) + 1
     entry["first_seen"] = entry.get("first_seen") or day
     entry["last_seen"] = day
     if event:
-        evs = entry.setdefault("events", [])
-        evs.append({"date": day, "event": str(event)[:200]})
-        del evs[:-10]  # 只留最近 10 条：台账是计数器，不是档案
+        _append_event(entry, day, event, counted=True)
     return True
+
+
+def _append_event(entry: dict, day: str, event: str, *, counted: bool) -> None:
+    evs = entry.setdefault("events", [])
+    evs.append({"date": day, "event": str(event)[:200], "counted": counted})
+    del evs[:-10]  # 只留最近 10 条：台账是计数器，不是档案
 
 
 def card_issue_index(cards: list[dict]) -> dict:
@@ -207,7 +254,7 @@ def observe(data: dict, decision: dict, cards: list[dict], day: str) -> dict:
             if hit:
                 e["card_file"] = hit
                 continue
-        if _touch(e, day, it.get("event", "")):
+        if _touch(e, day, it.get("event", ""), it.get("urls")):
             touched["bumped"].append(e["issue"])
 
     # ── 3) 到期了但这一轮决定不建：理由必须留下 ──

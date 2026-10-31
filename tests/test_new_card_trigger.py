@@ -164,6 +164,79 @@ class BacklogCountingTest(unittest.TestCase):
         self.assertEqual(e["card_file"], CARD["file"])
 
 
+class UrlSetCountingTest(unittest.TestCase):
+    """计数键从「议题 × 天」扩成「议题 × 报道」（2026-10-31）。
+
+    起因是一个真实的形状：10-29 记进台账的两条议题，第二天候选池里出现的
+    **仍是同一 URL 的原报道**（热榜挂着没掉）。按天计数，它们第二天就够 2 次、
+    被逼着建卡——而「第二次出现」的全部意义是「不是孤例」，同一篇文章挂两天
+    证明的是热榜没换，不是议题复发。
+    """
+
+    def _d(self, urls):
+        item = {"issue": "AI 输出致害的责任归属", "event": "e", "why": "x"}
+        if urls is not None:
+            item["urls"] = urls
+        return {"decision": {"action": "skip"}, "no_card_available": [item]}
+
+    def _entry(self, b):
+        return b["issues"][backlog_mod.norm_issue("AI 输出致害的责任归属")]
+
+    def test_same_article_two_days_counts_once(self):
+        b = backlog_mod.empty_backlog()
+        u = ["https://www.36kr.com/p/4045728212341632"]
+        backlog_mod.observe(b, self._d(u), [CARD], "2026-10-30")
+        touched = backlog_mod.observe(b, self._d(u), [CARD], "2026-10-31")
+        e = self._entry(b)
+        self.assertEqual(1, e["times_seen"], "同一篇报道挂两天不该被数成两次")
+        self.assertEqual([], touched["bumped"])
+        self.assertEqual("2026-10-31", e["last_seen"], "还是要更新最近出现时间")
+
+    def test_new_article_counts(self):
+        b = backlog_mod.empty_backlog()
+        backlog_mod.observe(b, self._d(["https://a.example/1"]), [CARD], "2026-10-30")
+        touched = backlog_mod.observe(b, self._d(["https://a.example/2"]), [CARD], "2026-10-31")
+        self.assertEqual(2, self._entry(b)["times_seen"], "换了一篇报道才算新的一次")
+        self.assertEqual(1, len(touched["bumped"]))
+
+    def test_new_article_alongside_old_one_counts(self):
+        """第二天两篇报道里有一篇是新的 → 算新的一次（哪怕另一篇还是旧的）。"""
+        b = backlog_mod.empty_backlog()
+        backlog_mod.observe(b, self._d(["https://a.example/1"]), [CARD], "2026-10-30")
+        backlog_mod.observe(
+            b, self._d(["https://a.example/1", "https://a.example/2"]), [CARD], "2026-10-31")
+        self.assertEqual(2, self._entry(b)["times_seen"])
+
+    def test_same_day_new_url_still_one(self):
+        """同一天出现两篇不同报道，仍算一次——按天去重的语义不变。"""
+        b = backlog_mod.empty_backlog()
+        backlog_mod.observe(b, self._d(["https://a.example/1"]), [CARD], "2026-10-31")
+        backlog_mod.observe(b, self._d(["https://a.example/2"]), [CARD], "2026-10-31")
+        self.assertEqual(1, self._entry(b)["times_seen"])
+
+    def test_without_urls_falls_back_to_day_counting(self):
+        """老决策没有 urls：保持历史语义（按天），不然会静默减少所有历史计数。"""
+        b = backlog_mod.empty_backlog()
+        backlog_mod.observe(b, self._d(None), [CARD], "2026-10-30")
+        backlog_mod.observe(b, self._d(None), [CARD], "2026-10-31")
+        self.assertEqual(2, self._entry(b)["times_seen"])
+
+    def test_non_http_entries_are_ignored(self):
+        """urls 里混进空值/相对路径时不能让计数变成「永远是新报道」。"""
+        b = backlog_mod.empty_backlog()
+        backlog_mod.observe(b, self._d(["", "not-a-url"]), [CARD], "2026-10-30")
+        e = self._entry(b)
+        self.assertEqual([], e["urls_seen"])
+        self.assertEqual(1, e["times_seen"])
+
+    def test_url_set_is_recorded_as_evidence(self):
+        b = backlog_mod.empty_backlog()
+        backlog_mod.observe(b, self._d(["https://a.example/1", "https://a.example/1"]),
+                            [CARD], "2026-10-30")
+        self.assertEqual(["https://a.example/1"], self._entry(b)["urls_seen"],
+                         "证据集要去重")
+
+
 class NewCardGateTest(unittest.TestCase):
     """闸：到期议题必须二选一——建卡，或写下不建的理由。"""
 

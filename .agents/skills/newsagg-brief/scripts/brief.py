@@ -326,6 +326,21 @@ def section_conclusion(decision, publish_recs, date: str, perf: dict | None = No
     # 运行失败优先于一切：此时"没发布"不是判断，是故障。
     rs = run_status or {}
     if rs and not rs.get("ok"):
+        # 例外（2026-10-31 实测）：`daily_limit` 不是故障，是闸门按设计拒绝。
+        # 它此前被渲染成「系统在运行途中失败了」，而 ⑤ 还写着「修复后重跑」——
+        # 照那句话走只有两种结局：重跑仍被拦（白跑一轮），或去掉闸门变成
+        # 重复发文（ADR-0059 的教训）。设计内的拒绝必须与故障分开报。
+        if str(rs.get("stage") or "") == "daily_limit":
+            out += ["**今日额度已用尽，本轮未发布**（ADR-0014：每个日历日最多 1 篇）。",
+                    "",
+                    "> 这是闸门按设计拦下的，**不是故障，也不是弃权**——系统跑完了，只是没发。",
+                    "> **不要重跑，更不要加 `--allow-daily-override`**：那会变成重复发文。",
+                    "> 成稿已经写好并留在本地 `outputs/`，处置见 ⑤。",
+                    ""]
+            detail = (rs.get("detail") or "").strip()
+            if detail:
+                out += ["```", detail[:1200], "```", ""]
+            return out
         out += [f"**本轮运行未完成**（阶段 `{rs.get('stage')}`）：{rs.get('reason')}",
                 "",
                 "> 这不是「今日无选题」，也不是弃权——系统在运行途中失败了。",
@@ -1018,9 +1033,16 @@ def section_actions(publish_recs, candidates, decision, cover_path: Path | None,
     rs = run_status or {}
     if rs and not rs.get("ok"):
         any_item = True
-        out += [f"**本轮运行未完成**：阶段 `{rs.get('stage')}` — {rs.get('reason')}",
-                "  产出可能不完整。修复后重跑：`bash .agents/skills/newsagg-collect/scripts/run_all.sh`",
-                ""]
+        if str(rs.get("stage") or "") == "daily_limit":
+            out += ["**今日额度已用（ADR-0014），本轮未发布**：闸门拦下的，不是故障，系统没有半途而废。",
+                    "  处置二选一：① 明天首条通道把它补发（`bash .agents/skills/newsagg-collect/scripts/run_all.sh --date <今天> --after-write --publish`），"
+                    "② 留作风格教学副本不补发。**别既补发又跑新选题——会撞同一个日历日闸。**",
+                    "  **不要重跑今天的流程，也不要加 `--allow-daily-override`。**",
+                    ""]
+        else:
+            out += [f"**本轮运行未完成**：阶段 `{rs.get('stage')}` — {rs.get('reason')}",
+                    "  产出可能不完整。修复后重跑：`bash .agents/skills/newsagg-collect/scripts/run_all.sh`",
+                    ""]
 
     # 降级完成（ADR-0061）：跑完了，但有一处让步。与 ok=0 分开是因为它的处置
     # 完全不同——不需要「修复后重跑」，只需要人知道「这一轮少了什么」。

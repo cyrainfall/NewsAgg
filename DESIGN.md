@@ -218,6 +218,8 @@
 
  90. **Agent-Reach 终于装上了，但它有三处会随时静默失效的地方（ADR-0089）。** ① **同名陷阱**：`pip install agent-reach` 装的是 Jean Galea 的另一个项目（2 个渠道），上游 `llms.txt` 自己写着「The PyPI package named agent-reach is NOT this project」；真身是 `Panniantong/Agent-Reach`，只能从 GitHub 装。② **接口漂移**：`doctor --json` 在 v1.6.0 已被删除、`doctor` 退化成纯本地状态（不走网络）、真正实测的是 `check`，而渠道表里 `rss`/`exa_search` 两个名字已经不存在。`source_health.py` 原来调的就是 `doctor --json`，所以**装上之后仍会报「读不到」**——「装好」与「接上」是两件事。③ **Windows 两处**：uv 把 console script 装进 `Scripts/` 不是 `bin/`（不补这条就永远「找不到可执行文件」）；`subprocess(text=True)` 按 GBK 解码 UTF-8 JSON 会抛 `UnicodeDecodeError`，而它在 reader 线程里抛，主线程只看到空 stdout。已修：逐渠道 `check`（每渠道 30s 上限，慢的只拖自己）+ `doctor` 只补没实测到的 tier-0 + `missing_channels` 单独上报 + 编码固定 utf-8。**未做的**：没跑 `agent-reach setup`（会把 skill 写进 `~/.agents/skills`，与 ADR-0021 冲突）、没 `add` 任何渠道（那要装 ffmpeg/bili-cli 等二进制）。**会静默失效的假设**：上游若再改 `check`/`doctor` 的形状，两条路径一起失效 → ⑤ 段变成「读不到」；反之，`web` 的 jina 读本机长期 20 秒超时，会让 tier-0 几乎每天都判定 degraded——**如实的，但三个月后若还天天如此，该重定阈值而不是继续报警**。
 
+ 91. **闸门拒绝被渲染成「运行失败」，而简报教人去重跑（ADR-0093）。** `publish.py` 拒绝发布时打印的 JSON 里有 `stage: daily_limit`，但 `run_all.sh` 只取退出码、就地丢掉 stage → `run-status.json` 写成 `stage: publish/ok: false`，`brief.py` 两处渲染又只认 `ok == false` → ①段变成「本轮运行未完成……系统在运行途中失败了」、⑤段附上「修复后重跑」。这句话的两种执行方式都是坏的：重跑仍被同一个闸拦下（白跑，且本身是「对发布的重试」，与 ADR-0059 相抵）；去掉闸门加 `--allow-daily-override` 就是**重复发文**。链路上没有任何一处报错——退出码对、JSON 对、简报也写出来了，错的只是这次拒绝被叫作了什么。已修：编排器用 `tee` 保住输出、命中 `daily_limit` 改报闸门（**只认这一个 stage**，多认会让真失败被误判成设计内）；简报①⑤分开渲染并显式禁止重跑/override；5 个测试含两条**反向断言**（`daily_limit` 的文本不得出现「运行未完成」「修复后重跑」，真故障必须保留「修复后重跑」）。**没修的是撞额度本身**：跨零点运行吃次日额度，四天内两次（10-28、10-31），第二次起因是「零点后改稿重发」。是否把额度改成按内容日计、或禁止零点后重发，是另一个决定。另一半未做：拒绝**没有进发布账本**，所以「哪些天被闸拦过」在账本里查不到，只能从 `run-status.json` 读。
+
 
 
 

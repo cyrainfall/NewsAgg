@@ -894,15 +894,29 @@ if [[ "$MODE" == "publish" ]]; then PUB_FLAG="--mode publish"; else PUB_FLAG="";
 # 归因（"哪些卡跑出了数据"），而账本是唯一的关联点——文章标题会被你改，
 # slug 不会，卡名只能在这一刻从决策文件里取到。dry-run 也记，便于验证。
 CARD="$(dec_field card_file)"
+PUB_OUT="$(mktemp)"
 set +e
 "$PY" .agents/skills/newsagg-publish/scripts/publish.py \
   --slug "$SLUG" --cover "outputs/covers/${SLUG}.png" \
-  ${CARD:+--card-file "$CARD"} $PUB_FLAG
-PUB_RC=$?
+  ${CARD:+--card-file "$CARD"} $PUB_FLAG 2>&1 | tee "$PUB_OUT"
+PUB_RC=${PIPESTATUS[0]}
 set -e
 if [[ $PUB_RC -ne 0 ]]; then
+  # 闸门不是故障（2026-10-31 实测）：publish.py 拒绝发布会打印
+  # `{"ok": false, "stage": "daily_limit", ...}`，而这里原先只看退出码，
+  # 于是「今日额度已用」被渲染成「系统运行途中失败了」，简报⑤还教人
+  # 「修复后重跑」——重跑仍被拦，照它把闸门去掉就是重复发文（ADR-0059）。
+  # 这里只认这一个 stage：它是**设计内的拒绝**，必须与失败分开报。
+  if grep -q '"stage":[[:space:]]*"daily_limit"' "$PUB_OUT" 2>/dev/null; then
+    rm -f "$PUB_OUT"
+    fail_soft "daily_limit" \
+      "今日额度已用（ADR-0014：每个日历日最多 1 篇），闸门按设计拒绝发布；成稿已留在本地，未进草稿箱" \
+      "$SLUG" 1
+  fi
+  rm -f "$PUB_OUT"
   fail_soft "publish" "发布未成功（退出码 ${PUB_RC}；熔断与反查结果见发布账本）" "$SLUG" 1
 fi
+rm -f "$PUB_OUT"
 
 # ── ⑥ 认知写回（ADR-0026：必须在发布成功之后）────────────────────
 if [[ "$MODE" == "publish" ]]; then

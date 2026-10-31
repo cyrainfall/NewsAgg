@@ -454,6 +454,9 @@ def _backlog_echo(item: dict, backlog: dict | None) -> str:
 
 
 def section_overview(candidates, decision, trend_summary=None, backlog=None) -> list[str]:
+    # 输入包给的是台账摘要（没有 `issues`），回声要读完整台账——否则 ② 段那句
+    # 「第 N 次出现」在生产里永远是空的（与 ④ 段同一个缺陷，见 `_load_backlog_full`）。
+    backlog = _load_backlog_full(backlog)
     out = ["## ② 采集与分拣概览", ""]
     if candidates:
         c = candidates.get("counts", {})
@@ -704,6 +707,40 @@ def section_assets(decision, cards_dir: Path, article_slug: str | None = None,
     return out
 
 
+def _load_backlog_full(backlog: dict | None) -> dict | None:
+    """把输入包里的「台账摘要」换成完整台账。
+
+    ⚠️ 这是 2026-10-31 发现的一个**生产里空转、测试里全绿**的缺陷：
+    输入包的 `backlog` 字段给的是摘要——`threshold / review_days / due /
+    open_issues / path`，**没有 `issues`**（那份逐议题的表在台账文件里）。
+    而 ④ 段要按 `issues` 逐条判断「到期未建卡」，于是：
+
+      - 生产：`issues` 读不到 → 到期列表恒空 → 「到期未建卡」与
+        「台账：N 个议题在跟」**从来没印过**；
+      - 测试：用例手造了带 `issues` 的 dict → 全绿。
+
+    这就是本仓库反复出现的那一类（判据接上了、但接错了字段），所以修在
+    消费方而不是让输入包变胖。**注意摘要里连 `path` 都没有**（2026-10-30 实测：
+    只有 `threshold / review_days / due / open_issues / note`），所以真正走的是
+    默认台账路径；`path` 只是给将来留的口子。
+    注意 `backlog is None` 时**不读**——那是「没有台账」（老日期重放），
+    凭空读当天的台账去印「无到期」等于编。
+    """
+    if not isinstance(backlog, dict) or backlog.get("issues"):
+        return backlog
+    mod = _load_card_backlog()
+    if mod is None:
+        return backlog
+    raw_path = backlog.get("path")
+    ledger = (Path(str(raw_path)) if raw_path else
+              repo_root() / ".newsagg" / "triage" / "card-backlog.json")
+    try:
+        full = mod.load(ledger)
+    except (OSError, ValueError):
+        return backlog
+    return full or backlog
+
+
 def _card_stock_lines(cards_dir: Path, backlog: dict | None, date: str) -> list[str]:
     """卡库的两条体检线（ADR-0083）：到期议题、退役候选。
 
@@ -718,6 +755,7 @@ def _card_stock_lines(cards_dir: Path, backlog: dict | None, date: str) -> list[
     out = []
     if not cards_dir.exists():
         return out
+    backlog = _load_backlog_full(backlog)
 
     cards = []
     for p in sorted(cards_dir.glob("*.md")):
@@ -752,9 +790,6 @@ def _card_stock_lines(cards_dir: Path, backlog: dict | None, date: str) -> list[
             out += [f"  - {issue}——第 {n} 次出现（最近 {last}）"]
         if len(due) > 5:
             out += [f"  - 另有 {len(due) - 5} 个"]
-    elif backlog and (backlog.get("issues") or {}):
-        out += [f"- 台账：{len(backlog.get('issues') or {})} 个议题在跟，无到期未建卡"]
-
     # ② 退役候选：建满 30 天，一次都没被 continue（`last_written` 为空）
     # 判定委托给 `card_backlog.retire_candidates`（ADR-0042：同一判据只留一份实现）。
     # 简报这里自己数一遍日期差，就会重演 ADR-0042 的漂移——两份口径一旦分家，
@@ -783,6 +818,14 @@ def _card_stock_lines(cards_dir: Path, backlog: dict | None, date: str) -> list[
         for c in retired[:3]:
             out += [f"  - {c.get('issue')}（{c.get('file')}，已 {c.get('age_days')} 天）"]
         out += ["  - 只是候选：改 `status: retired` 才生效，机器不自动退役"]
+
+    # ③ 两条线都查过、都没东西：要留一行「查过了」。
+    # 这一段此前是静默的：`due` 与 `retired` 都空时 ④ 段只剩「卡总数」，
+    # 读者分不清「今天确实没有」与「这段根本没跑」——而本模块的 docstring
+    # 早就写着「没有就印『无』，一行『无』比整段消失更有用」。承诺与实现分家。
+    if backlog and (backlog.get("issues") or {}) and not due and not retired:
+        out += [f"- 台账：{len(backlog.get('issues') or {})} 个议题在跟，无到期未建卡；"
+                f"无退役候选（建卡满 {review_days} 天起算）"]
     return out
 
 

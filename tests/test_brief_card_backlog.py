@@ -222,5 +222,65 @@ class SectionAssetsWiringTest(unittest.TestCase):
         self.assertIn("到期未建卡", out)
 
 
+class SummaryBacklogTest(unittest.TestCase):
+    """输入包给的是**摘要**，简报要自己读回台账（2026-10-31）。
+
+    这是「测试全绿、生产空转」的又一例：输入包的 `backlog` 字段只有
+    `threshold / review_days / due / open_issues / path`，**没有 `issues`**；
+    而 ④ 段按 `issues` 逐条判「到期未建卡」。用例手造了带 `issues` 的 dict，
+    所以一直绿；生产里那两行（到期未建卡 / 台账在跟）从来没印过。
+    """
+
+    def _write_ledger(self, tmp: Path) -> Path:
+        p = tmp / "card-backlog.json"
+        data = card_backlog.empty_backlog()
+        card_backlog.observe(
+            data,
+            {"decision": {"action": "skip"},
+             "no_card_available": [{"issue": "到期议题", "event": "e", "why": "x"}]},
+            [], "2026-10-20")
+        card_backlog.observe(
+            data,
+            {"decision": {"action": "skip"},
+             "no_card_available": [{"issue": "到期议题", "event": "e2", "why": "x"}]},
+            [], "2026-10-21")
+        card_backlog.save(p, data)
+        return p
+
+    def test_summary_is_resolved_to_full_ledger(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write_ledger(Path(tmp))
+            summary = {"threshold": 2, "due": [{"issue": "到期议题"}],
+                       "open_issues": [], "path": str(p), "note": "有到期"}
+            full = brief._load_backlog_full(summary)
+            self.assertIn("issues", full, "摘要应被换成完整台账")
+            self.assertIn(card_backlog.norm_issue("到期议题"), full["issues"])
+
+    def test_due_line_now_fires_in_production_shape(self):
+        """生产形状（摘要无 issues）下，「到期未建卡」必须真的印出来。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write_ledger(Path(tmp))
+            summary = {"threshold": 2, "due": [], "open_issues": [],
+                       "path": str(p), "note": ""}
+            lines = "\\n".join(brief._card_stock_lines(CARDS, summary, "2026-10-31"))
+            self.assertIn("到期未建卡", lines)
+            self.assertIn("到期议题", lines)
+
+    def test_none_backlog_never_reads_disk(self):
+        """`backlog=None` 是「没有台账」（老日期重放），不许去读当天的文件。"""
+        self.assertIsNone(brief._load_backlog_full(None))
+
+    def test_empty_state_says_checked(self):
+        """两条线都空时留一行「查过了」——承诺在这儿，别再静默。"""
+        lines = "\\n".join(brief._card_stock_lines(
+            CARDS, backlog(times=1), "2026-10-31"))
+        self.assertIn("无到期未建卡", lines)
+        self.assertIn("无退役候选", lines)
+
+
 if __name__ == "__main__":
     unittest.main()

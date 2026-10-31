@@ -7,7 +7,7 @@ NewsAgg 工作过程事实提取器。
 
 原则：
 - 摘录必须真实来自文件，行号必须真实；anchor 命中失败即报错退出，不静默降级。
-- 描述性文字（做了什么 / 为什么）人手-approved，逐条对齐 ADR。
+- 描述性文字（做了什么 / 为什么）逐条对齐 ADR，数字与路径必须来自读过的原文。
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "repo-facts.json"
 CST = timezone(timedelta(hours=8))
-DATE = "2026-10-26"
+DATE = "2026-10-31"
 
 
 def die(msg: str):
@@ -59,7 +59,7 @@ def ex(path: str, start: int, end: int | None = None, note: str = "") -> dict:
 
 
 def at(path: str, anchor: str, before: int = 0, after: int = 0, note: str = "") -> dict:
-    """按正则定位首处命中，取上下文。"""
+    """按字面子串定位首处命中，取上下文。"""
     ls = lines_of(path)
     for i, line in enumerate(ls):
         if anchor in line:
@@ -79,7 +79,8 @@ def jsonview(path: str, keys: list[str] | None, note: str = "") -> dict:
     p = ROOT / path
     if not p.exists():
         die(f"文件不存在：{path}")
-    data = json.loads(p.read_text(encoding="utf-8"))
+    raw = p.read_text(encoding="utf-8")
+    data = json.loads(raw)
     if keys is None:
         sub = {k: ("…(%d 项)" % len(v) if isinstance(v, list) else v)
                for k, v in data.items()}
@@ -90,7 +91,7 @@ def jsonview(path: str, keys: list[str] | None, note: str = "") -> dict:
         "start": None,
         "end": None,
         "note": note or "结构化视图（非原文切片）",
-        "total": len(p.read_text(encoding="utf-8").splitlines()),
+        "total": len(raw.splitlines()),
         "text": json.dumps(sub, ensure_ascii=False, indent=2),
     }
 
@@ -113,34 +114,44 @@ def jsonline(path: str, index: int = -1, note: str = "") -> dict:
     }
 
 
+# ── 被编排的脚本 ─────────────────────────────────────────────────────
 RUN = ".agents/skills/newsagg-collect/scripts/run_all.sh"
 COLLECT = ".agents/skills/newsagg-collect/scripts/collect.py"
 TRIAGE = ".agents/skills/newsagg-triage/scripts/triage.py"
 CARDFM = ".agents/skills/newsagg-triage/scripts/cardfm.py"
+CBACKLOG = ".agents/skills/newsagg-triage/scripts/card_backlog.py"
 BBRIEF = ".agents/skills/newsagg-triage/scripts/build_brief.py"
 WRITEBACK = ".agents/skills/newsagg-triage/scripts/writeback.py"
 STYLEL = ".agents/skills/newsagg-triage/scripts/style_learn.py"
 STYLEP = ".agents/skills/newsagg-triage/scripts/style_patterns.py"
 BRIEF = ".agents/skills/newsagg-brief/scripts/brief.py"
+SRCHEALTH = ".agents/skills/newsagg-brief/scripts/source_health.py"
 PUB = ".agents/skills/newsagg-publish/scripts/publish.py"
 COVER = ".agents/skills/newsagg-publish/scripts/make_cover.py"
 PHOTO = ".agents/skills/newsagg-publish/scripts/fetch_photo.py"
+PRORULES = ".agents/skills/newsagg-publish/scripts/prose_rules.py"
+TITRULES = ".agents/skills/newsagg-publish/scripts/title_rules.py"
+LEDGERLIB = ".agents/lib/publish_ledger.py"
 PERF = ".agents/skills/newsagg-performance/scripts/performance.py"
 WATCHDOG = ".github/workflows/newsagg-watchdog.yml"
 TESTW = ".github/workflows/newsagg-tests.yml"
 
+# ── 当日产物 ─────────────────────────────────────────────────────────
 CAND = f".newsagg/candidates/{DATE}.json"
 INPUT = f".newsagg/triage/{DATE}-input.json"
 DECISION = f".newsagg/triage/{DATE}-decision.json"
 BRIEFF = f".newsagg/briefs/{DATE}.md"
 REPORT = f"reports/{DATE}.md"
-DRAFT = f"outputs/{DATE}-draft.md"
-OUTPUT = f"outputs/{DATE}-layoff-reasons-without-ai.md"
+OUTPUT = f"outputs/{DATE}-ai-content-price-anchor-is-zero.md"
 COVERSPEC = f".newsagg/covers/{DATE}.json"
+COVERREPORT = f".newsagg/covers/{DATE}.report.json"
+REVIEW = f"docs/reviews/{DATE}-elon-review.md"
 LEDGER = ".newsagg/publish-ledger.jsonl"
 RUNSTATUS = ".newsagg/run-status.json"
 PERFSTATUS = ".newsagg/performance-status.json"
-CARD = "knowledge/cards/ai-replacing-developers-misreads-the-work.md"
+BACKLOG = ".newsagg/triage/card-backlog.json"
+HEALTH = ".newsagg/source-health.json"
+CARD = "knowledge/cards/personal-ai-monetization-is-paid-demand-not-technology.md"
 STYLE = ".wewrite/style.yaml"
 NICHE = "platforms/niche.txt"
 
@@ -155,7 +166,7 @@ def build() -> dict:
             "layer": "orchestrate",
             "when": "21:00 主流程第 1 段开头（续跑段不再 pull）",
             "actor": "脚本",
-            "one_liner": "先把你自己机器上改过的东西拉下来，再开始今天的活。",
+            "one_liner": "先把远端与你机器上的改动对齐，再开始今天的活。",
             "does": [
                 "显式按「当前分支」取远端分支，不用裸 git pull（裸命令依赖 upstream，新分支会直接失败）。",
                 "远端还没有这个分支时视为正常状态，跳过同步继续跑，收尾用 -u 建到远端。",
@@ -170,13 +181,13 @@ def build() -> dict:
             ],
             "reads": [],
             "writes": [
-                at(RUN, "PULL_DEGRADED=1", before=6, after=2,
+                at(RUN, "PULL_DEGRADED=1", before=0, after=6,
                    note="网络不可达 → 降级继续，收尾不 push"),
-                ex(PUB, 50, 80, note="Breaker：冲突时由本类的 trip() 写 .newsagg/breaker.json"),
+                ex(PUB, 111, 141, note="Breaker：冲突时由本类的 trip() 写 .newsagg/breaker.json"),
             ],
             "files": [
-                ex(RUN, 1, 33, note="头注释：九步时序与四段调用约定"),
-                at(RUN, 'if grep -qiE \'CONFLICT|Automatic merge failed', before=2, after=10,
+                ex(RUN, 1, 31, note="头注释：九步时序与四段调用约定"),
+                at(RUN, "Automatic merge failed", before=2, after=10,
                    note="冲突即熔断的实现"),
                 at(RUN, "current_branch() {", before=8, after=10,
                    note="ADR-0065：一律按当前分支取远端"),
@@ -201,7 +212,7 @@ def build() -> dict:
                 "ADR-0008：人从「发布前审批」退到「发布后反馈」；你的修改是唯一真实信号源。",
             ],
             "reads": [
-                jsonline(LEDGER, -1, note="发布账本：风格 diff 的基线与 NyA指针"),
+                jsonline(LEDGER, -1, note="发布账本：风格 diff 的基线与指针"),
                 jsonview(RUNSTATUS, None, note="当日运行状态"),
             ],
             "writes": [
@@ -226,13 +237,15 @@ def build() -> dict:
             "does": [
                 "用 gid（平台内容 ID）而非标题做归因——标题是软的，slug 才稳；老账本没 gid 时标题兜底。",
                 "同一天重跑是「就地更新」而不是追加：否则同一篇在基准里算两遍。",
-                "自身基準取历史中位数；连续 N 篇低于基准的一定比例才判持续低迷。",
+                "自身基准取历史中位数；连续 N 篇低于基准的一定比例才判持续低迷。",
+                "阅读率有一个最小展现量门槛：展现量不足时算不出有意义的比率，返回 None 而不是一个数。",
                 "**必须永不致命**：读不回来只写 performance-status.json + 简报呈现，不拖垮整轮。",
             ],
             "why": [
                 "ADR-0010/0037：表现数据是**软信号**——不据此自动降权或退役观点卡。每日一篇的样本量下，把噪音升成硬规则会适得其反。",
                 "ADR-0006：表现读不回来 ≠ 系统没跑，看守必须能区分这两者。",
                 "ADR-0053：账本记录 gid，循环 C 才能按身份 join 回文章与卡。",
+                "小样本的比率会骗人：10-27 那篇 9 展现 8 阅读被原样印成 88.89%，它既不是「表现好」也不是「标题该改」，是平台还没补展现。",
             ],
             "reads": [
                 jsonline(LEDGER, -1, note="账本里的 gid 是 join 回文章的唯一身份"),
@@ -242,7 +255,10 @@ def build() -> dict:
                 ex(REPORT, 1, 1, note="reports/performance.jsonl 是入库文件，跨环境保留"),
             ],
             "files": [
-                ex(PERF, 45, 57, note="阈值常量与解除方式"),
+                at(PERF, "DEFAULTS = {", before=2, after=16, note="阈值常量与解除方式"),
+                at(PERF, "MIN_SHOW_FOR_RATE = 100", before=8, after=1,
+                   note="阅读率的最小展现量：低于它返回 None，不返回一个数"),
+                at(PERF, "def read_rate_of(", after=22, note="两条写路径的唯一实现"),
                 at(PERF, "def evaluate(", after=20, note="自身基准 + 持续低迷判定"),
                 at(RUN, "performance() {", after=14, note="编排器：失败时把输出末行带出来（ADR-0052）"),
             ],
@@ -286,12 +302,14 @@ def build() -> dict:
                 "同日多次采集是**累积合并**不是覆盖：保留 first_seen，热度轨迹进 hot_history，掉榜的标 seen_in_last_run:false。",
                 "每次采集追加一条 collection_runs，其中 kept_new 按「first_seen == 本次时刻」计数——它不等于本次 kept。",
                 "每个源按自己的 TTL×1.5 判陈旧（不是统一阈值），github 这种 24h TTL 的源不会被误判。",
+                "github 单源超时放宽到 75 秒，且预筛除 title 外还匹配 desc——它的 title 是英文仓库名，中文词表命中不了。",
             ],
             "why": [
                 "ADR-0006：白天采多次是为了捕捉**发酵过程**，只看最后一个快照就丢掉了这一维。",
                 "ADR-0039：第二次采集时预筛仍会「保留很多条」，但可能全是旧的；取 kept 会把「没有新东西」显示成「采到很多新的」，所以 kept_new 单独算。",
                 "ADR-0029：公开实例 api-hot.imsyy.top 实测 HTTP 000 已不可用 → 改依赖本地部署。",
                 "ADR-0056：观测同时记 hot 与 rank/rank_total，位次跨度才是可比的趋势信号（hot 跨源不可比）。",
+                "ADR-0085：账本写「timed out」而服务端写「fetch failed」——客户端 20 秒先弃权，真错误落不下来。75 秒让客户端活得比服务端久。",
             ],
             "reads": [
                 ex(NICHE, 1, 16, note="赛道词典：命中任一关键词才成为候选（180 行，人为维护）"),
@@ -300,8 +318,12 @@ def build() -> dict:
                 jsonview(CAND, ["collected_at", "counts", "source_meta"], note="候选池元信息与计数"),
             ],
             "files": [
-                at(COLLECT, "DEFAULT_SOURCES = [", before=2, after=4, note="7 个默认源"),
-                at(COLLECT, "STALE_TTL_FACTOR = 1.5", before=8, after=2, note="陈旧系数 1.5 是经验值，非推导值"),
+                at(COLLECT, "DEFAULT_SOURCES = [", before=0, after=4, note="7 个默认源"),
+                at(COLLECT, "SOURCE_TIMEOUTS = {", before=4, after=4,
+                   note="github 单源 75 秒：让客户端活得比服务端久"),
+                at(COLLECT, "DESC_MATCH_SOURCES = ", before=8, after=1,
+                   note="github 的 title 是英文仓库名，预筛必须看 desc"),
+                at(COLLECT, "STALE_TTL_FACTOR = 1.5", before=17, after=2, note="陈旧系数 1.5 是经验值，非推导值"),
                 at(COLLECT, "def merge_candidates(", before=14, after=16, note="同日累积合并规则"),
                 jsonview(CAND, ["collection_runs"], note="当天三次采集的真实记录"),
                 at(RUN, "collect_now() {", after=6, note="编排器调用点；全源不可达才算失败"),
@@ -315,30 +337,37 @@ def build() -> dict:
             "layer": "triage",
             "when": "21:00 第 1 段，采集之后",
             "actor": "脚本",
-            "one_liner": "把候选条目、全部 active 卡正文、冷却状态、限额、位次趋势、历史表现装进一个大包。",
+            "one_liner": "把候选条目、全部 active 卡正文、冷却状态、限额、位次趋势、历史表现、议题台账装进一个大包。",
             "does": [
                 "8 张 active 卡**全文**进包（含当前判断/依据事实/修订史/边界与反方五节）——只看卡名判不了匹配度。",
                 "每张卡的 covered_events 由 cardfm.py 解析，这是全仓唯一实现。",
                 "给每条候选算位次趋势 trend（state/delta/observations/position_source）。",
+                "把议题台账里**未挂卡**的那几条也放进包：这个议题第几次出现、上一轮为什么不建。",
                 "trend_summary 单独给出覆盖率；participant：unknown+absent 占大半时明确说「本轮 trend 没有信息量」。",
             ],
             "why": [
                 "ADR-0042：两份契约的两份实现一定会漂移，且漂移是静默的。三份 parse_frontmatter 漂移后，分拣层看不到「这张卡写过什么」而写作层看得到——同一轮里一个知道一个不知道。",
                 "ADR-0056：刻度必须是同源位次百分位。池内名次会把退步读成爬升（rank 22→25 曾被判 climbing）。",
-                "ADR-0007：covered_events 是防重复发文的唯一依据，读不到就等于没有。",
+                "ADR-0007：covered_events 是防重复发文的唯一依据，读不到就等于没有「已覆盖」。",
+                "ADR-0083：闸门只是兜底。模型看不见台账时只能每轮从零重推同一个结论，13 轮 0 张卡就是这么来的。",
             ],
             "reads": [
                 ex(CARD, 1, 22, note="观点卡：frontmatter + 五节结构"),
                 jsonview(CAND, ["counts"], note="候选池"),
             ],
             "writes": [
-                jsonview(INPUT, ["prepared_at", "instruction", "limits", "trend_summary"], note="输入包（161 条候选 / 8 张卡）"),
+                jsonview(INPUT, ["prepared_at", "instruction", "limits", "trend_summary"],
+                         note="输入包（当日条目 / 全部卡 / 台账）"),
             ],
             "files": [
                 ex(CARDFM, 1, 17, note="为什么必须是共享模块：三份拷贝漂移的后果"),
-                at(TRIAGE, "def load_cards(", before=20, after=10, note="卡正文全文进包"),
+                at(TRIAGE, "def build_triage_input(", after=26,
+                   note="ADR-0083：台账必须放在模型眼前"),
+                at(TRIAGE, "def _backlog_block(", after=40,
+                   note="只给未挂卡的议题，外加上一轮的不建理由"),
                 at(TRIAGE, "TREND_CLIMB_DELTA", after=5, note="趋势阈值常量"),
                 jsonview(INPUT, ["trend_summary"], note="这一轮趋势信号的真实覆盖率"),
+                jsonview(INPUT, ["backlog"], note="这一轮交给模型看的台账"),
                 at(RUN, "triage_input() {", after=6, note="编排器调用点"),
             ],
         },
@@ -355,14 +384,16 @@ def build() -> dict:
                 "聚簇：同一现实事件的多条报道合并；单条报道不足以支撑判断。",
                 "匹配：逐张读卡**正文**，不是只看标题。",
                 "三态：skip / continue / new，或 abstain；action=new 时必须先写好卡文件再产出决策。",
-                "低置信度的簇不参与竞争，但要写进 low_confidence_skipped；无卡可接的写进 no_card_available。",
-                "校验：triage.py --validate 检查结构 + 冷却期 + 限额 + card_file 是否存在。",
+                "台账到期（backlog.due）非空时只能二选一：为它建卡，或写下 no_card_reason。",
+                "低置信度的簇不参与竞争，但要写进 low_confidence_skipped；无卡可接的写进 no_card_available，issue 是必填的计数键。",
+                "校验：triage.py --validate 检查结构 + 冷却期 + 限额 + card_file 是否存在 + 到期议题有没有交代。",
             ],
             "why": [
-                "ADR-0025：技能装判断，插件装强制——这层是纯判断，脚本只做确定性外壳。",
+                "ADR-0025：技能装判断、插件装强制——这层是纯判断，脚本只做确定性外壳。",
                 "「新进展」的唯一判据是引入新事实或改变判断；纯重复报道必须 skip。这是全系统防重复发文的**唯一**判定点，判错代价最贵。",
                 "ADR-0041：建卡与决策是同一个动作。缺 card_file 时 ⑥ 的写回被静默跳过，新卡永远拿不到 covered_events——认知资产停止生长且不报错。",
-                "冷却期优先于排序：它的目的是防重复，不是惩罚其他选题。",
+                "ADR-0083：建卡门槛从「预测这卡将来有没有用」换成「同一议题是否第 2 次出现」——预测验不了，计数能验。13 轮 0 张卡不是因为门槛高，是因为那个事实没落到任何地方。",
+                "ADR-0091：计数键是「议题 × 报道」不是「议题 × 天」。同一 URL 挂两天证明的是热榜没换，不是议题复发。",
             ],
             "reads": [
                 jsonview(INPUT, ["instruction", "limits"], note="要你照着做的规则"),
@@ -371,10 +402,13 @@ def build() -> dict:
                 jsonview(DECISION, ["date"], note="决策文件（本 action=continue）"),
             ],
             "files": [
-                ex(".agents/skills/newsagg-triage/SKILL.md", 29, 56, note="三态决策表 + 八条硬规则"),
-                jsonview(DECISION, ["low_confidence_skipped"], note="被置信度/冷却期挡下的簇"),
-                at(TRIAGE, "def validate_decision(", after=16, note="校验器：结构 + 冷却 + 限额 + 卡存在"),
-                ex(RUN, 545, 566, note="第 1 段结尾打印的 handoff 指引"),
+                ex(".agents/skills/newsagg-triage/SKILL.md", 29, 56, note="三态决策表 + 硬规则"),
+                at(TRIAGE, "def validate_decision(", after=22, note="校验器：结构 + 冷却 + 限额 + 卡存在 + 台账到期"),
+                at(CBACKLOG, "def observe(", after=30, note="台账怎么记一次出现"),
+                jsonview(DECISION, ["low_confidence_skipped", "no_card_available"], note="被挡下的簇与无卡可接的议题"),
+                jsonview(BACKLOG, ["threshold", "review_days", "due"], note="台账当前的门槛与到期议题"),
+                at(RUN, "分拣的**判断**由模型完成", before=1, after=28,
+                   note="第 1 段结尾的 handoff：建卡与台账到期的交代"),
             ],
         },
         # ── ④ 之一 ────────────────────────────────────────────────────
@@ -385,15 +419,19 @@ def build() -> dict:
             "layer": "write",
             "when": "第 2 段开头",
             "actor": "脚本",
-            "one_liner": "把决策 + 承接卡的认知 + 风格配置拼成一份任务书，交给写作引擎。",
+            "one_liner": "把决策 + 承接卡的认知 + 风格配置 + 标题/正文规则 + 评审要求拼成一份任务书。",
             "does": [
                 "从卡里抽出「当前判断 / 依据事实 / 已覆盖事件 / 边界与反方」四块，明确要求引用或推进、不得另起。",
                 "把 style.yaml 的账号、目标读者、语气、人称、人格与黑名单一并注入。",
+                "把标题硬下限与正文观察项一起写进任务书：前者拦发，后者只打标签。",
+                "末尾附「发布前评审」一节：要求写完先起独立子智能体做一次马斯克视角评审。",
                 "--out 显式写到当日文件名：编排器三段必须共享同一日期，跨零点续跑时默认「今天」会指向不存在的文件。",
             ],
             "why": [
                 "ADR-0026：写作必须引用或推进已有卡，不得另起炉灶——这是沉淀闭环的关键一步。",
                 "ADR-0039：build_brief 默认按今天命名，会在重放历史决策时静默指向错误文件。",
+                "ADR-0082：正文规则只打标签不拦发，且**不把词表印给写作者**——印了就等于教人作弊，末段塞一个标记词就满足了标签。",
+                "ADR-0094：评审要求必须出现在「你已经写完了、还没发布」的那个时刻，而这正是本文件被读的时刻。",
             ],
             "reads": [
                 jsonview(DECISION, ["decision"], note="决策（含 whats_new / money_point）"),
@@ -403,11 +441,15 @@ def build() -> dict:
                 ex(BRIEFF, 1, 26, note="选题包实际产物"),
             ],
             "files": [
-                at(BBRIEF, "def build_brief(", before=6, after=10, note="素材锚点只放输入里真实存在的内容，不编造"),
-                at(BBRIEF, "cur = extract_section(card[\"body\"], \"当前判断\")", before=3, after=12,
+                at(BBRIEF, "def build_brief(", before=0, after=16, note="素材锚点只放输入里真实存在的内容，不编造"),
+                at(BBRIEF, "cur = extract_section(", before=3, after=12,
                    note="卡的四块内容怎么进任务书"),
-                at(BBRIEF, "spath = root / \".wewrite\" / \"style.yaml\"", before=2, after=12, note="风格注入"),
-                at(RUN, 'python3 .agents/skills/newsagg-triage/scripts/build_brief.py --decision',
+                at(BBRIEF, "spath = root /", before=2, after=12, note="风格注入"),
+                at(BBRIEF, "### 发布前评审（必须做", before=4, after=26,
+                   note="ADR-0094：写入任务书的评审要求"),
+                at(BBRIEF, "### 发布后会记下的正文标签", before=2, after=14,
+                   note="只说明会被记什么，不印标记词"),
+                at(RUN, "build_brief.py --decision",
                    before=6, after=6, note="显式 --out 到当日"),
             ],
         },
@@ -422,12 +464,14 @@ def build() -> dict:
             "one_liner": "按选题包写出初稿；模型未配置时按设计降级为本人自写。",
             "does": [
                 "wewrite llm-write 生成 outputs/<date>-draft.md；退出码 3 表示写作模型未配置 → 降级为自写，不是错误。",
-                "审稿后的成稿另存为 outputs/<slug>.md，slug 形如 <date>-<短标题>，首行一级标题 2~30 字（头条硬限制）。",
+                "审稿后的成稿另存为 outputs/<slug>.md，首行一级标题 2~30 字（头条硬限制）。",
                 "写作阶段同时产出封面论据 .newsagg/covers/<date>.json（一个视觉论据，而不是复述标题）。",
+                "成稿正文会被打四个结构标签，记进发布账本、次日印在简报 ③ 段——它们不拦发，是「规则有没有被执行」的唯一证据。",
             ],
             "why": [
                 "ADR-0004：复用 wewrite 作为写作引擎，不重写。",
                 "ADR-0044：信息流里标题就印在封面旁边，复述标题的封面不增加信息，缩到 320px 时还读不出来——所以封面要承载一个论据。缺 spec 时会回退到标题推导，而这条回退路径曾静默产出一张顶部小字与正文重复的封面。",
+                "ADR-0086：正文里又带了一遍标题——浏览器写路径把整份 .md 交给了平台，而 API 路径只交正文。两条写路径读两个不同的输入。",
             ],
             "reads": [
                 ex(BRIEFF, 1, 26, note="任务书"),
@@ -437,9 +481,52 @@ def build() -> dict:
                 jsonview(COVERSPEC, None, note="封面论据（layout=number）"),
             ],
             "files": [
-                at(RUN, "wewrite llm-write --brief", before=4, after=14, note="退出码 3 的降级分支"),
-                ex(RUN, 600, 627, note="第 2 段结尾给模型的指引（含封面论据格式）"),
+                at(RUN, "wewrite llm-write --brief", before=0, after=16, note="退出码 3 的降级分支"),
+                at(RUN, "封面要承载**一个视觉论据**", before=3, after=12,
+                   note="第 2 段结尾给模型的指引（含封面论据格式）"),
                 jsonview(COVERSPEC, None, note="这一天的封面论据 spec"),
+            ],
+        },
+        # ── ④c 评审关（ADR-0094）──────────────────────────────────────
+        {
+            "id": "n16-review",
+            "step": "④c",
+            "title": "发布前独立评审",
+            "layer": "gate",
+            "when": "成稿写完、跑 `--after-write --publish` 之前",
+            "actor": "独立子智能体 + 主智能体",
+            "one_liner": "换一个不共享上下文的模型，用马斯克视角挑毛病；主智能体逐条 accept / reject。",
+            "does": [
+                "用 subagent 起一个**独立**评审子智能体——它不共享上下文，所以成稿路径、观点卡路径必须写进任务里。",
+                "它必须先 `skill` 加载 elon-musk-perspective，按该技能的心智模型评审，而不是给通用写作建议。",
+                "评审意见原样落盘 docs/reviews/<日期>-elon-review.md（入库，次日可复核）；格式含 verdict / blockers / improvements / what_survives。",
+                "主智能体逐条判 accept / reject：accept 的真的改稿，reject 的必须指证据或指规则，不接受「我觉得没必要」。",
+                "一条 blocker 都没提时，必须在记录里明写「是真没问题，还是评审被写成了夸奖」——不许把沉默当通过。",
+                "改完的稿子重新对一遍标题/篇幅/首段要求，再跑发布。",
+            ],
+            "why": [
+                "ADR-0094：连着四天的缺陷（ADR-0092 台账摘要、ADR-0093 闸门被渲染成失败、封面孤字自检全绿、10-30 那篇三处硬数字）共同点是**判断者与被执行者是同一个东西**。",
+                "同上下文的自查看不见自己的盲区——报告全绿而东西是错的。评审不是打分，是找一个愿意反对你的读者。",
+                "只判不改（与 ADR-0025 同一分工）：若让评审直接改写，主智能体就无法对改动负责，也没法留下「我为什么改 / 不改」。",
+                "what_survives 必填：强制评审先说清「哪里别改坏」，避免顺着意见把骨架改塌。",
+                "**不拦发**，拦发权仍在主智能体（与 ADR-0082 同理）：拦错一次损失一篇产能，正确性靠「记录 + 次日复核」。",
+            ],
+            "reads": [
+                ex(OUTPUT, 1, 12, note="被评审的成稿"),
+                ex(CARD, 1, 22, note="它接住的观点卡（评审要判有没有背离卡的当前判断）"),
+                ex(BRIEFF, 1, 26, note="任务书：评审要对照它判是否答非所问"),
+            ],
+            "writes": [
+                ex(REVIEW, 1, 24, note="评审记录：结论 + 主智能体改口对照表"),
+            ],
+            "files": [
+                at(BBRIEF, "### 发布前评审（必须做", before=4, after=26,
+                   note="这一步是被写进任务书的，不是靠人记得"),
+                ex(REVIEW, 1, 20, note="2026-10-31 的真实评审记录"),
+                at(REVIEW, "| # | 自查项", before=2, after=10,
+                   note="自查 6 条 vs 评审 4 条：评审有两处比自查更准确"),
+                at("docs/adr/0094-publish-gated-by-independent-elon-lens-review.md",
+                   "## 决定", after=16, note="ADR-0094 的五条决定"),
             ],
         },
         # ── ④b ────────────────────────────────────────────────────────
@@ -467,7 +554,7 @@ def build() -> dict:
                 jsonview(COVERSPEC, None, note="封面论据"),
             ],
             "writes": [
-                jsonview(f".newsagg/covers/{DATE}.report.json", None, note="自检留档（简报 ⑤ 段读取）"),
+                jsonview(COVERREPORT, None, note="自检留档（简报 ⑤ 段读取）"),
             ],
             "files": [
                 at(COVER, "FEED_CARD_ASPECT = 1.5", before=4, after=4, note="安全区由 3:2 裁切推导"),
@@ -481,7 +568,7 @@ def build() -> dict:
         {
             "id": "n11-publish",
             "step": "⑤",
-            "title": "发布（六道门 + 反查）",
+            "title": "发布（门 + 反查）",
             "layer": "publish",
             "when": "第 3 段",
             "actor": "脚本 → vendor 的 toutiao-ops（node）",
@@ -489,16 +576,19 @@ def build() -> dict:
             "does": [
                 "门 0 熔断：.newsagg/breaker.json 存在即拒绝发布，人工修复后删文件解除。",
                 "门 0.5 每日上限：今天已成功发布 ≥1 篇即拒绝（dry-run 不消耗额度）。需补发/重发时须显式 --allow-daily-override 并写理由。",
-                "门 1 输入：成稿存在、有一级标题、标题 2~30 字、封面文件存在（头条必填）。",
-                "门 2 登录预检：只读，最多 3 次；判定为 login_lost 即熔断。",
-                "门 3 内存预检：可用内存低于下限即熔断（ADR-0023）。",
+                "门 1 输入：成稿存在、有一级标题、封面文件存在（头条必填）。",
+                "标题硬下限：按 platforms/title-rules.md 拦，因为被平台退回的文章再改也不会被推荐。",
+                "正文观察项：只打四个标签写进账本，**不拦发**——正文没有「拒发」的正确阈值。",
+                "门 2 登录预检：只读，最多 3 次；判定为 login_lost 即熔断。门 3 内存预检：可用内存低于下限即熔断（ADR-0023）。",
                 "发布命令显式带 --no-weitoutiao（平台默认是勾选的，同发会造成内容重复）。",
                 "门 5 反查：按平台实际收到的标题去作品列表里查；咽字时以平台标题为准。",
-                "全程 FileLock 串行锁；锁带 pid，用 kill(pid,0) 判断持有者是否存活，崩惯不会留下永久锁。",
+                "全程 FileLock 串行锁；锁带 pid，用 kill(pid,0) 判断持有者是否存活，崩溃不会留下永久锁。",
             ],
             "why": [
-                "ADR-0014：dry-run 默认开启；dry-run 只对人民日报 NanA 留真实草稿，也要 Methodist草稿不算发布。",
-                "ADR-0024：复用 vendor 的 toutiao-ops，本脚本只加安全门与验证。",
+                "ADR-0014：dry-run 默认开启；dry-run 走 --draft，会在真实账号上创建真实草稿，不是无痕验证。",
+                "ADR-0081：「每日 1 篇」从 ADR-0074 起一直空转——repo_root_of() 上溯三级指错了仓库根，闸门查的是另一份账本。空转的闸比没有闸更危险，它让人以为有保护。",
+                "ADR-0093：闸门拒绝不是故障。原先只看退出码，于是「今日额度已用」被渲染成「系统运行失败，请重跑」——照它把闸门去掉就是重复发文。",
+                "ADR-0082：正文规则只打标签不拦发；标题规则相反，它拦——标题被退回是「这一篇归零」，而不是「少一点点击」。",
                 "ADR-0051：平台实际标题可能被输入框咽字，按原标题反查会把真实发布误判成未发布。",
                 "ADR-0034：一次运行只产一篇文章，同发微头条会造成内容重复且不受每日上限与冷却期约束。",
                 "ADR-0037：把承接卡写进账本——循环 C 要按卡归因回答「哪些卡跑出了数据」。",
@@ -512,12 +602,13 @@ def build() -> dict:
             ],
             "files": [
                 at(PUB, "# ── 门 0：熔断状态", after=12, note="门 0"),
-                at(PUB, "# ── 门 0.5：每日发布上限", after=14, note="门 0.5"),
+                at(PUB, "# ── 门 0.5：每日发布上限", after=30, note="门 0.5：额度用到就拒绝，并给出逃生舱"),
+                at(PUB, "# ── 标题硬下限", after=18, note="标题门：规则读不上只告警，不因缺规则停摆"),
+                at(PUB, "# ── 正文观察项", after=16, note="正文标签：只记录，不拦发"),
                 at(PUB, "# ── 门 3：内存预检", after=8, note="门 3"),
                 at(PUB, "# ── 门 2：登录预检", after=16, note="门 2"),
-                at(PUB, "# 并把真实值放在 `title` 字段", before=3, after=8, note="平台实际标题"),
                 at(PUB, "# ── 门 5：反查验证", after=12, note="门 5"),
-                ex(PUB, 82, 100, note="FileLock 的陈旧锁处理"),
+                ex(PUB, 143, 196, note="FileLock 的陈旧锁处理"),
             ],
         },
         # ── ⑥ ─────────────────────────────────────────────────────────
@@ -549,46 +640,54 @@ def build() -> dict:
             "files": [
                 ex(WRITEBACK, 1, 13, note="设计依据：covered_events 与 last_written 是关键字段"),
                 at(WRITEBACK, "def append_covered_event(", after=12, note="空列表展开的处理"),
-                at(WRITEBACK, "# 判据：同日 + 同事件（前缀匹配）已存在于 covered_events。", before=4, after=8,
+                at(WRITEBACK, "幂等保护（ADR-0026 的同构要求）", before=0, after=10,
                    note="幂等保护"),
-                at(RUN, "log \"⑥ 认知写回", after=16, note="编排器：失败不阻塞发布，但须人工补"),
+                at(RUN, "⑥ 认知写回", before=0, after=20, note="编排器：失败不阻塞发布，但须人工补"),
             ],
         },
         # ── ⑦⑧ ⑨ ─────────────────────────────────────────────────────
         {
             "id": "n13-brief-push",
             "step": "⑦⑧⑨",
-            "title": "状态 + 简报 + commit/push",
+            "title": "账本归档 + 简报 + commit/push",
             "layer": "orchestrate",
             "when": "第 3 段结尾（成功与失败都走）",
             "actor": "脚本",
-            "one_liner": "把这一轮的成败写成 run-status，再渲染成人看的五段式简报，最后提交推送。",
+            "one_liner": "先把账本同步成入库归档，再渲染成人看的五段式简报，最后提交推送。",
             "does": [
                 "run-status.json：无论成败都先落一份「这一轮跑到哪、为什么停」。",
+                "先把运行时账本同步成入库归档（reports/publish-ledger.jsonl），因为简报要读的是合并视图。",
                 "brief.py 读当日全部产物渲染五段：① 今日结论 ② 采集分拣概览 ③ 本篇与发布结果 ④ 资产变动 ⑤ 需你介入的事项。",
+                "④ 段读**台账**算卡库两条线：到期议题（该建没建）与退役候选（建了 30 天没接住）；没有就印「无」，证明查过。",
+                "⑤ 段把信源健康读回来，且**只在状态变化时展开**——每天必然出现的告警会被整段略过。",
                 "缺哪个阶段的文件就按「该阶段未运行」呈现，不报错——简报必须无条件每日存在。",
                 "sync_push：git add -A → commit → push 当前分支；push 走代理失败时直连重试一次。",
                 "降级轮不 push：不知道远端有没有新提交，盲目 push 可能被拒。",
             ],
             "why": [
+                "ADR-0074：账本分运行时（不入库）与归档（入库）两份。没有归档，换机器就看不出平台作品与本地成稿的关联——实测 11 篇只匹配 9 篇。",
                 "ADR-0038：任何失败都必须出简报。`.newsagg/` 不入库、看守读不到它，所以成败由简报呈现给人。",
                 "ADR-0006：简报是心跳不是可选报告。一份写明「本轮运行未完成」的简报比没有简报更有信息量。",
                 "ADR-0019：五段结构的存在是为了让「今日无选题」「弃权」「系统没跑」三者可区分。",
+                "ADR-0092：台账早就接上了，但接的是摘要——到期线与退役线在生产里从没印过。机制不响等于没有机制。",
             ],
             "reads": [
                 jsonview(RUNSTATUS, None, note="运行状态（① 段优先读它）"),
                 jsonview(PERFSTATUS, None, note="表现读回结果（⑤ 段）"),
                 jsonline(LEDGER, -1, note="发布账本（③ 段）"),
+                jsonview(BACKLOG, ["threshold", "review_days"], note="卡库两条线（④ 段）"),
             ],
             "writes": [
                 ex(REPORT, 1, 20, note="reports/<日期>.md：看守读的就是它"),
             ],
             "files": [
+                at(RUN, "sync_ledger_archive() {", after=24, note="运行时账本 → 入库归档（幂等，失败不阻塞）"),
                 at(BRIEF, "def section_conclusion(", after=22, note="① 段：运行失败优先于一切"),
-                at(BRIEF, "    out = [\"## ② 采集与分拣概览\", \"\"]", after=10, note="② 段"),
-                at(BRIEF, "out = Path(args.out) if args.out else root / \"reports\"", before=4, after=6,
+                at(BRIEF, "def _card_stock_lines(", after=30, note="④ 段：到期议题与退役候选两条线"),
+                at(BRIEF, "out = Path(args.out) if args.out else root", before=0, after=8,
                    note="落盘与摘要输出"),
                 at(RUN, "sync_push() {", after=20, note="提交与推送，含降级不 push 分支"),
+                ex(LEDGERLIB, 1, 26, note="为什么账本必须是两份（运行时 + 入库归档）"),
             ],
         },
         # ── 失败通道 ──────────────────────────────────────────────────
@@ -603,10 +702,12 @@ def build() -> dict:
             "does": [
                 "write_status(ok=0, stage, reason, detail)：detail 保留最后 2000 字。",
                 "degraded 是第三种状态：跑完了但有让步，不让看守告警但必须让人看见。",
+                "「今日额度已用」走同一通道但 stage=daily_limit：它是**设计内的拒绝**，不是故障。",
                 "brief_now 无条件执行；allow_push=0 时（远端状态不明/工作区脏）不 push，交人工处置。",
             ],
             "why": [
                 "ADR-0038：失败必须出简报，否则看守无法区分「系统没跑」与「跑了一半」。",
+                "ADR-0093：闸门拒绝与运行失败必须分开报——混在一起时简报会写出「修复后重跑」这种导致重复发文的建议。",
                 "ADR-0028：命令成功与否一律看退出码，不经管道——管道会掩码退出码。",
             ],
             "reads": [],
@@ -615,6 +716,8 @@ def build() -> dict:
             ],
             "files": [
                 at(RUN, "fail_soft() {", after=16, note="统一失败出口"),
+                at(RUN, "daily_limit", before=4, after=10,
+                   note="只认 daily_limit 这一个 stage：设计内拒绝，与失败分开报"),
                 at(RUN, "write_status() {", after=18, note="第三态 degraded"),
                 at(RUN, "brief_now() {", after=4, note="简报无条件存在"),
             ],
@@ -631,6 +734,7 @@ def build() -> dict:
             "does": [
                 "看守：checkout 后找近两日的 reports/<date>.md；存在再校验五段标题 ①②③④⑤ 齐备。",
                 "测试：python 3.9 与 3.12 双版本矩阵跑 python3 -m unittest discover；3.9 是下限（服务器上的版本）。",
+                "测试默认不联网：简报 ⑤ 段会真的跑渠道体检，每渠道最多 30 秒，四遍简报就把套件从 7 秒拖到 274 秒。",
                 "两条流水线都不依赖主系统所在的机器，因此能发现「主系统整体失效」。",
             ],
             "why": [
@@ -644,15 +748,14 @@ def build() -> dict:
             "writes": [],
             "files": [
                 ex(WATCHDOG, 1, 13, note="设计依据：为什么它必须跑在另一台机器上"),
-                at(WATCHDOG, "YESTERDAY=$(TZ=Asia/Shanghai date -d 'yesterday' +%Y-%m-%d)", before=8, after=8, note="检查窗口：昨天与今天任一存在即存活"),
-                at(WATCHDOG, 'for marker in "①" "②" "③" "④" "⑤"; do', before=4, after=8, note="五段齐备校验"),
+                at(WATCHDOG, "YESTERDAY=", before=0, after=10, note="检查窗口：昨天与今天任一存在即存活"),
+                at(WATCHDOG, "for marker in", before=4, after=8, note="五段齐备校验"),
                 ex(TESTW, 1, 13, note="为什么单独建这个工作流"),
                 at(TESTW, 'python-version: ["3.9", "3.12"]', before=8, after=4, note="两个真实解释器都要测"),
             ],
         },
     ]
 
-    # ── 附录： browse all files referenced ──
     return nodes
 
 
@@ -663,16 +766,17 @@ def main():
     cards = sorted(p.name for p in (ROOT / "knowledge/cards").glob("*.md"))
     outputs = sorted(p.name for p in (ROOT / "outputs").glob("*.md"))
     reports = sorted(p.name for p in (ROOT / "reports").glob("*.md"))
+    reviews = sorted(p.name for p in (ROOT / "docs/reviews").glob("*.md"))
     led = [json.loads(l) for l in (ROOT / LEDGER).read_text(encoding="utf-8").splitlines() if l.strip()]
 
     data = {
         "groups": [
-            {"title": "\u4e3b\u6d41\u7a0b\u7b2c 1 \u6bb5 \u00b7 21:00 \u8d77", "ids": ["n01-pull", "n02-style", "n03-performance", "n04-skipday"]},
-            {"title": "\u5728\u6b64\u4e4b\u524d \u00b7 \u767d\u5929\u5df2\u8dd1\u4e09\u6b21\uff08\u6b65\u9aa4 \u2462\uff09", "ids": ["n05-collect"]},
-            {"title": "\u7b2c 1\u21922 \u6bb5\u4e4b\u95f4 \u00b7 \u6a21\u578b\u5224\u65ad", "ids": ["n07-triage-judge"]},
-            {"title": "\u4e3b\u6d41\u7a0b\u7b2c 2 \u6bb5 \u00b7 \u5199\u4f5c", "ids": ["n06-triage-input", "n08-brief-pack", "n09-write"]},
-            {"title": "\u4e3b\u6d41\u7a0b\u7b2c 3 \u6bb5 \u00b7 \u53d1\u5e03\u7ed3\u7b97", "ids": ["n10-cover", "n11-publish", "n12-writeback", "n13-brief-push"]},
-            {"title": "\u5f02\u5e38\u4e0e\u5916\u56f4", "ids": ["n14-failsoft", "n15-ci"]},
+            {"title": "主流程第 1 段 · 21:00 起", "ids": ["n01-pull", "n02-style", "n03-performance", "n04-skipday"]},
+            {"title": "在此之前 · 白天已跑三次（步骤 ③）", "ids": ["n05-collect"]},
+            {"title": "第 1→2 段之间 · 模型判断", "ids": ["n07-triage-judge"]},
+            {"title": "主流程第 2 段 · 写作与评审", "ids": ["n06-triage-input", "n08-brief-pack", "n09-write", "n16-review"]},
+            {"title": "主流程第 3 段 · 发布结算", "ids": ["n10-cover", "n11-publish", "n12-writeback", "n13-brief-push"]},
+            {"title": "异常与外围", "ids": ["n14-failsoft", "n15-ci"]},
         ],
         "meta": {
             "title": "NewsAgg",
@@ -682,10 +786,10 @@ def main():
             "date": DATE,
             "note": "全部摘录实读自仓库源文件；行号为真实行号。",
             "stats": [
-            ["ADR", len(adr)], ["\u6d4b\u8bd5", len(tests)], ["\u89c2\u70b9\u5361", len(cards)],
-            ["\u6210\u7a3f", len(outputs)], ["\u7b80\u62a5", len(reports)],
-            ["\u53d1\u5e03", len([r for r in led if not r.get("accidental")])],
-            ["\u8bef\u53d1", len([r for r in led if r.get("accidental")])],
+                ["ADR", len(adr)], ["测试", len(tests)], ["观点卡", len(cards)],
+                ["成稿", len(outputs)], ["简报", len(reports)], ["评审记录", len(reviews)],
+                ["发布", len([r for r in led if not r.get("accidental")])],
+                ["误发", len([r for r in led if r.get("accidental")])],
             ],
         },
         "nodes": nodes,

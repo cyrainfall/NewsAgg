@@ -348,6 +348,31 @@ def build_brief(decision: dict, card: dict | None, style: dict, target_words: st
     lines.append("    正文插图能力（只有封面，见 `platforms/toutiao-format.md` 的已知缺口），写了就是空指。")
     lines.append("")
 
+    # ── 发布前评审（ADR-0094）──
+    # 这一段和上面那些"写作规则"性质不同：上面是给写作者的要求，这一段是给
+    # **写作者之外的一个模型**的要求。放在这里的理由是位置——它必须出现在
+    # 「你已经写完了、还没发布」的那个时刻，而这正是本文件被读的时刻。
+    lines.append("### 发布前评审（必须做，2026-10-31 起，ADR-0094）")
+    lines.append("")
+    lines.append("写完、**在跑 `--after-write --publish` 之前**，必须做一次独立评审：")
+    lines.append("")
+    lines.append("1. 用 `subagent` 起一个**独立**的评审子智能体（它不共享你的上下文，所以要把成稿路径、")
+    lines.append("   观点卡路径写进它的任务里）。要求它先 `skill` 加载 `elon-musk-perspective`，")
+    lines.append("   再按该技能的模型评审——不是给通用写作建议。")
+    lines.append("2. 评审意见原样写到 `docs/reviews/<今天>-elon-review.md`（入库，次日可复核）。")
+    lines.append("3. **诚实接收**：逐条判 accept / reject。accept 的必须真的改稿；reject 的必须写清理由")
+    lines.append("   （指证据或指规则，不接受「我觉得没必要」）。")
+    lines.append("4. 改完、改完的稿子重新对一遍上面的标题/篇幅/首段要求，再跑发布。")
+    lines.append("")
+    lines.append("为什么在这一步：它是全流程里**唯一一处由另一个模型对成稿下判断**的环节。")
+    lines.append("同上下文的自查看不见自己的盲区——本仓库连续四天的缺陷（ADR-0092/0093、封面孤字、")
+    lines.append("10-30 那篇的三处硬数字）都是「报告全绿、东西是错的」。评审不是打分，是找一个愿意反对你的读者。")
+    lines.append("")
+    lines.append("**判据**：评审若一条 blocker 都没提，要么稿子真没问题，要么它被写成了夸奖——")
+    lines.append("后者要在记录里明写出来，不许把沉默当成通过。它**不拦发**，拦发权在你，")
+    lines.append("但每个 reject 都要留得下理由。")
+    lines.append("")
+
     # ── 正文观察项（`platforms/prose-rules.md`）──
     # 只说明"会被记什么"，**不印标记词**。这是刻意的：把「先别」「记下来」这些词
     # 印给写作方，写作方只要在末段塞一个就满足了标签，而标签本该检测结构而不是口令。

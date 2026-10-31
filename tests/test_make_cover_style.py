@@ -213,5 +213,43 @@ class TestContrast(unittest.TestCase):
             self.assertEqual(info["problems"], [], f"样式 {name} 有对比度问题")
 
 
+
+
+class PayoffOrphanLineTest(unittest.TestCase):
+    """payoff 折出孤字行时必须告警（2026-10-31 实测）。
+
+    那次 payoff 是「免费的那批，先替你定了价」，`fit_block` 允许两行，于是排成
+    「免费的那批，先替你定了」+「价」——`max_lines=2` 之内，既没截断也没告警，
+    report 里 `problems: [] warnings: []` 全绿，图却明显是坏的。
+    无人值守时没人看图，排版坏了只能自己说出来（同节其他自检的判据）。
+    """
+
+    def _render(self, payoff: str) -> dict:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            return mc.make_cover(
+                "AI电影票房150万：你卖的AI内容，价已经被定死了",
+                Path(td) / "c.png",
+                layout="number",
+                kicker="首部AI院线电影",
+                hero="1",
+                hero_unit="% 上座率",
+                payoff=payoff,
+                style="blush",
+            )
+
+    @unittest.skipIf(mc is None, "需要 Pillow（wewrite 的 python）")
+    def test_orphan_last_line_warns(self):
+        rep = self._render("免费的那批，先替你定了价")
+        self.assertTrue(any("payoff" in w and "一个字" in w for w in rep["warnings"]),
+                        msg=f"孤字行没有告警：{rep['warnings']}")
+
+    @unittest.skipIf(mc is None, "需要 Pillow（wewrite 的 python）")
+    def test_short_payoff_does_not_warn(self):
+        rep = self._render("免费的，先替你定了价")
+        self.assertFalse(any("一个字" in w for w in rep["warnings"]),
+                         msg=f"短 payoff 不应告警：{rep['warnings']}")
+
+
 if __name__ == "__main__":
     unittest.main()

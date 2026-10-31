@@ -125,6 +125,8 @@ def _check_cookie_file_exposure(p: Path, st: os.stat_result) -> None:
     """
     if os.name != "nt":
         if st.st_mode & 0o077:
+            from .chromium import CookieError  # 局部导入，避免与 chromium 成环
+
             raise CookieError(
                 f"cookie 文件 {p} 权限太宽（mode={oct(st.st_mode & 0o777)}）："
                 f"组/其他用户可读就等于把账号交出去。"
@@ -132,10 +134,26 @@ def _check_cookie_file_exposure(p: Path, st: os.stat_result) -> None:
             )
         return
 
+    # 这个局部导入是必须的：`CookieError` 在 `chromium` 里定义，而本函数是模块级
+    # 的（不在 `from_cookie_file` 内，那里有自己的局部导入）。此前它每次都抛
+    # `NameError`——但因为它从没走到过 raise（见下面 SID 那条），这个 NameError
+    # 也一直没暴露：**闸坏了两次，第二层被第一层盖住了**（ADR-0090）。
+    from .chromium import CookieError
+
     for sid, label in _WINDOWS_EXPOSURE_SIDS:
         try:
+            # ⚠️ 两个坑叠在一起，这条闸因此从写下来那天起**一次都没响过**（ADR-0090）：
+            #
+            # 1. 裸 SID 会被 icacls 当成**名字**去查 → 永远 1332（没找到）。
+            #    必须带 `*` 前缀，那才是「这是 SID 不是名字」的标记。
+            # 2. 带 `*` 之后**退出码恒为 0**（命令跑成功了，哪怕一个都没匹配到），
+            #    所以「rc==0 即暴露」会把**每一个**文件都判成泄露。
+            #    真正的信号是输出里有没有这个文件路径：命中时 icacls 会打印
+            #    `<路径> Everyone:(R)`，没命中只打印「未找到任何…文件」。
+            #    用路径判断而不是用那句中文，是因为 icacls 的消息随系统语言变。
+            target = str(p.resolve())
             proc = subprocess.run(
-                ["icacls", str(p), "/findsid", sid],
+                ["icacls", target, "/findsid", f"*{sid}"],
                 capture_output=True, text=True, timeout=10, check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -143,16 +161,16 @@ def _check_cookie_file_exposure(p: Path, st: os.stat_result) -> None:
                 f"cookie 文件 {p} 的 ACL 查不出来（icacls 调用失败：{exc}）。"
                 f"Windows 上没有 mode 位可判，查不出来就按「可能泄露」处理。"
             ) from exc
-        if proc.returncode == 0:
+        if proc.returncode != 0:
+            raise CookieError(
+                f"cookie 文件 {p} 的 ACL 查不出来：icacls 返回 {proc.returncode}。"
+                f"按「可能泄露」处理。"
+            )
+        if target in ((proc.stdout or "") + (proc.stderr or "")):
             raise CookieError(
                 f"cookie 文件 {p} 的 ACL 太宽：`{label}`（{sid}）能读。"
                 f"收干净再试：\n"
                 f'    icacls "{p}" /inheritance:r /grant:r "%USERNAME%":R'
-            )
-        if proc.returncode != 1332:  # 1332 = 没找到该 SID，是正常结果
-            raise CookieError(
-                f"cookie 文件 {p} 的 ACL 查不出来：icacls 返回 {proc.returncode}，"
-                f"既不是「找到」也不是「没找到」。按「可能泄露」处理。"
             )
 
 

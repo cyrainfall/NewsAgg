@@ -61,6 +61,7 @@ class TestCookieFileLoading(unittest.TestCase):
         finally:
             p.unlink()
 
+    @unittest.skipUnless(os.name != "nt", "POSIX mode 位在 NTFS 上不存在（Windows 走 DACL，见 WindowsAclGateTest）")
     def test_rejects_group_or_other_readable_file(self):
         """权限太宽 = 把账号交出去。必须拒绝，且说清怎么改。"""
         p = self._write({"cookies": [
@@ -75,6 +76,7 @@ class TestCookieFileLoading(unittest.TestCase):
         finally:
             p.unlink()
 
+    @unittest.skipUnless(os.name != "nt", "POSIX mode 位在 NTFS 上不存在（Windows 走 DACL，见 WindowsAclGateTest）")
     def test_rejects_file_readable_by_group_only(self):
         """0o640 也是「别人能读」。只测 0o644 会漏掉这一类。"""
         p = self._write({"cookies": [
@@ -332,22 +334,78 @@ class TestCookieExpiryWarning(unittest.TestCase):
             p.unlink()
 
     def test_brief_renders_the_warning(self):
-        """简报第⑤段必须把这件事说出来——不然等于没提醒。"""
+        """简报第⑤段必须把这件事说出来——不然等于没提醒。
+
+        ⚠️ 顺手把信源健康关掉（`NEWSAGG_SKIP_SOURCE_HEALTH`）：`section_actions`
+        会去跑一次**联网**的 agent-reach 实测，而这条用例只想验一句话的渲染。
+        不加这个开关，它会从 0.02 秒变成 74.74 秒（2026-10-31 实测）——
+        一条测文案的用例不该在别人的机器上等一分钟。
+        """
         import importlib.util
+        from unittest import mock
+
         p = REPO / ".agents/skills/newsagg-brief/scripts/brief.py"
         spec = importlib.util.spec_from_file_location("brief_mod_expiry", p)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        lines = mod.section_actions(
-            [], {}, {}, None, None,
-            perf={"status": {"ok": True, "cookie_expiry": {
-                "level": "expiring", "days_left": 3.0,
-                "message": "注入的 cookie 还有 3 天过期（2026-10-30）。"}}},
-        )
+        with mock.patch.dict(os.environ, {"NEWSAGG_SKIP_SOURCE_HEALTH": "1"}):
+            lines = mod.section_actions(
+                [], {}, {}, None, None,
+                perf={"status": {"ok": True, "cookie_expiry": {
+                    "level": "expiring", "days_left": 3.0,
+                    "message": "注入的 cookie 还有 3 天过期（2026-10-30）。"}}},
+            )
         text = "\n".join(lines)
         self.assertIn("cookie", text)
         self.assertIn("快过期", text)
         self.assertIn("export-cookies.py", text)
+
+
+@unittest.skipUnless(os.name == "nt", "DACL 判定只在 Windows 上存在")
+class WindowsAclGateTest(unittest.TestCase):
+    """Windows 上真正的判据是 DACL，不是 POSIX mode 位（ADR-0090）。
+
+    这条闸坏过两次，而两次都被前一层盖住：
+      1. `icacls /findsid <裸SID>` 把 SID 当**名字**查 → 永远 1332 → 从不拦；
+      2. 补上 `*` 前缀之后退出码**恒为 0**，于是「rc==0 即泄露」变成「每个文件都
+         判成泄露」；真正的信号是输出里有没有该文件的路径。
+    再加一条：`CookieError` 只在 `from_cookie_file` 里**局部导入**，模块级函数
+    里 `raise CookieError` 直接 `NameError`——所以闸一旦真的响，它崩而不是报错。
+    三层叠在一起，表现是「一直通过」。
+
+    这条用例要的正是那个失败形态：把 Everyone 打开，必须被拒。
+    """
+
+    def _make(self):
+        import json
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        p = Path(d) / "c.json"
+        p.write_text(json.dumps({"cookies": [
+            {"domain": ".toutiao.com", "name": "sessionid", "value": "abc"},
+        ]}), encoding="utf-8")
+        return p
+
+    def test_granting_everyone_is_rejected(self):
+        import subprocess
+
+        p = self._make()
+        try:
+            # 先确认基线：没被额外赋权的临时文件应当能加载
+            Session.from_cookie_file(p)
+            grant = subprocess.run(["icacls", str(p), "/grant", "*S-1-1-0:(R)"],
+                                   capture_output=True, text=True)
+            if grant.returncode != 0:
+                self.skipTest(f"icacls 授权失败，无法构造用例：{grant.stderr[:80]}")
+            with self.assertRaises(Exception) as ctx:
+                Session.from_cookie_file(p)
+            self.assertIn("ACL 太宽", str(ctx.exception),
+                          "拒绝理由要说清是 ACL，而不是笼统的加载失败")
+        finally:
+            subprocess.run(["icacls", str(p), "/remove:g", "*S-1-1-0"],
+                           capture_output=True, text=True)
+            p.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

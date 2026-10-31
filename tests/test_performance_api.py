@@ -343,9 +343,68 @@ class TestReadRateClamp(unittest.TestCase):
         self.assertAlmostEqual(arts[0]["read_rate"], 0.007, places=6)
 
     def test_exactly_100_percent_is_kept(self):
-        """恰好 100% 是合法边界（所有展现都被读了），不该被抹成 None。"""
-        arts, _ = perf.extract_articles(self._browser_payload(10, 10))
+        """恰好 100% 是合法边界（所有展现都被读了），不该被抹成 None。
+
+        样本量取 200 而不是 10：这里要测的是「1.0 不被 clamp」，不是「小样本」——
+        小样本已是 `MIN_SHOW_FOR_RATE` 的事（见 `TestMinShowForRate`）。
+        """
+        arts, _ = perf.extract_articles(self._browser_payload(200, 200))
         self.assertAlmostEqual(arts[0]["read_rate"], 1.0, places=6)
+
+
+class TestMinShowForRate(unittest.TestCase):
+    """样本太小的阅读率不进基准、也不进简报（MIN_SHOW_FOR_RATE）。
+
+    2026-10-30 实测：10-27 那篇读回 `showCount=9 / readCount=8` → 88.89%。
+    它没触发 `rate > 1` 的 clamp（8/9 < 1），于是被原样印进简报③段——
+    而 9 个展现算出来的比率既不是「表现好」，也不是「标题该改」，
+    它是「平台还没来得及补展现」。
+    """
+
+    def _browser_payload(self, show, read):
+        return {
+            "success": True, "source": "api_intercept", "count": 1,
+            "items": [
+                {"data": [{"assembleCell": {"itemCell": {
+                    "articleBase": {"gidStr": "7701389368845500963",
+                                    "title": "H20租金", "publishTime": 1792870926,
+                                    "itemStatus": 20,
+                                    "articleURL": "https://www.toutiao.com/item/1/"},
+                    "itemCounter": {"showCount": show, "readCount": read},
+                }}}]},
+            ],
+        }
+
+    def test_tiny_sample_is_none(self):
+        """9 展现 / 8 阅读 → None（就是今天那个 88.89%）。"""
+        arts, _ = perf.extract_articles(self._browser_payload(9, 8))
+        self.assertIsNone(arts[0]["read_rate"])
+        self.assertEqual(arts[0]["metrics"]["showCount"], 9)
+        self.assertEqual(arts[0]["metrics"]["readCount"], 8)
+
+    def test_threshold_boundary(self):
+        """阈值本身算得出来，差一个就不算——边界写成断言，免得日后飘。"""
+        below, _ = perf.extract_articles(
+            self._browser_payload(perf.MIN_SHOW_FOR_RATE - 1, 50))
+        self.assertIsNone(below[0]["read_rate"])
+        at, _ = perf.extract_articles(
+            self._browser_payload(perf.MIN_SHOW_FOR_RATE, 50))
+        self.assertAlmostEqual(at[0]["read_rate"], 0.5, places=6)
+
+    def test_helper_is_the_single_implementation(self):
+        """两条写路径必须共用 `read_rate_of()`，不能各留一份口径。
+
+        ADR-0042 记过一次「三份拷贝漂移」：改了一边、另一边还是老口径，
+        而两边看起来都正常。这里用源码级断言钉住——它们还在各自的循环里
+        各写一份 `read/show`，就说明又漂了。
+        """
+        import inspect
+
+        src = inspect.getsource(perf)
+        self.assertEqual(src.count("read_rate_of(metrics)"), 2,
+                         "两条写路径应各调用一次 read_rate_of；多/少都说明口径分家了")
+        self.assertEqual(src.count("read / show"), 1,
+                         "阅读率的除法只该出现在 read_rate_of 里（出现两次 = 有人又抄了一份）")
 
 
 class TestKindClassification(unittest.TestCase):

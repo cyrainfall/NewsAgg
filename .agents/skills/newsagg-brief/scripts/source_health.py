@@ -60,6 +60,7 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 # tier-0 = 装好即用、无需配置。ADR-0021 列举的是 v0 时代的六个名字
@@ -86,6 +87,17 @@ DOCTOR_TIMEOUT = 30
 # 同一份代码在本机能用 Jina Reader，在不装代理的服务器上不能用。写在代码里
 # 等于把「本机的网络」硬编码进整个系统。
 POLICY_REL = Path("deploy") / "channel-policy.txt"
+
+# 上一次判定的快照（2026-10-31 加）。为什么要它：
+# 每天的渠道状态基本不变（`web` 的 jina 读长期 20 秒超时），若不比较上一次，
+# 第 ⑤ 段每天印同样四条——而「每天必然出现的告警」会训练人整段略过
+# （ADR-0006/0021/0031 反复要避免的「狼来了」）。
+# 有快照之后，只在**状态发生变化**时展开细节，其余折成一行计数。
+HEALTH_SNAPSHOT_REL = Path(".newsagg") / "source-health.json"
+
+# 设为任意非空值时 `read_health()` 直接返回 `skipped`，不执行任何探测。
+# 用途：简报的单元测试（不该为了验一句文案去联网几十秒）、离线运行、CI。
+SKIP_HEALTH_ENV = "NEWSAGG_SKIP_SOURCE_HEALTH"
 
 
 def read_policy(root: Path) -> dict[str, dict]:
@@ -178,6 +190,15 @@ def read_health(root: Path) -> dict:
     if not cmd:
         return _unavailable("找不到 agent-reach 可执行文件（ADR-0021：只装 CLI、不入 PATH）")
 
+    # 显式跳过开关。为什么需要它：`read_health()` 会真的跑一次联网实测（几十秒），
+    # 而简报的单元测试也会走这里——一个只测「cookie 快过期那句话有没有印出来」的
+    # 用例，不该因此等 75 秒（2026-10-31 实测：加健康检查后该用例从 0.02s 变 74.74s）。
+    # 离线跑简报、以及 CI 里不想打网络时也用同一个开关。
+    if os.environ.get(SKIP_HEALTH_ENV):
+        return {"status": "skipped", "channels": {}, "tier0_ok": 0,
+                "tier0_total": len([k for k in TIER0 if k not in disabled]),
+                "policy_disabled": dict(disabled), "reason": f"{SKIP_HEALTH_ENV} 已设置"}
+
     # 一、主路径：`check` 实测（ADR-0021 要的「信源此刻能不能连上」）。
     # v1.6.0 的 `doctor` 是纯本地状态（no network），拿它当「信源健康」等于用
     # 「装没装」冒充「连不连得上」——这正是本文件要消灭的那类失真。
@@ -215,7 +236,74 @@ def read_health(root: Path) -> dict:
         return _unavailable(
             "agent-reach 的 check 与 doctor 都读不到（ADR-0089：接口在 v1.6.0 已变）")
 
-    return _verdict(channels, disabled, source=observed)
+    return _with_delta(_verdict(channels, disabled, source=observed), root)
+
+
+def _load_health_snapshot(root: Path) -> dict | None:
+    """读上一次的判定快照；没有/坏了都返回 None（当作首次运行）。"""
+    path = root / HEALTH_SNAPSHOT_REL
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _save_health_snapshot(root: Path, health: dict) -> None:
+    """落盘本次判定。写不下去也不能影响简报（ADR-0006：简报必须无条件存在）。"""
+    path = root / HEALTH_SNAPSHOT_REL
+    payload = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "observed_by": health.get("observed_by"),
+        "channels": {k: v.get("status")
+                     for k, v in (health.get("channels") or {}).items()},
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _with_delta(health: dict, root: Path) -> dict:
+    """把「与上一次相比变了什么」算进判定，并落盘本次快照。
+
+    三种情况要分开：
+    - **首次运行**（没有快照）：全部当成「新出现」，逐条展开——否则人不知道
+      基线是什么。
+    - **有变化**：只展开变了的渠道。
+    - **没变化**：不展开，只留一行计数。
+
+    注意比较的是**状态本身**（ok/warn/off/disabled），不是 message——
+    「web 还是 warn，但原因从 jina 超时变成 429」不会触发这一轮的展开。
+    这是刻意的：原因天天微调，展开它等于把逐条展开退化成每天都印。
+    """
+    previous = _load_health_snapshot(root)
+    current = {k: v.get("status") for k, v in (health.get("channels") or {}).items()}
+
+    if previous is None:
+        health["delta"] = {"first_run": True, "changed": sorted(current),
+                           "unchanged_bad": []}
+    else:
+        old = previous.get("channels") or {}
+        names = set(old) | set(current)
+        changed = sorted(k for k in names if old.get(k) != current.get(k))
+        unchanged_bad = sorted(
+            k for k in current
+            if current[k] in ("warn", "off", "error") and k not in changed
+        )
+        health["delta"] = {
+            "first_run": False,
+            "changed": changed,
+            "unchanged_bad": unchanged_bad,
+            "previous_at": previous.get("at"),
+        }
+
+    _save_health_snapshot(root, health)
+    return health
 
 
 def _run_json(cmd: list[str], args: list[str], *, timeout: float, cwd: Path) -> dict | None:
@@ -377,6 +465,9 @@ def render(health: dict) -> list[str]:
 
     if status == "ok":
         return out
+    if status == "skipped":
+        # 主动跳过不是「读不到」，不该占第 ⑤ 段。
+        return out
     if status == "unavailable":
         out += ["**信源健康观测不可用**（ADR-0021）：" + str(health.get("reason") or "未知原因"),
                 "  这不等于「信源都健康」——它等于我们**失去了观察能力**：",
@@ -406,12 +497,33 @@ def render(health: dict) -> list[str]:
     if not broken:
         return out
 
-    out += [f"**信源渠道失效**（ADR-0021，tier-0 {health.get('tier0_ok')}/{health.get('tier0_total')} 全通"
-            f"｜部分可用 {health.get('tier0_partial', 0)} 个"
-            f"、全挂 {health.get('tier0_off', 0)} 个）："]
-    for key, val in broken:
-        mark = "✗" if val.get("status") in ("off", "error") else "!"
-        out += [f"- {mark} {val.get('name') or key}：{val.get('message') or '（无说明）'}"]
+    # 只展开「与上次相比变了」的那几个（见 HEALTH_SNAPSHOT_REL 的说明）。
+    # 没有 delta（老调用方/测试手造的 dict）时退回「全部展开」，行为与改造前一致。
+    delta = health.get("delta") or {}
+    only_changes = bool(delta) and not delta.get("first_run")
+    if only_changes:
+        changed = set(delta.get("changed") or [])
+        shown = [(k, v) for k, v in broken if k in changed]
+        hidden = [k for k, _ in broken if k not in changed]
+    else:
+        shown, hidden = broken, []
+
+    if shown:
+        out += [f"**信源渠道失效**（ADR-0021，tier-0 {health.get('tier0_ok')}/{health.get('tier0_total')} 全通"
+                f"｜部分可用 {health.get('tier0_partial', 0)} 个"
+                f"、全挂 {health.get('tier0_off', 0)} 个）："]
+        for key, val in shown:
+            mark = "✗" if val.get("status") in ("off", "error") else "!"
+            out += [f"- {mark} {val.get('name') or key}：{val.get('message') or '（无说明）'}"]
+    if hidden and shown:
+        # 变了的那几个已经展开，其余压成一行——它们昨天前天都是同一句。
+        out += [f"  另有 {len(hidden)} 个渠道**状态未变**、不重复展开：{'、'.join(hidden)}"]
+    elif hidden:
+        # 今天什么都没变：一行说清「还在坏、但没新情况」，不占版面。
+        out += [f"**信源仍有 {len(hidden)} 个渠道异常，状态与上次相同**："
+                f"{'、'.join(hidden)}",
+                "  （不展开细节——同样的原因连印几天会让人整段略过；"
+                "要看具体原因，读 `.newsagg/source-health.json` 或跑 `agent-reach check`。）"]
     out += ["  这**不熔断**（ADR-0022 第五条）：采集面变窄不等于不能发文，",
             "  停发代价过大。它只报告，由你判断今天要不要换个选题。", ""]
     return out

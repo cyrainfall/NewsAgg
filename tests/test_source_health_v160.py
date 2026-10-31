@@ -168,5 +168,63 @@ class ExecutableLookupTest(unittest.TestCase):
             self.assertIsNone(sh.agent_reach_cmd(Path(tmp)))
 
 
+class DeltaAndNoiseTest(unittest.TestCase):
+    """只展开「状态变了」的渠道（2026-10-31 加）。
+
+    背景：`web` 的 jina 读在本机长期 20 秒超时，于是每天都是同一条 warn。
+    不比较上一次的话，第 ⑤ 段每天印同样几条——「每天必然出现的告警」
+    会被整段略过（ADR-0006/0021/0031 反复要避免的「狼来了」）。
+    """
+
+    def _health(self, statuses: dict[str, str]) -> dict:
+        channels = {name: {"status": st, "name": name, "message": f"{name} 的问题"}
+                    for name, st in statuses.items()}
+        return sh._verdict(channels, {}, source="check")
+
+    def test_first_run_reports_everything(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            h = sh._with_delta(self._health({"web": "warn", "github": "ok"}), root)
+            self.assertTrue(h["delta"]["first_run"])
+            self.assertEqual(["github", "web"], h["delta"]["changed"])
+            self.assertTrue((root / ".newsagg" / "source-health.json").exists())
+
+    def test_second_run_without_change_collapses(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sh._with_delta(self._health({"web": "warn", "github": "ok"}), root)
+            h = sh._with_delta(self._health({"web": "warn", "github": "ok"}), root)
+            self.assertEqual([], h["delta"]["changed"])
+            self.assertEqual(["web"], h["delta"]["unchanged_bad"])
+            out = "\n".join(sh.render(h))
+            self.assertIn("状态与上次相同", out)
+            self.assertNotIn("web 的问题", out, "没变化就不该展开细节")
+
+    def test_status_change_is_expanded(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sh._with_delta(self._health({"web": "warn", "github": "ok"}), root)
+            h = sh._with_delta(self._health({"web": "warn", "github": "off"}), root)
+            self.assertEqual(["github"], h["delta"]["changed"])
+            out = "\n".join(sh.render(h))
+            self.assertIn("github 的问题", out)
+            self.assertNotIn("web 的问题", out, "没变的那条不该跟着展开")
+
+    def test_handmade_dict_without_delta_still_expands(self):
+        """老调用方（测试手造）没有 delta 时，行为必须与改造前一致。"""
+        out = "\n".join(sh.render({
+            "status": "degraded",
+            "channels": {"github": {"status": "off", "name": "github", "message": "gh 未授权"}},
+            "tier0_ok": 3, "tier0_total": 4, "policy_disabled": {}, "reason": "",
+        }))
+        self.assertIn("gh 未授权", out)
+
+
 if __name__ == "__main__":
     unittest.main()

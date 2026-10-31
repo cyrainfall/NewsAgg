@@ -258,6 +258,48 @@ def classify_kind(base: dict) -> str:
     return "weitoutiao" if votes["weitoutiao"] > votes["article"] else "article"
 
 
+# 阅读率的**最小样本量**：展现数低于它的比率不进基准、也不进简报。
+#
+# 2026-10-30 实测：10-27 那篇次日读回是 `showCount=9 / readCount=8` → 88.89%，
+# 它没触发 `rate > 1` 的钳制（8/9 < 1），于是被原样印进简报③段。
+# 这个数本身没算错，但 **9 个展现算出来的比率没有统计意义**——它既不是「这篇文章
+# 表现好」，也不是「作者该改标题」，它是「平台的展现还没来得及补上」。
+# 简报的信噪比是它唯一的资产（ADR-0055），一个 88.89% 混在 0.1% 里，会让人
+# 开始怀疑同一段里的每一个数字。
+#
+# 100 是经验值：本号正常文章的展现量在 600–2000 之间，而「刚发布不到一天」的
+# 那几篇是 7–9。取 100 把「还在补数据的窗口期」整段排除掉，又不会误伤任何一篇
+# 已经跑起来的文章。它和 `SOURCE_TTL_MINUTES` 同一类：**从数据分布里借来的常量，
+# 会随账号长大而需要重估**——所以要写在这儿，而不是散在分支里。
+MIN_SHOW_FOR_RATE = 100
+
+
+def read_rate_of(metrics: dict) -> float | None:
+    """按平台两个计数器算阅读率；算不出有意义的比率时返回 None。
+
+    三种「算不出」要分开记在心里（它们的原始数都留在 `metrics` 里）：
+    1. `showCount` 为 0/缺失 —— 没被展现，比率无定义（不是 0）。
+    2. `showCount` 低于 `MIN_SHOW_FOR_RATE` —— 样本太小，见常量上的说明。
+    3. 阅读数大于展现数 —— 两条计数不同步的窗口期（2026-10-28 实测 120%）。
+
+    三者的共同点是：**此刻算不出有意义的比率**，而下游（基准中位数、简报、
+    降频判定）只该看到「算不出」，不该看到「一个数」。
+
+    这是这两条写路径（浏览器拦截 / 纯 HTTP 列表）的**唯一实现**。它们曾经各写
+    一份，改口径时只改了一边（ADR-0042 记过同一类事故）。
+    """
+    show = metrics.get("showCount")
+    read = metrics.get("readCount")
+    if not show or read is None:
+        return None
+    if show < MIN_SHOW_FOR_RATE:
+        return None
+    rate = read / show
+    if rate > 1.0:
+        return None
+    return rate
+
+
 def extract_articles(raw: dict) -> tuple[list[dict], dict]:
     """从 `content list` 的原始信封里抽出每篇文章（ADR-0030 决策四）。
 
@@ -305,23 +347,9 @@ def extract_articles(raw: dict) -> tuple[list[dict], dict]:
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     metrics[k] = int(v)
 
-            show = metrics.get("showCount")
-            read = metrics.get("readCount")
-            # 展现为 0 时阅读率无定义——记 None 而不是 0，避免把"没被展现"
-            # 混进"被展现了但没人点"的统计里。
-            #
-            # 2026-10-28 补：阅读数**可能大于**展现数（实测 10-27 那篇
-            # show=5 / read=6 → 120%）。新文章的展现统计滞后于阅读统计，
-            # 平台先记点击再补展现，于是出现一个数学上不可能的比例。
-            # 这不是「数据坏了」，是两条计数不同步的窗口期。
-            # 但**不能把它当阅读率用**：它会进基准中位数（把阈值抬高 →
-            # 该降频时降不下来），也会被简报原样印成「阅读率 120%」
-            # （简报的信噪比是它唯一的资产，ADR-0055）。
-            # 判据：rate > 1 视为窗口期未同步，记 None（与「展现为 0」同类，
-            # 都是「此刻算不出有意义的比率」），并把两个原始数留给下游呈现。
-            rate = (read / show) if (show and read is not None) else None
-            if rate is not None and rate > 1.0:
-                rate = None
+            # 阅读率的口径（展现为 0 / 样本太小 / 阅读数大于展现数 → None）
+            # 统一在 `read_rate_of()` 里，两条写路径共用同一份实现。
+            rate = read_rate_of(metrics)
 
             articles.append({
                 "gid": str(base.get("gidStr") or "") or None,
@@ -769,14 +797,8 @@ def fetch_content_list_api(account: str, limit: int) -> tuple[list[dict], dict]:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 metrics[dst] = int(v)
 
-        show = metrics.get("showCount")
-        read = metrics.get("readCount")
-        # 展现为 0 时阅读率无定义——记 None 而不是 0（与浏览器路径同口径）。
-        # 阅读数大于展现数时同样记 None：见上方浏览器路径那段注释
-        # （2026-10-28 实测 show=5 / read=6 的窗口期）。
-        rate = (read / show) if (show and read is not None) else None
-        if rate is not None and rate > 1.0:
-            rate = None
+        # 与浏览器路径同口径，见 `read_rate_of()`。
+        rate = read_rate_of(metrics)
 
         url = str(item.get("article_url") or "")
         out.append({

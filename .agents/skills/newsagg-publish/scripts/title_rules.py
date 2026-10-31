@@ -130,6 +130,16 @@ def tag_title(title: str, rules: dict) -> dict:
             "anti_markers": anti,
             "hit": bool(reader or role),
         }
+        # 负向那一半单独成标签（2026-10-31 回归）。
+        # 此前 `anti_markers` 被算出来、写进账本，却**不参与 hit**——于是复盘时
+        # 「reader_side_landing 不成立」被读成「角色词和抽象量都没用」，而实测
+        # 只有负向那一半显著：命中 anti_markers 的 4 篇 CTR 0.09%，未命中的
+        # 7 篇 0.31%（0.3 倍，p=0.006，n=11）。正向（角色词）1.1 倍、p=0.67。
+        # 拆开之后，这两条假设各自积累证据，不再互相掩护。
+        tags["ends_on_abstract_metric"] = {
+            "markers": anti,
+            "hit": bool(anti),
+        }
 
     contrast = observe.get("contrast_shape") or {}
     if contrast:

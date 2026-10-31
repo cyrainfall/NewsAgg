@@ -109,6 +109,27 @@ class TestObservationTags(unittest.TestCase):
         for key in self.rules["observe"]:
             self.assertIn(key, tags)
 
+    def test_abstract_metric_is_its_own_tag(self):
+        """负向那一半单独成标签（2026-10-31 回归）。
+
+        此前 `anti_markers` 被算出来却不参与 `reader_side_landing.hit`，于是
+        「这条假设不成立」把正向词（角色词，实测 1.1 倍、p=0.67）与负向词
+        （抽象量，实测 0.3 倍、p=0.006）一起否掉了。拆开之后两条各自积累证据。
+        """
+        hit = tr.tag_title("Meta 开源 8160 亿参数模型：模型免费，运维不免费", self.rules)
+        self.assertTrue(hit["ends_on_abstract_metric"]["hit"])
+        self.assertIn("运维", hit["ends_on_abstract_metric"]["markers"])
+
+        clean = tr.tag_title("被裁半年降薪15%：四条原因里没有AI", self.rules)
+        self.assertFalse(clean["ends_on_abstract_metric"]["hit"])
+
+    def test_abstract_metric_tag_is_not_the_positive_hit(self):
+        """两条标签必须能分开：撞上负向词不等于「落在读者处境上」。"""
+        tags = tr.tag_title("拼豆App三个月43美元：AI小工具死在留存", self.rules)
+        self.assertTrue(tags["ends_on_abstract_metric"]["hit"])
+        self.assertFalse(tags["reader_side_landing"]["hit"],
+                         "只有负向词时，正向 hit 不该被点亮")
+
 
 if __name__ == "__main__":
     unittest.main()

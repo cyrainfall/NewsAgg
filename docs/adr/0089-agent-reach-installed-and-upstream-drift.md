@@ -77,11 +77,30 @@ ADR-0059 发现这条承诺当时**没有任何代码消费**，于是补了 `so
    AI 的技能目录，与 ADR-0021 第三条（不注册它的 SKILL）直接冲突。
 5. **编码固定 `utf-8`**（见发现三之二）。
 
-## 未做
+## 追加（同日上午）：两个渠道都 `add` 了，一个卡在网络，一个卡在子进程环境
 
-- **没有 `agent-reach add <channel>`**。那会装 `ffmpeg` / `bili-cli` 等二进制，属于
-  「往机器上加东西」，该由人决定。所以 `youtube` 仍报 `needs_setup（缺 ffmpeg）`，
-  `bilibili` 同；这是**如实状态**，不是故障。
+用户要求把 `youtube` / `bilibili` 也装上，于是跑了 `agent-reach add`。两个都成功
+（`ffmpeg 0.7.0`、`bili-cli 0.6.2`，都装在 `~/.agent-reach/tools/` 的私有 venv 里，
+**不进仓库**）。但实测连通时，两个都失败，**原因完全不同，而且都不是「没装好」**：
+
+**`youtube`：装好了，是 YouTube 不可达。** `yt-dlp` 报 `[SSL: UNEXPECTED_EOF_WHILE_READING]`
+与 `ConnectionAbortedError(10053)`。同期 curl 实测：直连 `https://www.youtube.com` 挂满 15 秒，
+经代理 0.003 秒即拒。这与 github.com 直连不通是同一类环境问题——**代码这边没有可修的东西**，
+代理节点能到 YouTube 时它自然就好了。
+
+**`bilibili`：站是通的（`api.bilibili.com` 200 / 0.26 秒），坏在 agent-reach 起子进程的方式。**
+`bili-cli` 单独跑（哪怕 HOME 重定向到 session 目录）完全正常；一旦经
+`agent_reach.runtime.run.run_cmd` 启动，子进程就报
+`FileNotFoundError: No usable temporary directory found in [...]`——列出 8 个候选目录，
+其中 `C:\Users\cyx\AppData\Local\Temp` 与 `C:\Windows\Temp` 都确实存在且可写（用 anaconda
+的 3.12 当场 `mkstemp` 成功）。定位过程收敛到「**子进程的 cwd/env 组合**」：
+`run_cmd(..., cwd=<repo>)` 能过，默认的 `cwd=<用户主目录>` 必挂；把 HOME 改成 Windows 路径、
+把 TEMP 换成真实目录都不解决。
+
+**没有继续往下修**，理由是：`run_cmd` 属于第三方包（ADR-0021 明确不 vendor 它），改它等于
+在我们的仓库外打补丁，下次 `uv tool install` 升级就没了；而**同一个 bili-cli 直接调用是好的**，
+所以这不是「渠道不能用」，是「经这层封装不能用」。要真用，得由人决定接受一个直接调用的旁路
+（那就绕过了 agent-reach 的统一错误码与缓存），或者等上游改默认 cwd。两条都不该我顺手定。
 - **没有把 `check` 结果落盘成历史**。`doctor` 有 `regressed` 字段（上次检查能通、这次
   不能），但需要先有 `check` 的历史；现在每天只算当天。
 - **github 的 rate limit 是今天装包时反复打 API 撞出来的**，不是我改的东西坏了。明天

@@ -53,6 +53,9 @@ AFTER_WRITE=""
 NO_GIT=""
 NO_COLLECT=""
 DATE_OVERRIDE=""
+# 每日额度逃生舱（见参数解析处）。空 = 不动闸门（默认）；非空 = 本轮允许越过
+# 「每个日历日 1 篇」，并把理由写进发布账本。
+DAILY_OVERRIDE_REASON=""
 # ① 没能从远端同步（网络不可达）时置 1：本轮在本地状态下继续，收尾不 push。
 # 见 ADR-0061——远端不可达与「工作区脏 / 合并冲突」是两种事，后者要人动手，
 # 前者只要等网络好；把前者判成后者会让一次代理抖动抹掉整天的产出。
@@ -74,6 +77,12 @@ while [[ $# -gt 0 ]]; do
     --no-git)       NO_GIT="1" ;;
     --no-collect)   NO_COLLECT="1" ;;
     --date)         DATE_OVERRIDE="${2:-}"; shift ;;
+    # ADR-0059 给 publish.py 留了逃生舱（--allow-daily-override + 理由），但
+    # 编排器此前**没有把参数传下去的路径**，于是那个舱口只能在绕过 run_all.sh
+    # 时使用——而「不许绕过」是铁律（解释器与 PATH 由本脚本钉住）。一个只能
+    # 违规使用的逃生舱等于没有逃生舱。这里补上，并要求理由非空：空理由的
+    # override 就是「我就是要发」，那不是判断。
+    --daily-override) DAILY_OVERRIDE_REASON="${2:-}"; shift ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac
   shift
@@ -890,6 +899,12 @@ fi
 
 log "⑤ 发布（${MODE}）"
 if [[ "$MODE" == "publish" ]]; then PUB_FLAG="--mode publish"; else PUB_FLAG=""; fi
+# 逃生舱：只有显式给了理由才带上，理由会原样进发布账本（daily_override 字段）。
+OVR_ARGS=()
+if [[ -n "$DAILY_OVERRIDE_REASON" ]]; then
+  OVR_ARGS=(--allow-daily-override --daily-override-reason "$DAILY_OVERRIDE_REASON")
+  echo "注意：本轮带 --allow-daily-override（越过分日历日的每日额度）：${DAILY_OVERRIDE_REASON}" >&2
+fi
 # ADR-0037：把承接的观点卡一并写进发布账本。循环 C 读回表现数据后要按卡
 # 归因（"哪些卡跑出了数据"），而账本是唯一的关联点——文章标题会被你改，
 # slug 不会，卡名只能在这一刻从决策文件里取到。dry-run 也记，便于验证。
@@ -898,7 +913,7 @@ PUB_OUT="$(mktemp)"
 set +e
 "$PY" .agents/skills/newsagg-publish/scripts/publish.py \
   --slug "$SLUG" --cover "outputs/covers/${SLUG}.png" \
-  ${CARD:+--card-file "$CARD"} $PUB_FLAG 2>&1 | tee "$PUB_OUT"
+  ${CARD:+--card-file "$CARD"} $PUB_FLAG ${OVR_ARGS[@]+"${OVR_ARGS[@]}"} 2>&1 | tee "$PUB_OUT"
 PUB_RC=${PIPESTATUS[0]}
 set -e
 if [[ $PUB_RC -ne 0 ]]; then

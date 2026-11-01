@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -145,48 +146,69 @@ class BacklogEchoTest(unittest.TestCase):
 
 
 class CardStockLinesTest(unittest.TestCase):
-    """③ 资产段：到期议题与退役候选。"""
+    """③ 资产段：到期议题与退役候选。
+
+    2026-11-01 修：这个类原来拿真实卡库里的
+    `ai-tool-benefits-overestimated-by-demo-effect.md` 当「从未成文的样本」，
+    并明写「它是真实样本，不是造出来的」。那天系统第一次写回它，样本就消失，
+    四个用例同时变红——**断言测的是库的快照，不是属性**。现改为临时目录自造卡。
+    """
+
+    @staticmethod
+    def _cards(tmp: Path) -> Path:
+        d = tmp / "cards"
+        d.mkdir()
+
+        def card(name, lines):
+            (d / name).write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
+
+        card("old-never-written.md", ["---", "issue: 从没写过的老卡",
+                                      "status: active", "created: 2026-10-14", "---", "# x"])
+        card("old-but-written.md", ["---", "issue: 写过一次的老卡",
+                                    "status: active", "created: 2026-10-14",
+                                    "last_written: 2026-10-20", "---", "# x"])
+        card("young-never-written.md", ["---", "issue: 刚建的新卡",
+                                        "status: active", "created: 2026-11-10", "---", "# x"])
+        return d
+
+    def _lines(self, backlog_view=None, date="2026-11-20"):
+        with tempfile.TemporaryDirectory() as td:
+            return brief._card_stock_lines(self._cards(Path(td)), backlog_view, date)
 
     def test_retire_line_reads_review_days_from_module(self):
         """退役天数同理：写死 30 会让措辞与判据分家。"""
-        line = "\n".join(brief._card_stock_lines(CARDS, None, "2026-11-20"))
-        self.assertIn(f"建卡满 {card_backlog.REVIEW_DAYS} 天", line)
+        self.assertIn("建卡满 " + str(card_backlog.REVIEW_DAYS) + " 天", chr(10).join(self._lines()))
 
     def test_due_issue_is_listed(self):
-        lines = brief._card_stock_lines(CARDS, backlog(times=2), "2026-10-28")
-        joined = "\n".join(lines)
+        joined = chr(10).join(self._lines(backlog(times=2), "2026-10-28"))
         self.assertIn("到期未建卡", joined)
         self.assertIn("AI 顶尖人才的定价", joined)
         self.assertIn("第 2 次", joined)
 
     def test_no_backlog_prints_no_due_section(self):
         """老日期重放简报时没有台账，不该凭空印一个「无到期」——那是编的。"""
-        lines = "\n".join(brief._card_stock_lines(CARDS, None, "2026-10-28"))
-        self.assertNotIn("到期未建卡", lines)
+        self.assertNotIn("到期未建卡", chr(10).join(self._lines(None, "2026-10-28")))
 
     def test_backlog_with_nothing_due_says_checked(self):
         """一行「无到期」比整段消失有用：它证明这一轮真的查过。"""
-        lines = "\n".join(brief._card_stock_lines(
-            CARDS, {"threshold": 2, "issues": {"某议题": {
-                "issue": "某议题", "times_seen": 1, "card_file": None}}}, "2026-10-28"))
-        self.assertIn("无到期未建卡", lines)
+        view = {"threshold": 2, "issues": {"某议题": {
+            "issue": "某议题", "times_seen": 1, "card_file": None}}}
+        self.assertIn("无到期未建卡", chr(10).join(self._lines(view, "2026-10-28")))
 
     def test_retire_candidate_needs_review_window(self):
         """建满 30 天且从未成文 → 候选。当天不算（刚建就判死是荒谬的）。"""
-        # `ai-tool-benefits-overestimated-by-demo-effect.md` 的 created 是 2026-10-14
-        # 且 last_written 为空——它是真实样本，不是造出来的。
-        early = "\n".join(brief._card_stock_lines(CARDS, None, "2026-10-28"))
+        early = chr(10).join(self._lines(None, "2026-10-28"))
         self.assertNotIn("退役候选", early, "才 14 天，不该出现")
 
-        late = "\n".join(brief._card_stock_lines(CARDS, None, "2026-11-20"))
+        late = chr(10).join(self._lines())
         self.assertIn("退役候选", late)
-        self.assertIn("ai-tool-benefits-overestimated-by-demo-effect.md", late)
+        self.assertIn("old-never-written.md", late)
+        self.assertNotIn("young-never-written.md", late, "刚建的卡不该进候选")
         self.assertIn("机器不自动退役", late, "候选不是执行——ADR-0007 要求人否决")
 
     def test_written_card_is_not_a_retire_candidate(self):
         """已经成过文的卡不进候选：`last_written` 非空就是证据。"""
-        late = "\n".join(brief._card_stock_lines(CARDS, None, "2026-11-20"))
-        self.assertNotIn("ai-coding-workflow-over-model-capability.md", late)
+        self.assertNotIn("old-but-written.md", chr(10).join(self._lines()))
 
 
 class NormIssueIsSingleImplementationTest(unittest.TestCase):

@@ -80,7 +80,12 @@ class TriageCliTest(unittest.TestCase):
         p.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
         r = subprocess.run(
             [sys.executable, str(TRIAGE), "--validate", str(p),
-             "--backlog", str(self.backlog)],
+             "--backlog", str(self.backlog),
+             # 冷却期必须置 0：夹具里用的是**真实**卡文件，而真实卡会被系统本身
+             # 写回。2026-11-01 实测——那张卡当天第一次成文，立刻进入冷却，
+             # 于是这里 8 个用例同时变红。这些用例测的是台账门槛，不是冷却期；
+             # 让它依赖「哪张卡今天恰好没被写」，就是让断言测库的快照而不是属性。
+             "--cooldown-days", "0"],
             capture_output=True, text=True, cwd=str(ROOT),
         )
         try:
@@ -220,7 +225,7 @@ class ThresholdIsOneNumberTest(unittest.TestCase):
                      encoding="utf-8")
         r = subprocess.run(
             [sys.executable, str(TRIAGE), "--validate", str(p),
-             "--backlog", str(self.backlog)],
+             "--backlog", str(self.backlog), "--cooldown-days", "0"],
             capture_output=True, text=True, cwd=str(ROOT))
         return r.returncode, json.loads(r.stdout)
 

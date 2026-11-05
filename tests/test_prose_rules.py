@@ -119,6 +119,10 @@ class TestRealOutputs(unittest.TestCase):
             # 2026-11-01 又命中一篇：那篇写了「这张卡的判断原本是对团队说的」，
             # 是真引自己（规则第 15 条，一句），不是误命中。
             "2026-11-01-personal-agent-trust-cost",
+            # 2026-11-05 那句「我在这张卡里写过：被压缩的是编码环节」也是真自引
+            # （规则第 15 条，一句）。第三次因此加名单——这正是「显式」的代价，
+            # 也是它的价值：每加一次就得看一眼是不是真引了自己。
+            "2026-11-05-ai-takes-entry-level-jobs",
         ]
         prec, prior = [], []
         for p in OUTPUTS:
